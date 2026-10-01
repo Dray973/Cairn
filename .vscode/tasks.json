@@ -1,0 +1,211 @@
+{
+  // Cairn — VS Code build pipeline
+  // Default build (Ctrl+Shift+B) = "build: all" → C++ DLL → Rust workspace → deploy natives → ready to run.
+  // Everything runs through Windows PowerShell so the same task works from an elevated or non-elevated window.
+  "version": "2.0.0",
+  "options": {
+    "shell": {
+      "executable": "powershell.exe",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"]
+    },
+    "env": {
+      // Silence cargo's coloured spinner in the task terminal; keep colours for errors.
+      "CARGO_TERM_COLOR": "always",
+      // PyO3 must link against the venv interpreter, not the Store stub on PATH.
+      "PYO3_PYTHON": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+      "PYTHONUTF8": "1"
+    }
+  },
+  "presentation": {
+    "reveal": "always",
+    "panel": "shared",
+    "clear": false,
+    "showReuseMessage": false
+  },
+  "tasks": [
+    // ───────────────────────────── Environment ─────────────────────────────
+    {
+      "label": "env: bootstrap toolchains (winget)",
+      "detail": "One-time: installs Rust, MSVC Build Tools, CMake, Ninja, Python 3.12, Git via winget. Requires elevation.",
+      "type": "shell",
+      "command": "Start-Process powershell.exe -Verb RunAs -Wait -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','\"${workspaceFolder}\\scripts\\bootstrap.ps1\"'",
+      "problemMatcher": []
+    },
+    {
+      "label": "env: check toolchains",
+      "detail": "Verifies cargo / cmake / cl / py are reachable before building.",
+      "type": "shell",
+      "command": "& '${workspaceFolder}\\scripts\\check_env.ps1'",
+      "problemMatcher": []
+    },
+
+    // ───────────────────────────── Python venv ─────────────────────────────
+    {
+      "label": "python: create venv",
+      "detail": "Creates .venv with the py launcher (bypasses the Microsoft Store 'python' alias) and installs requirements.",
+      "type": "shell",
+      "command": "if (-not (Test-Path '${workspaceFolder}\\.venv\\Scripts\\python.exe')) { py -3.12 -m venv '${workspaceFolder}\\.venv' }; & '${workspaceFolder}\\.venv\\Scripts\\python.exe' -m pip install --upgrade pip; & '${workspaceFolder}\\.venv\\Scripts\\python.exe' -m pip install -r '${workspaceFolder}\\requirements.txt'",
+      "problemMatcher": []
+    },
+
+    // ───────────────────────────── C++ telemetry DLL ─────────────────────────────
+    {
+      "label": "cpp: configure",
+      "detail": "CMake configure with the Visual Studio 17 2022 x64 generator (auto-locates MSVC + Windows SDK).",
+      "type": "shell",
+      "command": "cmake -S '${workspaceFolder}' -B '${workspaceFolder}\\build\\cpp' -G 'Visual Studio 17 2022' -A x64 -DCMAKE_BUILD_TYPE=Release",
+      "problemMatcher": []
+    },
+    {
+      "label": "cpp: build telemetry dll",
+      "detail": "Compiles optimizer_telemetry.dll (Release, /O2 /arch:AVX2 /GL) → build/cpp/bin/Release",
+      "type": "shell",
+      "command": "cmake --build '${workspaceFolder}\\build\\cpp' --config Release --parallel",
+      "dependsOn": ["cpp: configure"],
+      "group": "build",
+      "problemMatcher": "$msCompile"
+    },
+    {
+      "label": "cpp: build telemetry dll (Debug)",
+      "type": "shell",
+      "command": "cmake --build '${workspaceFolder}\\build\\cpp' --config Debug --parallel",
+      "dependsOn": ["cpp: configure"],
+      "problemMatcher": "$msCompile"
+    },
+
+    // ───────────────────────────── Rust engine ─────────────────────────────
+    {
+      "label": "rust: build workspace (release)",
+      "detail": "cargo build --release for optimizer_core, optimizer_engine (.pyd via PyO3) and optctl (admin-manifested CLI).",
+      "type": "shell",
+      "command": "cargo build --release --workspace",
+      "options": { "cwd": "${workspaceFolder}" },
+      "group": "build",
+      "problemMatcher": "$rustc"
+    },
+    {
+      "label": "rust: build workspace (debug)",
+      "type": "shell",
+      "command": "cargo build --workspace",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": "$rustc"
+    },
+    {
+      "label": "rust: test",
+      "type": "shell",
+      "command": "cargo test --workspace",
+      "options": { "cwd": "${workspaceFolder}" },
+      "group": "test",
+      "problemMatcher": "$rustc"
+    },
+    {
+      "label": "rust: clippy",
+      "type": "shell",
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": "$rustc"
+    },
+
+    // ───────────────────────────── Deploy natives into the Python package ─────────────────────────────
+    {
+      "label": "deploy: natives → ui/optimizer/native",
+      "detail": "Copies optimizer_telemetry.dll and renames optimizer_engine.dll → optimizer_engine.pyd for import.",
+      "type": "shell",
+      "command": "& '${workspaceFolder}\\scripts\\deploy_natives.ps1' -Config Release",
+      "problemMatcher": []
+    },
+    {
+      "label": "deploy: natives (debug)",
+      "type": "shell",
+      "command": "& '${workspaceFolder}\\scripts\\deploy_natives.ps1' -Config Debug",
+      "problemMatcher": []
+    },
+
+    // ───────────────────────────── Aggregate build ─────────────────────────────
+    {
+      "label": "build: all",
+      "detail": "Ctrl+Shift+B — venv → C++ DLL → Rust workspace → deploy natives.",
+      "dependsOrder": "sequence",
+      "dependsOn": [
+        "env: check toolchains",
+        "python: create venv",
+        "cpp: build telemetry dll",
+        "rust: build workspace (release)",
+        "deploy: natives → ui/optimizer/native"
+      ],
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "build: all (debug)",
+      "dependsOrder": "sequence",
+      "dependsOn": [
+        "env: check toolchains",
+        "python: create venv",
+        "cpp: build telemetry dll (Debug)",
+        "rust: build workspace (debug)",
+        "deploy: natives (debug)"
+      ],
+      "problemMatcher": []
+    },
+
+    // ───────────────────────────── Run (elevated) ─────────────────────────────
+    {
+      "label": "run: gui (Administrator)",
+      "detail": "Builds everything then launches the dashboard through a UAC prompt (Start-Process -Verb RunAs).",
+      "type": "shell",
+      "command": "Start-Process -FilePath '${workspaceFolder}\\.venv\\Scripts\\pythonw.exe' -ArgumentList '-m','optimizer' -WorkingDirectory '${workspaceFolder}\\ui' -Verb RunAs",
+      "dependsOn": ["build: all"],
+      "problemMatcher": []
+    },
+    {
+      "label": "run: cli (Administrator)",
+      "detail": "Launches optctl.exe; its embedded manifest (requireAdministrator) triggers UAC automatically.",
+      "type": "shell",
+      "command": "Start-Process -FilePath '${workspaceFolder}\\target\\release\\optctl.exe' -ArgumentList '--help' -WorkingDirectory '${workspaceFolder}' -Verb RunAs",
+      "dependsOn": ["rust: build workspace (release)"],
+      "problemMatcher": []
+    },
+    {
+      "label": "vscode: relaunch as Administrator",
+      "detail": "Debugging (F5) inherits VS Code's token. Run this once, then F5 debugs with admin rights.",
+      "type": "shell",
+      "command": "Start-Process -FilePath 'code' -ArgumentList '\"${workspaceFolder}\"' -Verb RunAs",
+      "problemMatcher": []
+    },
+
+    // ───────────────────────────── Release ─────────────────────────────
+    {
+      "label": "release: build installer",
+      "detail": "scripts\\build_release.ps1: checks, release build, staged runtime and app with their gates, then Cairn-<version>-setup.exe with Inno Setup 6.3+ (build\\dist).",
+      "type": "shell",
+      "command": "& '${workspaceFolder}\\scripts\\build_release.ps1'",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "release: stage only",
+      "detail": "scripts\\build_release.ps1 -StageOnly -SkipChecks: release build and the staged folder build\\dist\\stage with its gates; no setup.",
+      "type": "shell",
+      "command": "& '${workspaceFolder}\\scripts\\build_release.ps1' -StageOnly -SkipChecks",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "run: staged Cairn",
+      "detail": "Starts build\\dist\\stage\\Cairn.exe to try the launcher. The stage folder is writable without administrator rights, so this copy never elevates.",
+      "type": "shell",
+      "command": "Start-Process -FilePath '${workspaceFolder}\\build\\dist\\stage\\Cairn.exe' -WorkingDirectory '${workspaceFolder}\\build\\dist\\stage'",
+      "problemMatcher": []
+    },
+
+    // ───────────────────────────── Housekeeping ─────────────────────────────
+    {
+      "label": "clean: all",
+      "type": "shell",
+      "command": "cargo clean; Remove-Item -Recurse -Force '${workspaceFolder}\\build' -ErrorAction SilentlyContinue; Remove-Item -Force '${workspaceFolder}\\ui\\optimizer\\native\\*.dll','${workspaceFolder}\\ui\\optimizer\\native\\*.pyd','${workspaceFolder}\\ui\\optimizer\\native\\*.pdb' -ErrorAction SilentlyContinue",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    }
+  ]
+}

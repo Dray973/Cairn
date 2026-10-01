@@ -1,0 +1,110 @@
+# Cairn — Rust workspace root
+#
+#   crates/core      optimizer_core     pure Rust: safety layer, registry/SCM/appx engines (no Python deps)
+#   crates/pybridge  optimizer_engine   PyO3 cdylib → ui/optimizer/native/optimizer_engine.pyd
+#   crates/cli       optctl             admin-manifested CLI (optctl.exe) and cairn-maintenance.exe
+#   crates/launcher  cairn              Cairn.exe: starts the embedded Python runtime
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/pybridge", "crates/cli", "crates/launcher"]
+default-members = ["crates/core", "crates/pybridge", "crates/cli", "crates/launcher"]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+authors = ["Dray973"]
+repository = "https://github.com/Dray973/Cairn"
+publish = false
+
+[workspace.dependencies]
+# ── Win32 ──────────────────────────────────────────────────────────────────────
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Registry",          # RegOpenKeyExW / RegSetValueExW / RegQueryValueExW
+    "Win32_System_Services",          # OpenSCManagerW / ChangeServiceConfigW / ControlService
+    "Win32_System_Restore",           # SRSetRestorePointW
+    "Win32_System_Power",             # PowerGetActiveScheme / PowerDuplicateScheme / GetSystemPowerStatus
+    "Win32_System_Memory",            # LocalFree for buffers returned by the power APIs
+    "Win32_System_Diagnostics_ToolHelp", # process snapshots (running browsers, explorer restart)
+    "Win32_System_Com_StructuredStorage", # IPersistFile for resolving startup shortcuts
+    "Win32_System_Environment",       # ExpandEnvironmentStringsW for startup commands
+    "Win32_System_RemoteDesktop",     # WTSQuerySessionInformationW / ProcessIdToSessionId
+    "Win32_System_Threading",         # OpenProcessToken / process handles
+    "Win32_System_SystemServices",
+    "Win32_System_Com",
+    "Win32_Storage_FileSystem",       # purge helpers
+    "Win32_UI_Shell",                 # IsUserAnAdmin / ShellExecuteW (self-elevation)
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_TaskScheduler",     # ITaskService / IRegisteredTask: scheduled task enabled state
+    "Win32_System_Ole",               # ITaskService::Connect and ITaskFolder::RegisterTask are gated on it
+    "Win32_System_Variant",           # VARIANT arguments of the Task Scheduler API
+    "Win32_NetworkManagement_IpHelper", # GetAdaptersAddresses / Get|SetInterfaceDnsSettings / GetIfEntry2 / IpRenewAddress
+    "Win32_NetworkManagement_Ndis",   # NET_LUID_LH, IF_OPER_STATUS, NDIS_PHYSICAL_MEDIUM, TUNNEL_TYPE
+    "Win32_Networking_WinSock",       # SOCKADDR_IN/IN6, SOCKET_ADDRESS, AF_INET/AF_INET6
+    "Win32_Globalization",            # GetOEMCP / MultiByteToWideChar for console tool output
+    "Win32_System_SystemInformation", # GetSystemDirectoryW / GetWindowsDirectoryW / GetSystemFirmwareTable / GetLogicalProcessorInformationEx
+    "Win32_System_LibraryLoader",     # LoadLibraryExW / GetProcAddress for DnsFlushResolverCache and dismapi.dll
+    "Win32_System_IO",                # DeviceIoControl
+    "Win32_System_Ioctl",             # IOCTL_STORAGE_QUERY_PROPERTY / IOCTL_DISK_GET_DRIVE_GEOMETRY_EX
+    "Win32_System_TpmBaseServices",   # Tbsi_GetDeviceInfo
+    "Win32_System_WindowsProgramming", # SYSTEM_CODEINTEGRITY_INFORMATION, DRIVE_* constants
+    "Win32_System_Diagnostics_Debug", # SetThreadErrorMode
+    "Win32_Security_Authentication_Identity", # SLIsGenuineLocal
+    "Win32_Graphics_Dxgi",            # CreateDXGIFactory1 / IDXGIAdapter1::GetDesc1
+    "Win32_Devices_Display",          # QueryDisplayConfig / DisplayConfigGetDeviceInfo
+    "Wdk_System_SystemInformation",   # NtQuerySystemInformation (code integrity state)
+    "Win32_System_Wmi",               # IWbemLocator / IWbemServices: Defender and BitLocker state
+    "Win32_System_SecurityCenter",    # IWSCProductList / WscGetSecurityProviderHealth
+    "Win32_NetworkManagement_WindowsFirewall", # INetFwPolicy2 profile reads
+    "Win32_System_UpdateAgent",       # Windows Update Agent status, history and search
+    "Win32_System_EventLog",          # EvtQuery / EvtRender for boot and update events
+    "Win32_NetworkManagement_NetManagement", # NetUserEnum / NetGetJoinInformation
+    "Win32_Security_Cryptography",    # BCrypt SHA-256 and BCryptGenRandom
+    "Wdk_Graphics_Direct3D",          # D3DKMT adapter caps for GPU scheduling support
+] }
+windows-core = "0.61"
+
+# ── Python bridge ──────────────────────────────────────────────────────────────
+pyo3 = { version = "0.25", features = ["extension-module", "abi3-py312"] }
+
+# ── State / persistence ────────────────────────────────────────────────────────
+rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+
+# ── Errors / logging ───────────────────────────────────────────────────────────
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# ── CLI ────────────────────────────────────────────────────────────────────────
+clap = { version = "4", features = ["derive", "env"] }
+
+# ── Misc ───────────────────────────────────────────────────────────────────────
+parking_lot = "0.12"
+once_cell = "1"
+
+# Internal
+optimizer_core = { path = "crates/core" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = 1            # line tables only: keeps PDBs useful for crash triage, small size cost
+strip = false
+incremental = false
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+# Fast dev builds for dependencies (windows-rs is large)
+[profile.dev.package."*"]
+opt-level = 2

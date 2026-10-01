@@ -1,0 +1,37 @@
+[package]
+name = "optctl"
+description = "Command-line tool for Cairn: scan, apply, revert and inspect the journal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "optctl"
+path = "src/main.rs"
+# The embedded requireAdministrator manifest also applies to the test harness, which then
+# cannot start from a non-elevated `cargo test`. The CLI logic is covered through
+# optimizer_core's tests.
+test = false
+
+[[bin]]
+name = "cairn-maintenance"
+path = "src/bin/cairn_maintenance.rs"
+# Same manifest as optctl.exe (see above); the logic lives in optimizer_core::maintenance.
+test = false
+
+[dependencies]
+optimizer_core.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[build-dependencies]
+# Embeds a Win32 application manifest with requestedExecutionLevel=requireAdministrator and
+# activeCodePage System into every binary of this crate (optctl.exe and cairn-maintenance.exe),
+# so Windows shows the UAC prompt the moment optctl.exe starts.
+embed-manifest = "1.4"

@@ -1,0 +1,7 @@
+名前                    ID                    バージョン 利用可能  ソース
+---------------------------------------------------------------------------
+テスト エディター       Contoso.Editor        1.2.0     1.3.0      winget
+Fabrikam Media Player 2 Fabrikam.MediaPlayer  2.0.11.6  2.1.0      winget
+Northwind Tools (x64)   Northwind.Tools.x64   < 4.0     4.2.1      winget
+Tailspin Notes          9NTAILSPIN0001        1.0.0.0   1.1.0.0    msstore
+4 アップグレードを利用できます。

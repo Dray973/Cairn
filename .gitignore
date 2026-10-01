@@ -1,0 +1,35 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# C++ / CMake
+/build/
+
+# Python
+/.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Native artifacts deployed into the package (rebuilt by tasks)
+/ui/optimizer/native/*.dll
+/ui/optimizer/native/*.pyd
+/ui/optimizer/native/*.pdb
+
+# Runtime state (journal DB, logs)
+/data/
+*.log
+
+# Setup program compiled into Inno Setup's default output folder
+/installer/Output/
+
+# IDE and tools
+.vs/
+*.user
+.claude/
+
+# Windows Explorer metadata
+desktop.ini
+Thumbs.db

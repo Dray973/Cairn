@@ -1,0 +1,84 @@
+{
+  // Debug configurations.
+  // NOTE: A debugger cannot elevate a process it spawns. To debug with Administrator rights,
+  // run the task "vscode: relaunch as Administrator" once; every F5 session then inherits the elevated token.
+  // The Python entry point self-checks IsUserAnAdmin() and refuses to run mutations when not elevated.
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "GUI: Python dashboard (debugpy)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "optimizer",
+      "cwd": "${workspaceFolder}/ui",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "preLaunchTask": "build: all (debug)",
+      "env": {
+        "PYTHONUTF8": "1",
+        "OPTIMIZER_LOG": "debug",
+        "RUST_BACKTRACE": "1"
+      }
+    },
+    {
+      "name": "GUI: Python dashboard (no rebuild)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "optimizer",
+      "cwd": "${workspaceFolder}/ui",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": { "PYTHONUTF8": "1", "OPTIMIZER_LOG": "debug", "RUST_BACKTRACE": "1" }
+    },
+    {
+      "name": "CLI: optctl.exe (Rust, cppvsdbg)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/target/debug/optctl.exe",
+      "args": ["--help"],
+      "cwd": "${workspaceFolder}",
+      "stopAtEntry": false,
+      "console": "integratedTerminal",
+      "preLaunchTask": "rust: build workspace (debug)",
+      "environment": [{ "name": "RUST_BACKTRACE", "value": "1" }],
+      "symbolSearchPath": "${workspaceFolder}/target/debug"
+    },
+    {
+      "name": "DLL: telemetry native debug (Python host, cppvsdbg)",
+      // Launches the GUI under the native debugger so breakpoints in telemetry/src/*.cpp hit.
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "args": ["-m", "optimizer"],
+      "cwd": "${workspaceFolder}/ui",
+      "stopAtEntry": false,
+      "console": "integratedTerminal",
+      "preLaunchTask": "build: all (debug)",
+      "symbolSearchPath": "${workspaceFolder}/build/cpp/bin/Debug;${workspaceFolder}/target/debug",
+      "environment": [{ "name": "PYTHONUTF8", "value": "1" }]
+    },
+    {
+      "name": "Attach: native (pick running python.exe)",
+      "type": "cppvsdbg",
+      "request": "attach",
+      "processId": "${command:pickProcess}",
+      "symbolSearchPath": "${workspaceFolder}/build/cpp/bin/Debug;${workspaceFolder}/target/debug"
+    },
+    {
+      "name": "Attach: Python (debugpy, port 5678)",
+      "type": "debugpy",
+      "request": "attach",
+      "connect": { "host": "127.0.0.1", "port": 5678 },
+      "justMyCode": false
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Mixed: Python + native attach",
+      "configurations": ["GUI: Python dashboard (no rebuild)", "Attach: native (pick running python.exe)"],
+      "stopAll": true
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+# Cairn: Python packages of the development environment (Python 3.12, Windows x64)
+# Install:  .venv\Scripts\python.exe -m pip install -r requirements.txt
+#
+# The runtime pins below equal those of requirements-runtime.txt, which adds their hashes for
+# the release build. The hashes stay out of this file: one hashed requirement switches pip into
+# hash-checking mode for the whole install, which would then demand a hash for every package,
+# including the dependencies of the development tools.
+
+# -- UI ----------------------------------------------------------------------------------
+customtkinter==6.0.0        # dark-themed Tk widgets
+darkdetect==0.8.0           # follows the system theme (CustomTkinter dependency)
+packaging==26.3             # CustomTkinter dependency
+pillow==12.3.0              # brand renderer, icons and CTkImage
+
+# -- Native bridges ----------------------------------------------------------------------
+# ctypes (stdlib)           -> optimizer_telemetry.dll
+# optimizer_engine.pyd      -> built by cargo (PyO3, abi3-py312), deployed by scripts/deploy_natives.ps1
+
+# -- Development tools -------------------------------------------------------------------
+-r requirements-dev.txt

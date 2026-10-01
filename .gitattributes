@@ -1,0 +1,7 @@
+# Text files are stored and checked out with LF line endings on every platform.
+* text=auto eol=lf
+*.png binary
+*.ico binary
+
+# Captured winget output keeps the CRLF line endings winget writes.
+crates/core/src/updates/winget/fixtures/*.txt -text

@@ -1,0 +1,36 @@
+{
+  "files.eol": "\n",
+  "files.exclude": {
+    "**/target": true,
+    "**/build": true,
+    "**/__pycache__": true,
+    "**/.venv": true
+  },
+  "search.exclude": { "**/target": true, "**/build": true, "**/.venv": true },
+
+  // Python
+  "python.defaultInterpreterPath": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+  "python.analysis.extraPaths": ["${workspaceFolder}/ui"],
+  "python.terminal.activateEnvironment": true,
+
+  // Rust
+  "rust-analyzer.linkedProjects": ["${workspaceFolder}/Cargo.toml"],
+  "rust-analyzer.check.command": "clippy",
+  "rust-analyzer.cargo.features": "all",
+  "rust-analyzer.cargo.extraEnv": {
+    "PYO3_PYTHON": "${workspaceFolder}\\.venv\\Scripts\\python.exe"
+  },
+
+  // C++ / CMake
+  "cmake.sourceDirectory": "${workspaceFolder}",
+  "cmake.buildDirectory": "${workspaceFolder}/build/cpp",
+  "cmake.generator": "Visual Studio 17 2022",
+  "cmake.configureOnOpen": false,
+  "C_Cpp.default.cppStandard": "c++20",
+  "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
+  "C_Cpp.default.compilerPath": "cl.exe",
+
+  "[rust]": { "editor.formatOnSave": true, "editor.defaultFormatter": "rust-lang.rust-analyzer" },
+  "[python]": { "editor.formatOnSave": true, "editor.defaultFormatter": "charliermarsh.ruff" },
+  "[cpp]": { "editor.formatOnSave": true }
+}

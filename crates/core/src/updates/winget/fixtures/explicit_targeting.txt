@@ -1,0 +1,10 @@
+Name                    Id                    Version   Available  Source
+---------------------------------------------------------------------------
+Contoso Editor          Contoso.Editor        1.2.0     1.3.0      winget
+Fabrikam Media Player 2 Fabrikam.MediaPlayer  2.0.11.6  2.1.0      winget
+2 upgrades available.
+
+The following packages have an upgrade available, but require explicit targeting for upgrade:
+Name                    Id                    Version   Available  Source
+---------------------------------------------------------------------------
+Litware Studio          Litware.Studio        5.0.1     5.1.0      winget

@@ -1,0 +1,7 @@
+# Cairn: development tools (not part of the installed copy).
+# Installed together with the runtime packages by requirements.txt.
+
+debugpy                     # VS Code Python debugger backend
+ruff                        # lint and format
+pytest
+pytest-timeout

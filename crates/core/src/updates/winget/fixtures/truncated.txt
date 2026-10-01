@@ -1,0 +1,5 @@
+Name                         Id                         Version  Available  Source
+-----------------------------------------------------------------------------------
+Contoso Very Long Product    Contoso.VeryLongProductNa… 3.1.0    3.2.0      winget
+Fabrikam Suite               Fabrikam.Suite…            7.0      7.1        winget
+2 upgrades available.

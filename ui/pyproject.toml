@@ -1,0 +1,20 @@
+[project]
+name = "cairn-ui"
+version = "0.2.0"
+requires-python = ">=3.12"
+description = "Cairn dashboard (CustomTkinter)"
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "BLE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 60
+# fd-level capture swaps the process's standard handles between tests; Tcl caches its
+# standard channels per process, and a Tk window created after a swap intermittently
+# fails to source tk.tcl. sys-level capture leaves the OS handles alone.
+addopts = "--capture=sys"

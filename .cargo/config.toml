@@ -1,0 +1,29 @@
+# Workspace-local cargo configuration.
+
+[build]
+# x86-64-v3 = AVX2/BMI2/FMA baseline: every Zen (AMD) and Haswell+ / Core Ultra (Intel) part.
+# Portable across modern hardware; swap for "native" if this binary never leaves this machine.
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+# OneDrive tip: cargo's target/ dir contains tens of thousands of files. If sync churn hurts,
+# uncomment to build outside the synced folder:
+# target-dir = "C:/dev/pc-optimizer-target"
+
+[target.x86_64-pc-windows-msvc]
+# Use the MSVC linker (installed with Build Tools). PyO3 + windows-rs both require the msvc ABI.
+linker = "link.exe"
+
+[net]
+git-fetch-with-cli = true
+
+[env]
+# Test and dev runs through cargo never create System Restore points.
+OPTIMIZER_FORBID_RESTORE_POINT = "1"
+# Test and dev runs through cargo never run a disk speed test at a volume root.
+OPTIMIZER_FORBID_DRIVE_TESTS = "1"
+# Test and dev runs through cargo never search Windows Update online.
+OPTIMIZER_FORBID_UPDATE_SEARCH = "1"
+# Test and dev runs through cargo never install or upgrade apps with winget.
+OPTIMIZER_FORBID_APP_INSTALLS = "1"
+# Tests and `cargo run` use a journal and logs under target\test-data, never the user's real data folder.
+OPTIMIZER_DATA_DIR = { value = "target/test-data", relative = true }
