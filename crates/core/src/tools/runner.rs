@@ -1690,10 +1690,12 @@ mod tests {
     }
 
     struct Harness {
-        dir: tempfile::TempDir,
         journal: Arc<Journal>,
         launcher: Arc<ScriptedLauncher>,
         runner: ToolRunner,
+        /// Declared last because fields drop in declaration order: the folder can be removed
+        /// only after the journal and the tool logs in it are closed.
+        dir: tempfile::TempDir,
     }
 
     #[derive(Clone, Copy)]

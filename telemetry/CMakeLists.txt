@@ -3,6 +3,10 @@
 # Release builds for other PCs turn this off, so the DLL also loads on CPUs without AVX2.
 option(TEL_AVX2 "Build with /arch:AVX2" ON)
 
+# The version resource (product name, version and description of the DLL) carries the project
+# version, which the root CMakeLists.txt reads from Cargo.toml.
+configure_file(src/version.rc.in "${CMAKE_CURRENT_BINARY_DIR}/version.rc" @ONLY)
+
 add_library(optimizer_telemetry SHARED
     src/telemetry.cpp
     src/cpu.cpp
@@ -11,6 +15,7 @@ add_library(optimizer_telemetry SHARED
     src/sampler.h
     include/telemetry/telemetry.h
     include/telemetry/ntinternal.h
+    "${CMAKE_CURRENT_BINARY_DIR}/version.rc"
 )
 
 target_include_directories(optimizer_telemetry
@@ -25,14 +30,16 @@ target_compile_definitions(optimizer_telemetry
         UNICODE _UNICODE
         _WIN32_WINNT=0x0A00
         WINVER=0x0A00
-        _CRT_SECURE_NO_WARNINGS)
+        _CRT_SECURE_NO_WARNINGS
+        "TEL_VERSION=\"${PROJECT_VERSION}\"")  # tel_version_string()
 
+# Compiler options apply to the C++ sources only; the resource compiler takes none of them.
 target_compile_options(optimizer_telemetry PRIVATE
-    /W4 /permissive- /Zc:__cplusplus /utf-8 /EHsc
-    $<$<CONFIG:Release>:/O2 /Oi /Ot /GL /Gy /Gw /guard:cf>
-    $<$<CONFIG:Debug>:/Od /Zi /RTC1>)
+    $<$<COMPILE_LANGUAGE:CXX>:/W4 /permissive- /Zc:__cplusplus /utf-8 /EHsc>
+    $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Release>>:/O2 /Oi /Ot /GL /Gy /Gw /guard:cf>
+    $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Debug>>:/Od /Zi /RTC1>)
 if(TEL_AVX2)
-    target_compile_options(optimizer_telemetry PRIVATE /arch:AVX2)
+    target_compile_options(optimizer_telemetry PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX2>)
 endif()
 
 # /PDBALTPATH records only the PDB's file name in the DLL, not the build folder's path. The name

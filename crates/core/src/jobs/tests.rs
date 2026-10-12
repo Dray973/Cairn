@@ -13,9 +13,11 @@ const TICK: Duration = Duration::from_millis(5);
 const LONG: Duration = Duration::from_secs(10);
 
 struct Fixture {
-    dir: tempfile::TempDir,
     journal: Arc<Journal>,
     host: JobHost,
+    /// Declared last because fields drop in declaration order: the folder can be removed only
+    /// after the journal and the job logs in it are closed.
+    dir: tempfile::TempDir,
 }
 
 fn config(dir: &Path) -> HostConfig {

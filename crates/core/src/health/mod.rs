@@ -1,8 +1,9 @@
 //! Read-only security checkup and boot history.
 //!
 //! - [`security_checkup`] reads Windows Security Center, Microsoft Defender, Windows Firewall,
-//!   Windows Update, BitLocker (administrators only), account and app settings, each source on
-//!   its own thread under an 8 s deadline, and rates 24 checks with a 0-100 score.
+//!   Windows Update, BitLocker (administrators only), account and app settings and Windows'
+//!   record of the Secure Boot certificate update, each source on its own thread under an 8 s
+//!   deadline, and rates 25 checks with a 0-100 score.
 //! - [`start_update_scan`] searches Windows Update for waiting updates on its own engine thread;
 //!   [`update_scan`] and [`cancel_update_scan`] only touch in-memory state.
 //! - [`boot_history`] reads start and shutdown durations from the Diagnostics-Performance log
@@ -10,7 +11,8 @@
 //!
 //! Nothing here changes the PC: no session, no journal record, no `ops_log` row, no external
 //! program. Fixes the window offers reuse the journaled apply and startup flows, or open
-//! Settings and Windows Security pages and built-in Windows tools.
+//! Settings and Windows Security pages, built-in Windows tools and the Microsoft web pages of
+//! [`MICROSOFT_LINKS`].
 
 pub mod boot;
 pub mod checkup;
@@ -19,6 +21,7 @@ pub mod updates;
 
 mod accounts;
 mod apps;
+mod certificates;
 mod device;
 mod network;
 mod probe;
@@ -35,8 +38,8 @@ pub use boot::{
     SlowEvent, SlowItem, SlowKind, Trend, MAX_BOOT_LIMIT,
 };
 pub use checkup::{
-    allowed_uri, Check, CheckGroup, CheckId, CheckState, Checkup, Fact, Fix, FixAction, Grade,
-    Score, Severity, Source, SourceError,
+    allowed_link, allowed_uri, Check, CheckGroup, CheckId, CheckState, Checkup, Fact, Fix,
+    FixAction, Grade, Score, Severity, Source, SourceError, MICROSOFT_LINKS,
 };
 pub use updates::{PendingUpdate, ScanState, UpdateScanView};
 
@@ -83,7 +86,7 @@ mod tests {
     use crate::win::update_agent::{SearchOutcome, UpdateStatus};
 
     /// Every file of this module and of the readers it uses; none may change anything.
-    const SOURCES: [(&str, &str); 17] = [
+    const SOURCES: [(&str, &str); 18] = [
         ("health/mod.rs", include_str!("mod.rs")),
         ("health/checkup.rs", include_str!("checkup.rs")),
         ("health/probe.rs", include_str!("probe.rs")),
@@ -91,6 +94,7 @@ mod tests {
         ("health/network.rs", include_str!("network.rs")),
         ("health/updates.rs", include_str!("updates.rs")),
         ("health/device.rs", include_str!("device.rs")),
+        ("health/certificates.rs", include_str!("certificates.rs")),
         ("health/accounts.rs", include_str!("accounts.rs")),
         ("health/apps.rs", include_str!("apps.rs")),
         ("health/boot.rs", include_str!("boot.rs")),
@@ -181,6 +185,18 @@ mod tests {
             concat!("windowsdefender://", "wdoscan"),
             concat!("windowsdefender://", "reboot"),
             concat!("windowsdefender://", "enableandupdate"),
+            // Firmware variables, the EFI system partition, the boot configuration and the
+            // Secure Boot servicing tools are never touched; the update task is only read.
+            concat!("SetFirmware", "Environment"),
+            concat!("GetFirmware", "Environment"),
+            concat!("Set-Secure", "BootUEFI"),
+            concat!("Get-Secure", "BootUEFI"),
+            concat!("mount", "vol"),
+            concat!("bcd", "edit"),
+            concat!("bcd", "boot"),
+            concat!("WinCs", "Flags"),
+            concat!("set", "_enabled"),
+            concat!("run_ignoring", "_conditions"),
         ];
         let mut scanner_scanned = false;
         for (name, source) in SOURCES {
@@ -257,6 +273,12 @@ mod tests {
         fn apps(&self, hive: &UserHive) -> crate::Result<apps::AppsRaw> {
             Live.apps(hive)
         }
+        fn secure_boot_certificates(
+            &self,
+            _elevated: bool,
+        ) -> crate::Result<certificates::CertificatesRaw> {
+            Live.secure_boot_certificates(false)
+        }
     }
 
     #[test]
@@ -270,21 +292,32 @@ mod tests {
             Utc::now(),
             checkup::CHECKUP_DEADLINE,
         );
-        assert_eq!(checkup.checks.len(), 24);
+        assert_eq!(checkup.checks.len(), 25);
         let ids: Vec<CheckId> = checkup.checks.iter().map(|c| c.id).collect();
         assert_eq!(ids, CheckId::ALL.to_vec());
         for check in &checkup.checks {
             assert!(!check.summary.is_empty(), "{:?} has no summary", check.id);
             for fix in &check.fixes {
-                if let FixAction::Uri { uri } = &fix.action {
-                    assert!(allowed_uri(uri), "{uri}");
+                match &fix.action {
+                    FixAction::Uri { uri } => assert!(allowed_uri(uri), "{uri}"),
+                    FixAction::Link { url } => assert!(allowed_link(url), "{url}"),
+                    _ => {}
                 }
             }
         }
-        assert!(checkup
-            .errors
-            .iter()
-            .all(|e| e.source != Source::WindowsUpdate));
+        assert!(checkup.errors.iter().all(
+            |e| e.source != Source::WindowsUpdate && e.source != Source::SecureBootCertificates
+        ));
+        let certificates = &checkup.checks[14];
+        assert_eq!(certificates.id, CheckId::SecureBootCertificates);
+        assert!(!certificates.needs_admin && !certificates.per_user);
+        println!(
+            "Secure Boot certificates: {:?}  ·  {}",
+            certificates.state, certificates.summary
+        );
+        for fact in &certificates.facts {
+            println!("  {}: {}", fact.label, fact.value);
+        }
         let pending = &checkup.checks[10];
         assert_eq!(pending.id, CheckId::PendingUpdates);
         assert_eq!(pending.summary, "Not checked yet");

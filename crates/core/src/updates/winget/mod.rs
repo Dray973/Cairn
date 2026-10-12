@@ -235,6 +235,30 @@ pub struct WingetEnv {
     pub servicing_tool: fn() -> Option<String>,
     pub now: fn() -> DateTime<Utc>,
     pub installs_forbidden: fn() -> bool,
+    /// Windows' pending-restart flags (read before and after a batch).
+    pub restart_flags: fn() -> RestartFlags,
+}
+
+/// Windows' own pending-restart flags. A batch compares them one by one before and after it
+/// runs, so a flag that was already set (a file operation an earlier install queued for the
+/// next boot, for example) does not hide one that turns on during the batch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RestartFlags {
+    /// `Component Based Servicing\RebootPending` exists.
+    pub servicing: bool,
+    /// `WindowsUpdate\Auto Update\RebootRequired` exists.
+    pub windows_update: bool,
+    /// `PendingFileRenameOperations` queues a file operation for the next boot.
+    pub file_renames: bool,
+}
+
+impl RestartFlags {
+    /// Whether a flag is set now that was not set in `before`.
+    pub fn appeared_since(self, before: RestartFlags) -> bool {
+        (self.servicing && !before.servicing)
+            || (self.windows_update && !before.windows_update)
+            || (self.file_renames && !before.file_renames)
+    }
 }
 
 impl fmt::Debug for WingetEnv {
@@ -260,7 +284,33 @@ impl WingetEnv {
         servicing_tool: system_servicing_tool,
         now: Utc::now,
         installs_forbidden: app_installs_forbidden,
+        restart_flags: system_restart_flags,
     };
+}
+
+/// Keys whose presence means Windows is waiting for a restart: Component Based Servicing and
+/// Windows Update.
+const CBS_REBOOT_PENDING: &str =
+    r"SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending";
+const WU_REBOOT_REQUIRED: &str =
+    r"SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired";
+/// Holds `PendingFileRenameOperations`, the file moves queued for the next boot.
+const SESSION_MANAGER: &str = r"SYSTEM\CurrentControlSet\Control\Session Manager";
+
+/// Windows' pending-restart flags: the Component Based Servicing and Windows Update reboot
+/// keys, and a file operation queued for the next boot (`PendingFileRenameOperations`).
+/// Read-only; a read that fails counts as not set, so a batch is never wrongly flagged.
+fn system_restart_flags() -> RestartFlags {
+    use crate::win::registry::{exists, read_value, Hive, RegValue};
+    let key_present = |path| matches!(exists(Hive::LocalMachine, path), Ok(true));
+    RestartFlags {
+        servicing: key_present(CBS_REBOOT_PENDING),
+        windows_update: key_present(WU_REBOOT_REQUIRED),
+        file_renames: matches!(
+            read_value(Hive::LocalMachine, SESSION_MANAGER, "PendingFileRenameOperations"),
+            Ok(Some(RegValue::MultiSz(items))) if items.iter().any(|s| !s.trim().is_empty())
+        ),
+    }
 }
 
 /// winget's status on this PC for this account. Starts no process and uses no network.
@@ -712,6 +762,10 @@ pub struct BatchResult {
     /// A stop was requested: no app starts after the current one.
     pub stopping: bool,
     pub restart_required: bool,
+    /// One of Windows' own pending-restart flags turned on while the batch ran, also when no
+    /// app reported a restart code: Windows needs a restart to finish.
+    #[serde(default)]
+    pub pending_restart: bool,
 }
 
 /// A plan and, unless it was a dry run, the job that started.

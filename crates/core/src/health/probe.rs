@@ -8,7 +8,7 @@ use crate::win::session::{self, SessionUser};
 use crate::Result;
 
 use super::checkup::{Source, SourceError};
-use super::{accounts, apps, device, network, protection, updates};
+use super::{accounts, apps, certificates, device, network, protection, updates};
 
 /// Facts about this process and session, read once before the source threads start.
 #[derive(Debug, Clone)]
@@ -121,6 +121,7 @@ pub(crate) struct CheckupRaw {
     pub(crate) accounts: std::result::Result<accounts::AccountsRaw, String>,
     pub(crate) remote: std::result::Result<network::RemoteRaw, String>,
     pub(crate) apps: std::result::Result<apps::AppsRaw, String>,
+    pub(crate) certificates: std::result::Result<certificates::CertificatesRaw, String>,
 }
 
 impl CheckupRaw {
@@ -143,6 +144,7 @@ impl CheckupRaw {
             err(Source::Accounts, &self.accounts),
             err(Source::Remote, &self.remote),
             err(Source::Apps, &self.apps),
+            err(Source::SecureBootCertificates, &self.certificates),
         ]
         .into_iter()
         .flatten()
@@ -165,6 +167,8 @@ pub(crate) trait Probe: Send + Sync {
     fn accounts(&self, ctx: &Context) -> Result<accounts::AccountsRaw>;
     fn remote(&self) -> Result<network::RemoteRaw>;
     fn apps(&self, hive: &UserHive) -> Result<apps::AppsRaw>;
+    /// Reads the update task only when `elevated` is true.
+    fn secure_boot_certificates(&self, elevated: bool) -> Result<certificates::CertificatesRaw>;
 }
 
 /// The probe of this PC.
@@ -219,6 +223,10 @@ impl Probe for Live {
 
     fn apps(&self, hive: &UserHive) -> Result<apps::AppsRaw> {
         apps::read_apps(hive)
+    }
+
+    fn secure_boot_certificates(&self, elevated: bool) -> Result<certificates::CertificatesRaw> {
+        certificates::read_certificates(elevated)
     }
 }
 
@@ -331,6 +339,9 @@ pub(crate) mod fixtures {
 
     use super::super::accounts::AccountsRaw;
     use super::super::apps::{AppsRaw, UserApps};
+    use super::super::certificates::{
+        self, Bucket, CertificatesRaw, FirmwareId, ServicingEvent, ServicingRaw, TaskRead,
+    };
     use super::super::device::{EncryptedVolume, EncryptionRaw};
     use super::super::network::{FirewallRaw, RemoteRaw};
     use super::super::protection::{DefenderMode, DefenderRaw, DefenderRead, WscRaw};
@@ -529,6 +540,34 @@ pub(crate) mod fixtures {
         }
     }
 
+    /// An event of the Secure Boot servicing `days` ago, without an error code.
+    pub(crate) fn event(id: u16, days: i64) -> ServicingEvent {
+        ServicingEvent {
+            id,
+            at: days_ago(days),
+            hresult: None,
+        }
+    }
+
+    /// The certificates are updated, the PC's group has Microsoft's high confidence and a
+    /// 1808 was logged two days ago; Contoso firmware; nothing read as administrator.
+    pub(crate) fn certificates() -> CertificatesRaw {
+        CertificatesRaw {
+            servicing: Ok(ServicingRaw {
+                status: Some(certificates::UpdateStatus::Updated),
+                bucket: Some(Bucket::HighConfidence),
+                firmware: FirmwareId {
+                    maker: Some("Contoso".into()),
+                    version: Some("1.0.7".into()),
+                    released: Some("2025-01-15".into()),
+                },
+                ..ServicingRaw::default()
+            }),
+            events: Ok(vec![event(1808, 2)]),
+            task: TaskRead::NotRead,
+        }
+    }
+
     /// Every source read, and every check passes.
     pub(crate) fn raw() -> CheckupRaw {
         CheckupRaw {
@@ -553,6 +592,7 @@ pub(crate) mod fixtures {
             accounts: Ok(accounts()),
             remote: Ok(remote()),
             apps: Ok(apps()),
+            certificates: Ok(certificates()),
         }
     }
 
@@ -573,6 +613,16 @@ pub(crate) mod fixtures {
     pub(crate) fn with_defender(raw: &mut CheckupRaw, change: impl FnOnce(&mut DefenderRaw)) {
         if let Ok(DefenderRead::Present(d)) = &mut raw.defender {
             change(d);
+        }
+    }
+
+    /// Changes the Secure Boot certificate reading of `raw`.
+    pub(crate) fn with_certificates(
+        raw: &mut CheckupRaw,
+        change: impl FnOnce(&mut CertificatesRaw),
+    ) {
+        if let Ok(c) = &mut raw.certificates {
+            change(c);
         }
     }
 }

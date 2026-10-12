@@ -780,8 +780,8 @@ fn feature_row(
 
 // ───────────────────────────── Summary and text ─────────────────────────────
 
-/// "Windows 11 Home 25H2  ·  Intel Core Ultra 7 265F  ·  32 GB RAM  ·  NVIDIA GeForce
-/// RTX 5060 Ti  ·  1.02 TB NVMe SSD"; unknown parts are left out.
+/// "Windows 11 Home 25H2  ·  Intel Core Ultra 5 245K  ·  32 GB RAM  ·  NVIDIA GeForce
+/// RTX 4060 Ti  ·  1.02 TB NVMe SSD"; unknown parts are left out.
 fn summary_line(info: &SystemInfo) -> String {
     let mut parts = Vec::new();
     if let Some(os) = &info.os {
@@ -1137,7 +1137,7 @@ pub(super) mod tests {
 
     pub(crate) fn fixture_cpu() -> CpuInfo {
         CpuInfo {
-            name: "Intel(R) Core(TM) Ultra 7 265F".into(),
+            name: "Intel(R) Core(TM) Ultra 5 245K".into(),
             vendor: "GenuineIntel".into(),
             identifier: "Intel64 Family 6 Model 198 Stepping 2".into(),
             packages: 1,
@@ -1185,7 +1185,7 @@ pub(super) mod tests {
 
     pub(crate) fn fixture_gpu() -> GpuInfo {
         GpuInfo {
-            name: "NVIDIA GeForce RTX 5060 Ti".into(),
+            name: "NVIDIA GeForce RTX 4060 Ti".into(),
             vendor: "NVIDIA".into(),
             vendor_id: 0x10DE,
             device_id: 0x2D04,
@@ -1208,7 +1208,7 @@ pub(super) mod tests {
             connection: "HDMI".into(),
             built_in: false,
             primary: true,
-            gpu: Some("NVIDIA GeForce RTX 5060 Ti".into()),
+            gpu: Some("NVIDIA GeForce RTX 4060 Ti".into()),
         }
     }
 
@@ -1341,7 +1341,7 @@ Windows
   Fast Startup         On
 
 Processor
-  Name                 Intel Core Ultra 7 265F
+  Name                 Intel Core Ultra 5 245K
   Cores                20 (8 performance, 12 efficiency)
   Logical processors   20
   Base speed           2.40 GHz
@@ -1360,7 +1360,7 @@ Memory
   ChannelB DIMM1       16 GB DDR5 DIMM  ·  5600 MT/s  ·  Fabrikam FD5-16G-5600
 
 Graphics
-  NVIDIA GeForce RTX 5060 Ti
+  NVIDIA GeForce RTX 4060 Ti
     Manufacturer       NVIDIA
     Dedicated memory   8 GB
     Shared memory      15.8 GB
@@ -1844,7 +1844,7 @@ Security
         let rows = &section_of(&snap, Section::Displays).rows;
         assert!(row(rows, "Contoso 27Q")
             .value
-            .ends_with("  ·  on NVIDIA GeForce RTX 5060 Ti"));
+            .ends_with("  ·  on NVIDIA GeForce RTX 4060 Ti"));
         assert!(row(rows, "Built-in display")
             .value
             .ends_with("  ·  on Intel Graphics"));
@@ -2177,8 +2177,8 @@ Security
         let snap = render(fixture_info(), utc());
         assert_eq!(
             snap.summary,
-            "Windows 11 Home 25H2  ·  Intel Core Ultra 7 265F  ·  32 GB RAM  ·  \
-             NVIDIA GeForce RTX 5060 Ti  ·  1.02 TB NVMe SSD"
+            "Windows 11 Home 25H2  ·  Intel Core Ultra 5 245K  ·  32 GB RAM  ·  \
+             NVIDIA GeForce RTX 4060 Ti  ·  1.02 TB NVMe SSD"
         );
 
         // Unknown parts are left out; the real adapter with the most memory is named.
@@ -2200,7 +2200,7 @@ Security
         let snap = render(info, utc());
         assert_eq!(
             snap.summary,
-            "Windows 11 Home  ·  31.7 GB RAM  ·  NVIDIA GeForce RTX 5060 Ti"
+            "Windows 11 Home  ·  31.7 GB RAM  ·  NVIDIA GeForce RTX 4060 Ti"
         );
 
         let empty = SystemInfo {

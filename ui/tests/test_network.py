@@ -572,14 +572,19 @@ def test_fake_dns_change_records_first_and_reverts() -> None:
     wifi = next(a for a in engine.network_list()["adapters"] if a["id"] == WIFI)
     assert wifi["dns_ipv4"]["mode"] == "automatic" and not wifi["dns_revertible"]
 
-    # A failed later write keeps the target of the last write that succeeded.
+    # A failed write leaves no active record; a failed later write keeps the target of the last
+    # write that succeeded.
     failing = FakeEngine(elevated=True, dns_fail={"ipv4"})
     failing.network_set_dns(ETHERNET, "custom", ["9.9.9.9"])
+    assert failing._dns_active_count() == 0
     failing.dns_fail.clear()
     failing.network_set_dns(ETHERNET, "custom", ["8.8.8.8"])
     failing.dns_fail.add("ipv4")
     failing.network_set_dns(ETHERNET, "custom", ["1.1.1.1"])
-    assert [r["target_servers"] for r in failing._dns_export()] == [["8.8.8.8"]]
+    assert [(r["active"], r["target_servers"]) for r in failing._dns_export()] == [
+        (False, ["9.9.9.9"]),
+        (True, ["8.8.8.8"]),
+    ]
 
 
 def test_fake_adapters_without_a_link_list_no_servers_in_use() -> None:

@@ -5,6 +5,12 @@ records before each change, so the section's Undo, History and Revert All restor
 is only logged: updating or installing an app can't be undone; the engine writes an audit
 row before each app starts and one when it ends (History › Activity).
 
+An install winget reports as successful counts as installed only while a check finds the app
+in Windows' list of installed apps: some installers hand the install to another process and
+exit at once, so the check that follows a batch can show the app still missing. Until a check
+has found it, such an app shows winget's report, then the `succeeded_unlisted` state when the
+check doesn't list it, and never ✓ Installed.
+
 winget runs as engine-owned jobs of the "updates" job lane. A start is queued on the worker
 like any other call; after that the frame loop reads the job 10 times a second while the
 section is shown and twice a second otherwise, and again on the next frame while the engine
@@ -14,7 +20,7 @@ most 200 lines per frame once it is shown. The status bar shows the job in every
 Nothing loads at start: the first visit reads winget's status and, once it is ready, checks
 for app updates; the Windows Update view reads its settings on every visit.
 
-Uses these members of the window: `engine`, `elevated`, `errors`, `_busy`,
+Uses these members of the window: `engine`, `elevated`, `errors`, `_busy`, `_status_serial`,
 `section_visible`, `set_status`, `set_job_status`, `_guard`, `_set_busy`, `_show_error`,
 `_refresh_journal`, `load_history`, `_revert_done`, `_continue_close`, `_running_close`,
 `state`, `withdraw` and `update_idletasks`.
@@ -24,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import tkinter as tk
+from collections.abc import Iterable, Mapping
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, Any
 
@@ -36,12 +43,15 @@ from ..widgets.updates import (
     OTHER_USER_TEXT,
     POLICY_CAVEAT,
     SETTING_TITLES,
+    UNLISTED_STATE,
+    UNLISTED_TEXT,
     USER_UNKNOWN_TEXT,
     WINGET_MISSING_TEXT,
     WINGET_OUTDATED_TEXT,
     UpdatesPanel,
     apps_text,
     batch_line,
+    day_text,
     version_change,
 )
 
@@ -54,6 +64,9 @@ __all__ = [
     "AGREEMENTS_NOTE",
     "ALL_INSTALLED_TEXT",
     "BATCH_RUNNING_TEXT",
+    "DEBLOAT_OVERLAP",
+    "DEBLOAT_REMOVED_NOTE",
+    "DEPENDENCIES_NOTE",
     "HOME_DEFER_TEXT",
     "INSTALL_CONFIRM_MESSAGE",
     "IRREVERSIBLE_NOTE",
@@ -63,6 +76,7 @@ __all__ = [
     "RESTORE_POINT_TIP",
     "STOPPING_TEXT",
     "TOO_MANY_TEXT",
+    "UNLISTED_TEXT",
     "UNSUPPORTED_TEXT",
     "UPDATES_SECTION",
     "UPDATE_CONFIRM_MESSAGE",
@@ -70,6 +84,7 @@ __all__ = [
     "UpdatesFeature",
     "WINGET_MISSING_TEXT",
     "WINGET_OUTDATED_TEXT",
+    "removed_apps",
 ]
 
 log = logging.getLogger(__name__)
@@ -112,13 +127,50 @@ SELECT_INSTALLS_TEXT = "Select the apps to install."
 # Most apps the engine takes in one batch.
 MAX_BATCH_ITEMS = 200
 TOO_MANY_TEXT = "Pick at most {limit} apps at a time."
-# States of a batch item after which the app is on this PC.
+# States of a batch item after which the app is on this PC; an install winget reported as
+# successful or as needing a restart counts only once a check lists the app.
 INSTALLED_STATES = ("succeeded", "already_installed", "already_current", "restart_required")
+# winget id -> the package name of the same app in Debloat's list, for the apps both offer.
+DEBLOAT_OVERLAP = {"Microsoft.Teams": "MSTeams"}
+DEBLOAT_REMOVED_NOTE = (
+    APP_NAME + " removed this app on {date} (History). Installing it again doesn't change that record."
+)
+DEPENDENCIES_NOTE = (
+    "When an app needs a runtime that isn't on this PC, such as the Visual C++ runtime or .NET, winget "
+    "installs it as part of that app's install; it gets no rows of its own in History › Activity."
+)
 
 
 def _job_id(job: Any) -> int | None:
     value = job.get("id") if isinstance(job, dict) else None
     return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _overlap(package: Any) -> str | None:
+    """The Debloat package name of the winget id `package`, when Debloat also lists the app."""
+    key = str(package or "").lower()
+    return next((name for winget, name in DEBLOAT_OVERLAP.items() if winget.lower() == key), None)
+
+
+def removed_apps(export: Mapping[str, Any], items: Iterable[Mapping[str, Any]]) -> dict[str, str]:
+    """Lower-case id -> the RFC 3339 time of the newest active Debloat removal record (an Appx
+    entry of the journal export) of each item's app that Debloat also lists."""
+    wanted = {
+        str(item.get("id") or "").lower(): package.lower()
+        for item in items
+        if (package := _overlap(item.get("id"))) is not None
+    }
+    newest: dict[str, str] = {}
+    for record in export.get("appx") or []:
+        if not record.get("active"):
+            continue
+        family = str(record.get("package_family") or "")
+        name = (family.rsplit("_", 1)[0] if "_" in family else family).lower()
+        stamp = str(record.get("recorded_at") or "")
+        for key, package in wanted.items():
+            if package == name and stamp > newest.get(key, ""):
+                newest[key] = stamp
+    return newest
 
 
 class UpdatesFeature:
@@ -130,7 +182,13 @@ class UpdatesFeature:
     finishes, for its log, and `_last_batch_job` is the last update or install batch, whose
     log Open log opens while the job strip shows that batch's result line. `_updates_last_results`
     keeps each app's last batch result of this session (id lowercased), for the "Last attempt"
-    notes, Update all and the installed apps.
+    notes, Update all and the installed apps. `_updates_reported` holds the lowercased ids whose
+    last result is an install winget reported as successful or as needing a restart, which only a
+    check's list shows as installed, and `_updates_unverified` the successful ones no check has
+    found yet.
+    `_last_batch_result` and `_last_batch_state` are the last batch's result and job state, whose
+    line the job strip may still show, and `_batch_status_serial` the window's status serial
+    right after that line went to the status bar, so a check can reword it while it is shown.
     """
 
     _updates_supported: bool
@@ -154,6 +212,11 @@ class UpdatesFeature:
     _updates_result_rev: int
     _updates_result: dict[str, Any] | None
     _updates_last_results: dict[str, dict[str, Any]]
+    _updates_reported: set[str]
+    _updates_unverified: set[str]
+    _last_batch_result: dict[str, Any] | None
+    _last_batch_state: Any
+    _batch_status_serial: int
     _updates_starting: str | None
     _last_updates_job: int | None
     _last_batch_job: int | None
@@ -164,6 +227,7 @@ class UpdatesFeature:
         elevated: bool
         errors: list[str]
         _busy: bool
+        _status_serial: int
 
         def section_visible(self, name: str) -> bool: ...
         def set_status(self, text: str, color: str = ...) -> None: ...
@@ -203,6 +267,11 @@ class UpdatesFeature:
         self._updates_result_rev = 0
         self._updates_result = None
         self._updates_last_results = {}
+        self._updates_reported = set()
+        self._updates_unverified = set()
+        self._last_batch_result = None
+        self._last_batch_state = None
+        self._batch_status_serial = -1
         # Kind of the job whose start is queued on the worker.
         self._updates_starting = None
         self._last_updates_job = None
@@ -323,7 +392,7 @@ class UpdatesFeature:
             self._updates_apps_loading = False
             exc = future.exception()
             if exc is not None:
-                self.updates_panel.install.show_error(f"Could not read the install list: {exc}")
+                self.updates_panel.install.show_load_error(f"Could not read the install list: {exc}")
                 return
             self._updates_apps = dict(future.result() or {})
             self.updates_panel.install.show_apps(self._updates_apps, self._updates_installed_ids())
@@ -331,15 +400,18 @@ class UpdatesFeature:
         engine.updates_app_list(callback=done)
 
     def _updates_installed_ids(self) -> list[str] | None:
-        """Ids the last check found installed, plus the apps a batch of this session left on
+        """Ids the last check found installed, plus the apps a batch of this session found on
         this PC (winget's list of installed apps can leave out an app it finds by id); None
-        before any check."""
+        before any check. An install winget reported as successful or as needing a restart is
+        one of them only while the last check lists it."""
         if self._updates_scan is None:
             return None
         ids = [str(i) for i in self._updates_scan.get("installed") or []]
         known = {i.lower() for i in ids}
         for key, item in self._updates_last_results.items():
-            if item.get("state") in INSTALLED_STATES and key not in known:
+            if key in known or key in self._updates_reported:
+                continue
+            if item.get("state") in INSTALLED_STATES:
                 ids.append(str(item.get("id") or key))
                 known.add(key)
         return ids
@@ -448,6 +520,7 @@ class UpdatesFeature:
             if kind == "upgrade":
                 panel.apps.set_items(queued, "upgrade")
             else:
+                panel.install.reveal(str(i.get("id")) for i in items)
                 panel.install.set_items(queued)
             self.set_status(f"{self._updates_job_title}…")
             if self.section_visible("History"):
@@ -593,6 +666,7 @@ class UpdatesFeature:
             self.set_status(f"Could not check for app updates: {text}", theme.WARNING)
             return
         self._updates_scan = result
+        self._verify_installs(result)
         panel.apps.show_scan(result, self._updates_last_results)
         if self._updates_apps is not None:
             panel.install.show_apps(self._updates_apps, self._updates_installed_ids())
@@ -607,20 +681,89 @@ class UpdatesFeature:
         else:
             panel.show_job(False)
 
-    def _updates_batch_finished(self, state: Any, result: dict[str, Any] | None) -> None:
-        panel = self.updates_panel
-        items = [dict(i) for i in (result or {}).get("items") or []]
-        for item in items:
-            self._updates_last_results[str(item.get("id", "")).lower()] = item
+    def _verify_installs(self, result: Mapping[str, Any]) -> None:
+        """Compares the installs winget reported as successful with the apps a finished check
+        found: one Windows doesn't list gets `succeeded_unlisted` and is not counted as installed
+        until a later check finds it. A check that failed or could not read the installed apps
+        changes nothing. The last install batch's line is reworded where it is still shown: in
+        the job strip and, when nothing else was written there since, in the status bar."""
+        if not self._updates_unverified or result.get("error") or result.get("inventory_complete") is False:
+            return
+        listed = {str(i).lower() for i in result.get("installed") or []}
+        changed = []
+        for key in sorted(self._updates_unverified):
+            item = self._updates_last_results.get(key)
+            state = (item or {}).get("state")
+            if item is None or state not in ("succeeded", UNLISTED_STATE):
+                self._updates_unverified.discard(key)
+                continue
+            if key in listed:
+                self._updates_unverified.discard(key)
+                if state == "succeeded":
+                    continue
+                item = {**item, "state": "succeeded", "message": None}
+            elif state == UNLISTED_STATE:
+                continue
+            else:
+                item = {**item, "state": UNLISTED_STATE, "message": UNLISTED_TEXT}
+            self._updates_last_results[key] = item
+            changed.append(item)
+        if not changed:
+            return
+        self.updates_panel.install.set_items(changed)
+        batch = self._last_batch_result
+        if batch is None or batch.get("kind") != "install":
+            return
+        items = [
+            self._updates_last_results.get(str(i.get("id", "")).lower(), i) for i in batch.get("items") or []
+        ]
+        batch = {**batch, "items": items}
+        line, color = self._batch_line(self._last_batch_state, batch)
+        if self.updates_panel.job.shows_batch_result:
+            self.updates_panel.job.replace_result(line, color)
+        if self._status_serial == self._batch_status_serial:
+            summary = batch_line(batch)
+            self.set_status(f"Done: {summary}" if summary else "The apps job ended.", color)
+            self._batch_status_serial = self._status_serial
+
+    @staticmethod
+    def _batch_line(state: Any, result: Mapping[str, Any] | None) -> tuple[str, str]:
+        """The result line of a finished batch and its colour."""
+        items = list((result or {}).get("items") or [])
         line = batch_line(result) if result else ""
-        failed = any(i.get("state") in ("failed", "timed_out", "not_started") for i in items)
+        doubtful = ("failed", "timed_out", "not_started", UNLISTED_STATE)
+        failed = any(i.get("state") in doubtful for i in items)
         color = theme.WARNING if failed or state in ("failed", "attention") else theme.GOOD
         if state == "cancelled":
             color = theme.INK_SECONDARY
-        panel.job.finish(line or "The job ended without a result.", color)
+        return line or "The job ended without a result.", color
+
+    def _updates_batch_finished(self, state: Any, result: dict[str, Any] | None) -> None:
+        panel = self.updates_panel
+        items = [dict(i) for i in (result or {}).get("items") or []]
+        installing = (result or {}).get("kind") == "install"
+        for item in items:
+            key = str(item.get("id", "")).lower()
+            self._updates_last_results[key] = item
+            if installing and item.get("state") == "succeeded":
+                self._updates_reported.add(key)
+                self._updates_unverified.add(key)
+            elif installing and item.get("state") == "restart_required":
+                # Shown as needing a restart until a check lists the app.
+                self._updates_reported.add(key)
+                self._updates_unverified.discard(key)
+            else:
+                self._updates_reported.discard(key)
+                self._updates_unverified.discard(key)
+        self._last_batch_result = dict(result) if result is not None else None
+        self._last_batch_state = state
+        line = batch_line(result) if result else ""
+        shown, color = self._batch_line(state, result)
+        panel.job.finish(shown, color)
         if result is not None:
             self._show_updates_result(result)
         self.set_status(f"Done: {line}" if line else "The apps job ended.", color)
+        self._batch_status_serial = self._status_serial
         self._refresh_journal()
         if self.section_visible("History"):
             self.load_history()
@@ -713,11 +856,42 @@ class UpdatesFeature:
             if blocked:
                 self.set_status(str(blocked), theme.WARNING)
                 return
+            if kind == "install" and any(_overlap(i.get("id")) for i in items):
+                self._confirm_after_removals(items, plan)
+                return
             self._confirm_updates(kind, items, plan)
 
         self.engine.plan_updates(kind, items, callback=planned)
 
-    def _confirm_updates(self, kind: str, items: list[dict[str, Any]], plan: dict[str, Any]) -> None:
+    def _confirm_after_removals(self, items: list[dict[str, Any]], plan: dict[str, Any]) -> None:
+        """Reads the journal for Debloat removals of the apps both lists offer, then asks; a
+        journal that can't be read leaves the notes out."""
+        engine = self.engine
+        if engine is None:
+            return
+        self._set_busy(True, "read")
+
+        def exported(future: Future[Any]) -> None:
+            self._set_busy(False)
+            removed: dict[str, str] = {}
+            exc = future.exception()
+            if exc is not None:
+                log.warning("reading the journal for removed apps failed: %s", exc)
+            else:
+                removed = removed_apps(future.result() or {}, items)
+            self._confirm_updates("install", items, plan, removed)
+
+        engine.journal_export(callback=exported)
+
+    def _confirm_updates(
+        self,
+        kind: str,
+        items: list[dict[str, Any]],
+        plan: dict[str, Any],
+        removed: Mapping[str, str] | None = None,
+    ) -> None:
+        """Asks before a batch starts. `removed` maps the lower-case ids of apps Cairn removed
+        with Debloat to the time of that removal, which the install's details mention."""
         shown = [dict(i) for i in plan.get("items") or items]
         count = len(shown)
         if kind == "upgrade":
@@ -728,7 +902,14 @@ class UpdatesFeature:
             title, verb, message = f"Update {apps_text(count)}?", "Update", UPDATE_CONFIRM_MESSAGE
             acknowledge = f"I understand these updates can't be undone by {APP_NAME}"
         else:
-            details = [f"{i.get('name') or i.get('id')}  ·  {i.get('id')}" for i in shown]
+            details = []
+            for i in shown:
+                name = i.get("name") or i.get("id")
+                details.append(f"{name}  ·  {i.get('id')}")
+                when = (removed or {}).get(str(i.get("id") or "").lower())
+                if when:
+                    details.append(f"{name}  ·  {DEBLOAT_REMOVED_NOTE.format(date=day_text(when))}")
+            details.append(DEPENDENCIES_NOTE)
             title, verb, message = f"Install {apps_text(count)}?", "Install", INSTALL_CONFIRM_MESSAGE
             acknowledge = f"I understand these installs can't be undone by {APP_NAME}"
         details += [f"• {note}" for note in plan.get("notes") or []]

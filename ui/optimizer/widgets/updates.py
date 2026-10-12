@@ -1,9 +1,10 @@
 """Updates section: app updates and installs through winget, and the Windows Update settings.
 
 The section shows one of three views, picked with a segmented switch: App updates (the
-apps winget can update), Install apps (a curated, editable list) and Windows Update (pause,
-active hours and three more settings). A job strip below them follows the winget job that
-runs, with its progress, its output and its log.
+apps winget can update), Install apps (a curated, editable list in category sections that
+build their tiles when first opened, with a Find box) and Windows Update (pause, active
+hours and three more settings). A job strip below them follows the winget job that runs,
+with its progress, its output and its log.
 
 The pure helpers at the top shape the engine's results for display and need no window.
 Widgets never create dialogs; the feature does, with the window as their master.
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import tkinter as tk
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import datetime
@@ -23,6 +25,7 @@ import customtkinter as ctk
 from .. import APP_NAME, theme
 from .controls import PANEL_WRAP, ROW_WRAP, WRAP_MARGIN, WRAP_STEP, fitted_wrap
 from .monitor import set_text
+from .search import SearchEntry, matches, search_terms
 from .tools import FLUSH_LINES, MAX_OUTPUT_LINES, OutputBuffer, fmt_duration
 
 log = logging.getLogger(__name__)
@@ -91,17 +94,52 @@ APP_INSTALLER_ID = "Microsoft.AppInstaller"
 MAX_NAME_CHARS = 80
 # Above this many rows the list uses plain Tk labels, which draw much faster.
 LIGHT_ROWS_ABOVE = 60
+# The install state of an app winget reported as installed but the next check did not find in
+# Windows' list of installed apps; it never shows as installed.
+UNLISTED_STATE = "succeeded_unlisted"
+UNLISTED_TEXT = "winget reported success, but Windows doesn't list it yet. Choose Check again in a minute."
+# What an install winget reported as successful shows until a check finds the app in Windows'
+# list of installed apps.
+REPORTED_TEXT = "winget reported success. The next check shows whether Windows lists it."
+# Install states after which an app is on this PC or its installer may still be running; an app
+# whose install reaches one is unticked, so it isn't sent to winget twice by mistake.
+INSTALL_DONE_STATES = (
+    "succeeded",
+    UNLISTED_STATE,
+    "already_installed",
+    "restart_required",
+    "timed_out",
+    "left_running",
+)
+DEFAULT_LIST_NOTICE = (
+    "The default list has {apps} your list doesn't. Restore the default list to see them; your own "
+    "additions are then removed."
+)
+FIND_PLACEHOLDER = "Find an app"
+FIND_NONE_TEXT = "No app on the list matches your search."
+FIND_ONE_TEXT = "1 app matches."
+FIND_COUNT_TEXT = "{count} apps match."
+FIND_LIMIT_TEXT = "{count} apps match. The first {shown} are shown; type more to narrow the search."
+# A list with more apps than this starts with every section closed.
+OPEN_SECTIONS_UP_TO = 40
+# Most tiles a search shows at once.
+MAX_FIND_RESULTS = 40
 
-# Category id -> heading, in display order.
+# Category id -> heading, in display order. Apps of any other category are listed last under
+# OTHER_TITLE.
 CATEGORY_TITLES = {
     "browsers": "Browsers",
     "chat": "Chat and calls",
     "gaming": "Gaming",
     "media": "Media",
+    "creative": "Creative tools",
     "productivity": "Productivity",
     "utilities": "Utilities",
+    "security": "Security and privacy",
     "developer": "Developer tools",
 }
+OTHER_KEY = "other"
+OTHER_TITLE = "Other"
 
 PAUSE_CHOICES = ("1 week", "2 weeks", "3 weeks", "4 weeks", "5 weeks")
 DEFER_CHOICES = ("Don't delay", "30 days", "60 days", "90 days", "180 days", "365 days")
@@ -137,6 +175,7 @@ _ITEM_STATUS: dict[str, tuple[str, str]] = {
     "left_running": ("◐ Continues after " + APP_NAME + " closed", "INK_SECONDARY"),
     "not_started": ("– Not started", "INK_MUTED"),
     "skipped": ("– Skipped", "INK_MUTED"),
+    UNLISTED_STATE: ("◐ " + UNLISTED_TEXT, "INK_SECONDARY"),
 }
 
 
@@ -172,7 +211,10 @@ def item_status(
     state: str | None, message: str | None, kind: str, progress: str | None = None
 ) -> tuple[str, str]:
     """Status text of one app of a batch and the name of its theme colour. `kind` is "upgrade"
-    or "install"; `progress` is added to a running item ("◐ Updating…  ·  45%")."""
+    or "install"; `progress` is added to a running item ("◐ Updating…  ·  45%"). An install
+    winget reported as successful shows that report: ✓ Installed comes only from a check. The
+    `message` of a successful app is Windows' own pending-restart note, which winget's exit
+    code does not carry; it is shown after the report."""
     installing = kind == "install"
     if state == "running":
         text = "◐ Installing…" if installing else "◐ Updating…"
@@ -180,7 +222,10 @@ def item_status(
             text += f"  ·  {progress}"
         return text, "ACCENT"
     if state == "succeeded":
-        return ("✓ Installed" if installing else "✓ Updated"), "GOOD"
+        text, colour = ("◐ " + REPORTED_TEXT, "INK_SECONDARY") if installing else ("✓ Updated", "GOOD")
+        if message:
+            return f"{text}  ·  ⚠ {message}", "WARNING"
+        return text, colour
     if state == "failed":
         return f"⚠ Failed: {message}" if message else "⚠ Failed", "SERIOUS"
     if state in _ITEM_STATUS:
@@ -366,17 +411,92 @@ def valid_package_id(text: str, source: str = "winget") -> bool:
     return 2 <= len(parts) <= 8 and all(parts)
 
 
-def group_apps(apps: Iterable[Mapping[str, Any]]) -> list[tuple[str, list[dict[str, Any]]]]:
-    """(heading, apps) per category in display order, without empty categories; apps of an
-    unknown category come last under "Other"."""
+def app_key(app: Mapping[str, Any]) -> str:
+    """The app's id in lower case: winget ids ignore case."""
+    return str(app.get("id") or "").lower()
+
+
+def app_sections(apps: Iterable[dict[str, Any]]) -> list[tuple[str, str, list[dict[str, Any]]]]:
+    """(category key, heading, apps) per category in display order, without empty categories;
+    apps of an unknown category come last under OTHER_KEY. The apps are the given dicts."""
     groups: dict[str, list[dict[str, Any]]] = {key: [] for key in CATEGORY_TITLES}
     other: list[dict[str, Any]] = []
     for app in apps:
-        groups.get(str(app.get("category")), other).append(dict(app))
-    out = [(CATEGORY_TITLES[key], items) for key, items in groups.items() if items]
+        groups.get(str(app.get("category")), other).append(app)
+    out = [(key, CATEGORY_TITLES[key], items) for key, items in groups.items() if items]
     if other:
-        out.append(("Other", other))
+        out.append((OTHER_KEY, OTHER_TITLE, other))
     return out
+
+
+def group_apps(apps: Iterable[Mapping[str, Any]]) -> list[tuple[str, list[dict[str, Any]]]]:
+    """(heading, apps) per category in display order, without empty categories; apps of an
+    unknown category come last under "Other"."""
+    return [(title, items) for _key, title, items in app_sections(dict(app) for app in apps)]
+
+
+# A change from a lower-case letter or digit to an upper-case letter, from a digit to a
+# lower-case letter, and before the last capital of a run of capitals that starts a word.
+_CASE_CHANGE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[0-9])(?=[a-z])|(?<=[A-Z])(?=[A-Z][a-z])")
+
+
+def case_words(text: str) -> str:
+    """`text` with a space at each change of case inside a word, so the words of a name
+    written together can be found: "NanaZip" -> "Nana Zip", "OBSStudio" -> "OBS Studio",
+    "7zip" -> "7 zip"."""
+    return _CASE_CHANGE.sub(" ", text)
+
+
+def app_matches(app: Mapping[str, Any], terms: Sequence[str]) -> bool:
+    """Whether every search term starts a word of the app's name or id, also counting the
+    words a change of case separates ("zip" finds "7-Zip" and "NanaZip", never "Unzipped")."""
+    name = str(app.get("name") or "")
+    package = str(app.get("id") or "")
+    return matches([name, package, case_words(name), case_words(package)], terms)
+
+
+def find_text(count: int, shown: int) -> str:
+    """The note under the Install apps summary while a search runs: how many apps match and,
+    when not all of them are shown, how many are."""
+    if count == 0:
+        return FIND_NONE_TEXT
+    if shown < count:
+        return FIND_LIMIT_TEXT.format(count=count, shown=shown)
+    return FIND_ONE_TEXT if count == 1 else FIND_COUNT_TEXT.format(count=count)
+
+
+def section_text(
+    title: str,
+    apps: Sequence[Mapping[str, Any]],
+    installed: set[str] | None,
+    chosen: set[str],
+    expanded: bool,
+) -> str:
+    """The header of an install list section: "▸ Gaming  ·  9 apps  ·  2 installed  ·  1 selected",
+    without the counts that are zero; `installed` (lower-case ids) is None before any check and
+    `chosen` holds the ticked lower-case ids, of which only those not installed count."""
+    keys = [app_key(app) for app in apps]
+    parts = [title, apps_text(len(keys))]
+    on_pc = installed or set()
+    count = sum(1 for key in keys if key in on_pc)
+    if installed is not None and count:
+        parts.append(f"{count} installed")
+    picked = sum(1 for key in keys if key in chosen and key not in on_pc)
+    if picked:
+        parts.append(f"{picked} selected")
+    return f"{'▾' if expanded else '▸'} " + "  ·  ".join(parts)
+
+
+def missing_defaults(apps: Iterable[Mapping[str, Any]], default_ids: Iterable[str]) -> int:
+    """How many apps of the default list `apps` lacks (ids compared ignoring case)."""
+    have = {app_key(app) for app in apps}
+    return len({str(i).lower() for i in default_ids} - have)
+
+
+def day_text(stamp: str | None) -> str:
+    """The local date of an RFC 3339 `stamp` ("2026-10-01"), or the stamp as it is."""
+    local = _local(stamp)
+    return local.strftime("%Y-%m-%d") if local is not None else str(stamp or "")
 
 
 def install_summary(apps: Sequence[Mapping[str, Any]], installed: Iterable[str] | None) -> str:
@@ -385,6 +505,11 @@ def install_summary(apps: Sequence[Mapping[str, Any]], installed: Iterable[str] 
     ids = {i.lower() for i in installed}
     count = sum(1 for app in apps if str(app.get("id", "")).lower() in ids)
     return f"{INSTALL_INTRO}  ·  {count} of {len(apps)} already installed"
+
+
+# A batch result when Windows' own pending-restart flags turned on during the batch, also
+# when no app reported a restart code.
+BATCH_PENDING_RESTART_TEXT = "⚠ Windows reports a pending restart; restart Windows to finish"
 
 
 def batch_line(result: Mapping[str, Any] | None) -> str:
@@ -401,6 +526,9 @@ def batch_line(result: Mapping[str, Any] | None) -> str:
     done = count("succeeded")
     if done:
         parts.append(f"✓ {done} {'installed' if installing else 'updated'}")
+    unlisted = count(UNLISTED_STATE)
+    if unlisted:
+        parts.append(f"◐ {unlisted} not listed yet")
     already = count("already_installed", "already_current")
     if already:
         parts.append(f"{already} already {'installed' if installing else 'up to date'}")
@@ -416,7 +544,12 @@ def batch_line(result: Mapping[str, Any] | None) -> str:
     not_started = count("not_started", "queued", "running")
     if not_started:
         parts.append(f"{not_started} not started")
-    return "  ·  ".join(parts) or "Nothing was changed."
+    line = "  ·  ".join(parts) or "Nothing was changed."
+    # Windows' own pending-restart flags turned on during the batch, which winget's exit codes
+    # do not carry, so it is noted on the batch result even when every app exited cleanly.
+    if result.get("pending_restart"):
+        line += f"  ·  {BATCH_PENDING_RESTART_TEXT}"
+    return line
 
 
 def edition_text(edition: Mapping[str, Any]) -> str:
@@ -735,6 +868,13 @@ class JobStrip(ctk.CTkFrame, _Wrapping):
             set_text(self.label, self._result_title)
             _set_color(self.label, theme.INK_SECONDARY)
         _show(self.result_label, shown, row=3, column=0, sticky="ew", padx=self.PAD, pady=(0, 8))
+
+    def replace_result(self, result_line: str, color: str) -> None:
+        """Rewords the result line shown, keeping the job it belongs to; nothing when none is."""
+        if not self.result_text:
+            return
+        set_text(self.result_label, result_line)
+        _set_color(self.result_label, color)
 
     def lose(self, text: str) -> None:
         self.running = False
@@ -1158,8 +1298,10 @@ class AppTile(ctk.CTkFrame):
     """One app of the install list: a check box, its name and id on the left, and on the right
     whether it is installed or how its install went. In edit mode it offers Remove.
 
-    The status wraps at `STATUS_WRAP`; the name and the id wrap in the width the status
-    leaves them, which follows the tile's width (`set_tile_width`) and the status text."""
+    The view keeps the selection and the statuses and tells the tile what to show; a click on
+    the check box is reported through `on_toggle(tile)`. The status wraps at `STATUS_WRAP`; the
+    name and the id wrap in the width the status leaves them, which follows the tile's width
+    (`set_tile_width`) and the status text."""
 
     # Widest the status gets before it wraps, and the width the Remove link takes.
     STATUS_WRAP = 200
@@ -1177,17 +1319,25 @@ class AppTile(ctk.CTkFrame):
         *,
         installed: bool,
         editing: bool,
-        on_toggle: Callable[[], None],
+        on_toggle: Callable[[AppTile], None],
         on_remove: Callable[[dict[str, Any]], None],
         width: float = DEFAULT_WIDTH,
+        selected: bool = False,
+        status: tuple[str, str] | None = None,
     ) -> None:
         super().__init__(master, fg_color=theme.SURFACE_RAISED, corner_radius=8)
         self.app = app
         self.installed = installed
+        # (row, column) of the tile in its section's grid; None while it is not gridded.
+        self.cell: tuple[int, int] | None = None
         self._tile_width = width
+        self._enabled = True
+        self._status: tuple[str, str] = ("", "INK_MUTED")
         self.grid_columnconfigure(1, weight=1)
-        self.var = tk.IntVar(value=0)
-        self.check = ctk.CTkCheckBox(self, text="", width=24, variable=self.var, command=on_toggle)
+        self.var = tk.IntVar(value=1 if selected and not installed else 0)
+        self.check = ctk.CTkCheckBox(
+            self, text="", width=24, variable=self.var, command=lambda: on_toggle(self)
+        )
         self.check.grid(row=0, column=0, padx=(10, 4), pady=8, sticky="n")
         texts = ctk.CTkFrame(self, fg_color="transparent")
         texts.grid(row=0, column=1, sticky="new", padx=4, pady=8)
@@ -1204,15 +1354,14 @@ class AppTile(ctk.CTkFrame):
         self.id_label.grid(row=1, column=0, sticky="w")
         side = ctk.CTkFrame(self, fg_color="transparent")
         side.grid(row=0, column=2, sticky="ne", padx=(4, 8), pady=(8, 6))
-        self.badge = _label(
-            side, "✓ Installed" if installed else "", 11, theme.GOOD, wraplength=self.STATUS_WRAP
-        )
+        self.badge = _label(side, "", 11, theme.GOOD, wraplength=self.STATUS_WRAP)
         self.badge.grid(row=0, column=0, sticky="e", padx=(0, 2))
         self.remove = _link(side, "Remove", lambda: on_remove(app))
         if editing:
             self.remove.grid(row=1, column=0, sticky="e", pady=(4, 0))
         if installed:
             self.check.configure(state="disabled")
+        self.set_status(*(status or (("✓ Installed", "GOOD") if installed else ("", "INK_MUTED"))))
         self._rewrap()
 
     @property
@@ -1220,12 +1369,39 @@ class AppTile(ctk.CTkFrame):
         return not self.installed and self.var.get() == 1
 
     def set_enabled(self, enabled: bool) -> None:
+        self._enabled = enabled
         _set_state(self.check, enabled and not self.installed)
 
+    def set_installed(self, installed: bool) -> None:
+        """An installed app can't be ticked; its box shows empty."""
+        if installed == self.installed:
+            return
+        self.installed = installed
+        if installed and self.var.get() != 0:
+            self.var.set(0)
+        _set_state(self.check, self._enabled and not installed)
+
+    def set_selected(self, selected: bool) -> None:
+        value = 1 if selected and not self.installed else 0
+        if self.var.get() != value:
+            self.var.set(value)
+
+    def set_editing(self, editing: bool) -> None:
+        """Shows or hides Remove; the texts wrap again around it."""
+        _show(self.remove, editing, row=1, column=0, sticky="e", pady=(4, 0))
+        self._rewrap()
+
     def set_status(self, text: str, color_name: str) -> None:
+        if (text, color_name) == self._status:
+            return
+        self._status = (text, color_name)
         set_text(self.badge, text)
         _set_color(self.badge, getattr(theme, color_name, theme.INK_MUTED))
         self._rewrap()
+
+    @property
+    def status_text(self) -> str:
+        return str(self.badge.cget("text"))
 
     def set_tile_width(self, width: float) -> None:
         """Tells the tile its width in CustomTkinter units, so its texts wrap inside it."""
@@ -1248,8 +1424,41 @@ class AppTile(ctk.CTkFrame):
                 label.configure(wraplength=wrap)
 
 
+class _Section:
+    """One category of the install list: the header that opens and closes it, and the frame of
+    its tiles, each built the first time it is shown."""
+
+    def __init__(self, key: str, title: str, header: ctk.CTkButton) -> None:
+        self.key = key
+        self.title = title
+        self.header = header
+        self.apps: list[dict[str, Any]] = []
+        self.frame: ctk.CTkFrame | None = None
+        # Lower-case id -> the tile built for it.
+        self.tiles: dict[str, AppTile] = {}
+        self.expanded = False
+
+
+def _names(apps: Iterable[Mapping[str, Any]]) -> list[tuple[str, str]]:
+    """(id, name) of each app: what a section's tiles show."""
+    return [(str(app.get("id") or ""), str(app.get("name") or "")) for app in apps]
+
+
 class InstallAppsView(ctk.CTkFrame, _Wrapping):
-    """The Install apps card: the list by category, Install selected and the list editor."""
+    """The Install apps card: the list in category sections, the Find box, Check again, Install
+    selected and the list editor.
+
+    A section's header opens and closes it. Its tiles are built the first time they are shown;
+    closing the section hides them with `grid_forget`, and they are gridded again at their
+    places when it opens. A section nobody opened or closed is closed when the list has more
+    than `OPEN_SECTIONS_UP_TO` apps and open otherwise; a section opened or closed keeps that
+    while the window is open. The selection and each app's last install status are kept here,
+    not in the tiles, so a closed section keeps its ticks and shows an install's progress when
+    it opens. An app a check lists shows ✓ Installed and loses its install status, so a later
+    check that no longer lists it shows the app as not installed. A search opens the sections
+    with matching apps and shows only those, at most `MAX_FIND_RESULTS`; clearing it brings the
+    sections back as they were. Showing a list again rebuilds only the sections whose apps
+    changed."""
 
     PAD = 14
     # Gap on each side of a tile; two tiles share the list's width.
@@ -1269,16 +1478,32 @@ class InstallAppsView(ctk.CTkFrame, _Wrapping):
         )
         self._on_save_list = on_save_list
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(3, weight=1)
+        self.grid_rowconfigure(4, weight=1)
         self.apps: list[dict[str, Any]] = []
         self.installed: list[str] | None = None
-        self.tiles: list[AppTile] = []
+        self.custom = False
+        self.default_ids: list[str] = []
+        self.warnings: list[str] = []
         self.editing = False
         self._enabled = True
         self._job_running = False
         self._ready = True
         self._body_width = -1
         self._tile_width: float = AppTile.DEFAULT_WIDTH
+        # Lower-case ids of `installed`; None before any check.
+        self._installed_keys: set[str] | None = None
+        # Lower-case ids ticked; only those not installed are installed by Install selected.
+        self._chosen: set[str] = set()
+        # Lower-case id -> (status text, theme colour name) of the app's last install.
+        self._status: dict[str, tuple[str, str]] = {}
+        self._sections: dict[str, _Section] = {}
+        # Category key -> whether its section was opened (True) or closed (False) by a click or
+        # by an install that started; a search keeps its own.
+        self._open: dict[str, bool] = {}
+        self._find_open: dict[str, bool] = {}
+        self._terms: list[str] = []
+        # (id, name, category) of the apps the sections were built for.
+        self._shown: list[tuple[str, str, str]] = []
 
         header = ctk.CTkFrame(self, fg_color="transparent")
         header.grid(row=0, column=0, sticky="ew", padx=self.PAD, pady=(10, 0))
@@ -1286,23 +1511,28 @@ class InstallAppsView(ctk.CTkFrame, _Wrapping):
         _label(header, "Install apps", 13, theme.INK_SECONDARY, weight="bold").grid(
             row=0, column=0, sticky="w"
         )
-        self.edit_button = _neutral(header, "Edit list", self._toggle_editing, width=100)
-        self.edit_button.grid(row=0, column=1, padx=(8, 0))
+        self.find = SearchEntry(header, placeholder=FIND_PLACEHOLDER, on_change=self._find_changed, width=140)
+        self.find.grid(row=0, column=1, padx=(8, 0))
+        self.check_button = _neutral(header, "Check again", on_check, width=100)
+        self.check_button.grid(row=0, column=2, padx=(8, 0))
+        self.edit_button = _neutral(header, "Edit list", self._toggle_editing, width=90)
+        self.edit_button.grid(row=0, column=3, padx=(8, 0))
         self.install_button = _accent(header, "Install selected (0)", on_install)
-        self.install_button.grid(row=0, column=2, padx=(8, 0))
+        self.install_button.grid(row=0, column=4, padx=(8, 0))
         self.summary = _label(self, INSTALL_CHECKING_TEXT, 11, theme.INK_MUTED, wraplength=PANEL_WRAP)
         self.summary.grid(row=1, column=0, sticky="ew", padx=self.PAD, pady=(4, 0))
+        self.find_note = _label(self, "", 11, theme.INK_SECONDARY, wraplength=PANEL_WRAP)
         self.notice = _label(
             self, f"{IRREVERSIBLE_NOTE}  {AGREEMENTS_NOTE}", 10, theme.INK_MUTED, wraplength=PANEL_WRAP
         )
-        self.notice.grid(row=2, column=0, sticky="ew", padx=self.PAD, pady=(4, 6))
+        self.notice.grid(row=3, column=0, sticky="ew", padx=self.PAD, pady=(4, 6))
 
         self.body = ctk.CTkScrollableFrame(self, fg_color="transparent")
         self.body.grid_columnconfigure(0, weight=1)
-        self.body.grid(row=3, column=0, sticky="nsew", padx=6, pady=(0, 8))
+        self.body.grid(row=4, column=0, sticky="nsew", padx=6, pady=(0, 8))
         self.body.bind("<Configure>", self._body_resized, add="+")
         self._groups = ctk.CTkFrame(self.body, fg_color="transparent")
-        self._groups.grid(row=0, column=0, sticky="ew")
+        self._groups.grid(row=1, column=0, sticky="ew")
         self._groups.grid_columnconfigure(0, weight=1)
 
         self.form = ctk.CTkFrame(self.body, fg_color=theme.SURFACE_RAISED, corner_radius=8)
@@ -1330,8 +1560,277 @@ class InstallAppsView(ctk.CTkFrame, _Wrapping):
         self.store_button = _accent(
             self, "Get App Installer", lambda: on_open_uri(APP_INSTALLER_STORE_URI), width=150
         )
-        self._init_wrapping(self, [self.summary, self.notice, self.message], 2 * self.PAD + 24, PANEL_WRAP)
+        self._init_wrapping(
+            self, [self.summary, self.find_note, self.notice, self.message], 2 * self.PAD + 24, PANEL_WRAP
+        )
         self._refresh_buttons()
+
+    # -- the model -----------------------------------------------------------------------
+
+    @property
+    def tiles(self) -> list[AppTile]:
+        """The tiles built so far, in list order."""
+        return [
+            tile
+            for section in self._sections.values()
+            for app in section.apps
+            if (tile := section.tiles.get(app_key(app))) is not None
+        ]
+
+    @property
+    def sections(self) -> dict[str, _Section]:
+        """The sections shown, by category key, in display order."""
+        return dict(self._sections)
+
+    def _installed(self, key: str) -> bool:
+        return self._installed_keys is not None and key in self._installed_keys
+
+    def _badge(self, key: str) -> tuple[str, str]:
+        """What an app's tile shows on its right: ✓ Installed once a check found it, otherwise
+        its last install status."""
+        if self._installed(key):
+            return "✓ Installed", "GOOD"
+        return self._status.get(key, ("", "INK_MUTED"))
+
+    def selected_items(self) -> list[dict[str, Any]]:
+        """The ticked apps that are not installed, in list order."""
+        return [
+            {
+                "id": str(app["id"]),
+                "source": str(app.get("source") or "winget"),
+                "name": str(app.get("name") or app["id"]),
+            }
+            for app in self.apps
+            if app_key(app) in self._chosen and not self._installed(app_key(app))
+        ]
+
+    @property
+    def selection_count(self) -> int:
+        """Ticked apps, installed or not."""
+        return sum(1 for app in self.apps if app_key(app) in self._chosen)
+
+    def show_apps(self, app_list: Mapping[str, Any] | None, installed: Iterable[str] | None) -> None:
+        """Shows the list with the installed apps marked (`installed` None: not known yet); the
+        install statuses of the installed apps are dropped."""
+        try:
+            listing = app_list or {}
+            apps = [dict(a) for a in listing.get("apps") or []]
+            self.installed = None if installed is None else [str(i) for i in installed]
+            self._installed_keys = None if self.installed is None else {i.lower() for i in self.installed}
+            for key in (self._installed_keys or set()) & self._status.keys():
+                del self._status[key]
+            self.custom = bool(listing.get("custom"))
+            self.default_ids = [str(i) for i in listing.get("default_ids") or []]
+            self.warnings = [str(w) for w in listing.get("warnings") or []]
+            self._set_apps(apps)
+            self._refresh_summary()
+        except Exception as exc:  # noqa: BLE001 - malformed engine data is shown, not raised
+            log.exception("showing the install list failed")
+            self.show_load_error(f"The list could not be read: {exc}")
+
+    def _set_apps(self, apps: list[dict[str, Any]]) -> None:
+        self.apps = apps
+        self._chosen &= {app_key(app) for app in apps}
+        shown = [
+            (*name, str(app.get("category") or "")) for name, app in zip(_names(apps), apps, strict=True)
+        ]
+        if shown != self._shown:
+            self._shown = shown
+            self._rebuild_sections()
+        else:
+            for (_key, _title, items), section in zip(
+                app_sections(apps), self._sections.values(), strict=True
+            ):
+                section.apps = items
+        for section in self._sections.values():
+            for key, tile in section.tiles.items():
+                self._refresh_tile(key, tile)
+        self._layout()
+        self._refresh_buttons()
+
+    def _rebuild_sections(self) -> None:
+        """Matches the sections to the apps: a section whose apps changed loses its tiles, a
+        category without apps loses its section."""
+        old = self._sections
+        self._sections = {}
+        for key, title, apps in app_sections(self.apps):
+            section = old.pop(key, None)
+            if section is None:
+                section = self._new_section(key, title)
+            elif _names(section.apps) != _names(apps):
+                self._drop_tiles(section)
+            section.apps = apps
+            self._sections[key] = section
+        for section in old.values():
+            self._drop_tiles(section)
+            section.header.destroy()
+            if section.frame is not None:
+                section.frame.destroy()
+
+    def _new_section(self, key: str, title: str) -> _Section:
+        header = ctk.CTkButton(
+            self._groups,
+            text=title,
+            height=28,
+            font=_font(12, "bold"),
+            fg_color="transparent",
+            hover_color=theme.BUTTON_NEUTRAL_HOVER,
+            text_color=theme.INK_SECONDARY,
+            anchor="w",
+            command=lambda: self.toggle_section(key),
+        )
+        return _Section(key, title, header)
+
+    @staticmethod
+    def _drop_tiles(section: _Section) -> None:
+        for tile in section.tiles.values():
+            tile.destroy()
+        section.tiles = {}
+
+    def _tile(self, key: str) -> AppTile | None:
+        for section in self._sections.values():
+            tile = section.tiles.get(key)
+            if tile is not None:
+                return tile
+        return None
+
+    def _new_tile(self, master: tk.Misc, app: dict[str, Any]) -> AppTile:
+        key = app_key(app)
+        tile = AppTile(
+            master,
+            app,
+            installed=self._installed(key),
+            editing=self.editing,
+            on_toggle=self._tile_toggled,
+            on_remove=self._remove,
+            width=self._tile_width,
+            selected=key in self._chosen,
+            status=self._badge(key),
+        )
+        tile.set_enabled(not self._job_running)
+        return tile
+
+    def _refresh_tile(self, key: str, tile: AppTile) -> None:
+        tile.set_installed(self._installed(key))
+        tile.set_selected(key in self._chosen)
+        tile.set_status(*self._badge(key))
+        tile.set_enabled(not self._job_running)
+
+    def _tile_toggled(self, tile: AppTile) -> None:
+        key = app_key(tile.app)
+        if tile.var.get() == 1:
+            self._chosen.add(key)
+        else:
+            self._chosen.discard(key)
+        self._refresh_headers()
+        self._refresh_buttons()
+
+    # -- sections and the search ---------------------------------------------------------
+
+    def toggle_section(self, key: str) -> None:
+        """Opens or closes a section; during a search only for that search."""
+        section = self._sections.get(key)
+        if section is None:
+            return
+        if self._terms:
+            self._find_open[key] = not section.expanded
+        else:
+            self._open[key] = not section.expanded
+        self._layout()
+
+    def reveal(self, ids: Iterable[str]) -> None:
+        """Opens the sections holding `ids`, after ending a search, so the progress of an
+        install that starts shows without a click."""
+        keys = {str(i).lower() for i in ids}
+        if self._terms:
+            self.find.clear()
+        opened = False
+        for section in self._sections.values():
+            if not section.expanded and any(app_key(app) in keys for app in section.apps):
+                self._open[section.key] = True
+                opened = True
+        if opened:
+            self._layout()
+
+    def _opened(self, key: str) -> bool:
+        """Whether a section is open outside a search: as it was last opened or closed, else
+        open only in a list of at most `OPEN_SECTIONS_UP_TO` apps."""
+        return self._open.get(key, len(self.apps) <= OPEN_SECTIONS_UP_TO)
+
+    def _find_changed(self, query: str) -> None:
+        terms = search_terms(query)
+        if terms == self._terms:
+            return
+        self._terms = terms
+        self._find_open = {}
+        self._layout()
+
+    def _layout(self) -> None:
+        """Grids each section's header and, when it is open, its tiles. During a search only
+        the sections with matching apps are listed, open unless closed during that search,
+        with their matching tiles up to `MAX_FIND_RESULTS` in all."""
+        budget = MAX_FIND_RESULTS
+        found = 0
+        for index, section in enumerate(self._sections.values()):
+            if self._terms:
+                matching = [app for app in section.apps if app_matches(app, self._terms)]
+                found += len(matching)
+                shown = matching[:budget]
+                budget -= len(shown)
+                listed = bool(shown)
+                section.expanded = listed and self._find_open.get(section.key, True)
+            else:
+                shown = section.apps
+                listed = True
+                section.expanded = self._opened(section.key)
+            self._place_section(section, 2 * index, listed, shown if section.expanded else [])
+        if self._terms:
+            set_text(self.find_note, find_text(found, MAX_FIND_RESULTS - budget))
+        _show(self.find_note, bool(self._terms), row=2, column=0, sticky="ew", padx=self.PAD, pady=(2, 0))
+
+    def _place_section(self, section: _Section, row: int, listed: bool, shown: list[dict[str, Any]]) -> None:
+        set_text(section.header, self._header_text(section))
+        if listed:
+            section.header.grid(row=row, column=0, sticky="ew", padx=2, pady=(6, 0))
+        elif _managed(section.header):
+            section.header.grid_forget()
+        if not shown:
+            if section.frame is not None and _managed(section.frame):
+                section.frame.grid_forget()
+            return
+        if section.frame is None:
+            section.frame = ctk.CTkFrame(self._groups, fg_color="transparent")
+            section.frame.grid_columnconfigure((0, 1), weight=1, uniform="tiles")
+        self._grid_tiles(section, section.frame, shown)
+        section.frame.grid(row=row + 1, column=0, sticky="ew")
+
+    def _grid_tiles(self, section: _Section, frame: ctk.CTkFrame, shown: list[dict[str, Any]]) -> None:
+        """Builds the tiles of `shown` that don't exist yet and grids them two per row in
+        their order; the section's other tiles are forgotten."""
+        cells = {app_key(app): index for index, app in enumerate(shown)}
+        for app in shown:
+            if app_key(app) not in section.tiles:
+                section.tiles[app_key(app)] = self._new_tile(frame, app)
+        for key, tile in section.tiles.items():
+            index = cells.get(key)
+            if index is None:
+                if tile.cell is not None:
+                    tile.grid_forget()
+                    tile.cell = None
+                continue
+            cell = (index // 2, index % 2)
+            if tile.cell != cell:
+                tile.grid(row=cell[0], column=cell[1], sticky="nsew", padx=self.TILE_PADX, pady=3)
+                tile.cell = cell
+
+    def _header_text(self, section: _Section) -> str:
+        return section_text(section.title, section.apps, self._installed_keys, self._chosen, section.expanded)
+
+    def _refresh_headers(self) -> None:
+        for section in self._sections.values():
+            set_text(section.header, self._header_text(section))
+
+    # -- the rest of the card ------------------------------------------------------------
 
     def _body_resized(self, event: tk.Event) -> None:
         if event.width == self._body_width:
@@ -1339,19 +1838,32 @@ class InstallAppsView(ctk.CTkFrame, _Wrapping):
         self._body_width = event.width
         scale = ctk.ScalingTracker.get_widget_scaling(self) or 1.0
         self._tile_width = event.width / scale / 2 - 2 * self.TILE_PADX
-        for tile in self.tiles:
-            tile.set_tile_width(self._tile_width)
+        for section in self._sections.values():
+            for tile in section.tiles.values():
+                tile.set_tile_width(self._tile_width)
+
+    def _refresh_summary(self) -> None:
+        lines = [install_summary(self.apps, self.installed)]
+        lines += [f"⚠ {w}" for w in self.warnings]
+        missing = missing_defaults(self.apps, self.default_ids) if self.custom else 0
+        if missing:
+            lines.append(DEFAULT_LIST_NOTICE.format(apps=apps_text(missing)))
+        set_text(self.summary, "\n".join(lines))
+        _set_color(self.summary, theme.INK_MUTED)
 
     def _toggle_editing(self) -> None:
         self.set_editing(not self.editing)
 
     def set_editing(self, editing: bool) -> None:
+        """Shows or hides the editor and the tiles' Remove links; no tile is built again."""
         self.editing = editing
         set_text(self.edit_button, "Done" if editing else "Edit list")
-        _show(self.form, editing, row=1, column=0, sticky="ew", padx=6, pady=(8, 6))
+        _show(self.form, editing, row=0, column=0, sticky="ew", padx=6, pady=(8, 6))
         if not editing:
             self.show_error("")
-        self._build_tiles()
+        for section in self._sections.values():
+            for tile in section.tiles.values():
+                tile.set_editing(editing)
 
     def set_winget(self, status: Mapping[str, Any] | None) -> None:
         availability = (status or {}).get("availability", "ready")
@@ -1361,12 +1873,12 @@ class InstallAppsView(ctk.CTkFrame, _Wrapping):
             "other_user": OTHER_USER_TEXT,
             "user_unknown": USER_UNKNOWN_TEXT,
         }.get(str(availability))
-        _show(self.message, text is not None, row=4, column=0, sticky="ew", padx=self.PAD, pady=(0, 6))
+        _show(self.message, text is not None, row=5, column=0, sticky="ew", padx=self.PAD, pady=(0, 6))
         if text is not None:
             set_text(self.message, text)
         missing = availability == "missing"
-        _show(self.store_button, missing, row=5, column=0, sticky="w", padx=self.PAD, pady=(0, 6))
-        _show(self.message_check, missing, row=6, column=0, sticky="w", padx=self.PAD, pady=(0, 10))
+        _show(self.store_button, missing, row=6, column=0, sticky="w", padx=self.PAD, pady=(0, 6))
+        _show(self.message_check, missing, row=7, column=0, sticky="w", padx=self.PAD, pady=(0, 10))
         self._refresh_buttons()
 
     def set_enabled(self, enabled: bool, job_running: bool) -> None:
@@ -1380,92 +1892,44 @@ class InstallAppsView(ctk.CTkFrame, _Wrapping):
         can_act = self._enabled and not self._job_running and self._ready
         _set_state(self.install_button, can_act and selected > 0)
         _set_state(self.edit_button, self._enabled)
+        _set_state(self.check_button, self._enabled and not self._job_running)
         _set_state(self.message_check, self._enabled and not self._job_running)
-        for tile in self.tiles:
-            tile.set_enabled(not self._job_running)
+        for section in self._sections.values():
+            for tile in section.tiles.values():
+                tile.set_enabled(not self._job_running)
         for widget in (self.add_button, self.reset_link):
             _set_state(widget, self._enabled and not self._job_running)
 
-    def show_apps(self, app_list: Mapping[str, Any] | None, installed: Iterable[str] | None) -> None:
-        """Shows the list with the installed apps marked (`installed` None: not known yet)."""
-        try:
-            self.apps = [dict(a) for a in (app_list or {}).get("apps") or []]
-            self.installed = None if installed is None else [str(i) for i in installed]
-            warnings = [str(w) for w in (app_list or {}).get("warnings") or []]
-            text = install_summary(self.apps, self.installed)
-            if warnings:
-                text += "\n" + "\n".join(f"⚠ {w}" for w in warnings)
-            set_text(self.summary, text)
-            _set_color(self.summary, theme.INK_MUTED)
-            self._build_tiles()
-        except Exception as exc:  # noqa: BLE001 - malformed engine data is shown, not raised
-            log.exception("showing the install list failed")
-            self.show_error(f"The list could not be read: {exc}")
-
-    def _is_installed(self, app: Mapping[str, Any]) -> bool:
-        ids = {i.lower() for i in self.installed or []}
-        return str(app.get("id", "")).lower() in ids
-
-    def _build_tiles(self) -> None:
-        chosen = {t.app["id"] for t in self.tiles if t.selected}
-        for child in self._groups.winfo_children():
-            child.destroy()
-        self.tiles = []
-        row = 0
-        for title, apps in group_apps(self.apps):
-            _label(self._groups, title, 12, theme.INK_SECONDARY, weight="bold").grid(
-                row=row, column=0, sticky="w", padx=8, pady=(10, 2)
-            )
-            row += 1
-            grid = ctk.CTkFrame(self._groups, fg_color="transparent")
-            grid.grid(row=row, column=0, sticky="ew")
-            grid.grid_columnconfigure((0, 1), weight=1, uniform="tiles")
-            row += 1
-            for index, app in enumerate(apps):
-                tile = AppTile(
-                    grid,
-                    app,
-                    installed=self._is_installed(app),
-                    editing=self.editing,
-                    on_toggle=self._refresh_buttons,
-                    on_remove=self._remove,
-                    width=self._tile_width,
-                )
-                if app["id"] in chosen and not tile.installed:
-                    tile.var.set(1)
-                tile.grid(row=index // 2, column=index % 2, sticky="nsew", padx=self.TILE_PADX, pady=3)
-                self.tiles.append(tile)
-        self._refresh_buttons()
-
-    def selected_items(self) -> list[dict[str, Any]]:
-        return [
-            {
-                "id": str(t.app["id"]),
-                "source": str(t.app.get("source") or "winget"),
-                "name": str(t.app.get("name")),
-            }
-            for t in self.tiles
-            if t.selected
-        ]
-
-    @property
-    def selection_count(self) -> int:
-        """Ticked tiles, installed or not."""
-        return sum(1 for t in self.tiles if t.var.get() == 1)
-
     def set_items(self, items: Sequence[Mapping[str, Any]]) -> None:
-        by_id = {str(i.get("id", "")).lower(): i for i in items}
-        for tile in self.tiles:
-            item = by_id.get(str(tile.app.get("id", "")).lower())
-            if item is not None:
-                text, color = item_status(
-                    item.get("state"), item.get("message"), "install", item.get("progress")
-                )
-                tile.set_status(text, color)
+        """Shows the install state of each app; an app whose section is closed shows it once
+        its section opens. An app whose state is one of `INSTALL_DONE_STATES` is unticked; an
+        app that failed or didn't start keeps its tick for another try."""
+        unticked = False
+        for item in items:
+            key = str(item.get("id", "")).lower()
+            self._status[key] = item_status(
+                item.get("state"), item.get("message"), "install", item.get("progress")
+            )
+            if item.get("state") in INSTALL_DONE_STATES and key in self._chosen:
+                self._chosen.discard(key)
+                unticked = True
+            tile = self._tile(key)
+            if tile is not None:
+                tile.set_selected(key in self._chosen)
+                tile.set_status(*self._badge(key))
+        if unticked:
+            self._refresh_headers()
+            self._refresh_buttons()
 
     def show_error(self, text: str) -> None:
+        """Shows a problem of the list editor under its fields ("" hides it)."""
         set_text(self.error, text)
         _show(self.error, bool(text), row=1, column=0, columnspan=4, sticky="w", padx=10, pady=(0, 4))
+
+    def show_load_error(self, text: str) -> None:
+        """Shows that the list could not be read, in place of the summary."""
+        set_text(self.summary, f"⚠ {text}")
+        _set_color(self.summary, theme.WARNING)
 
     def _entries(self) -> list[dict[str, Any]]:
         return [

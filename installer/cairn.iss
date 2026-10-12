@@ -2,12 +2,18 @@
 ;
 ; Built by scripts\build_release.ps1:
 ;   ISCC /DAppVersion=<x.y.z> /DStageDir=<stage folder> /DOutputDir=<output folder> installer\cairn.iss
+; For a signed release it also passes /DSignedUninstallerDir=<folder>: the first compile then
+; writes the uninstaller into that folder and stops until a signed copy replaces it there; the
+; next compile embeds the signed uninstaller.
 ;
 ; Installs per machine into Program Files\Cairn (no folder choice), upgrades in place, refuses
 ; downgrades and removes only what it installed plus Cairn's scheduled maintenance tasks. The
 ; change history, the logs and every other file of the user's data folder stay: the history is
 ; the only way to undo changes that are still applied.
 
+#if Ver < EncodeVer(6, 3, 0)
+  #error Inno Setup 6.3 or later is required
+#endif
 #ifndef AppVersion
   #error AppVersion must be defined (/DAppVersion=x.y.z)
 #endif
@@ -37,10 +43,14 @@ AppPublisherURL={#AppUrl}
 AppSupportURL={#AppUrl}/issues
 AppUpdatesURL={#AppUrl}/releases
 AppCopyright=Copyright (c) 2026 {#AppPublisher}
+; The product name and version of the setup and of its uninstaller, which code signing checks.
 VersionInfoVersion={#AppVersion}.0
+VersionInfoTextVersion={#AppVersion}
 VersionInfoCompany={#AppPublisher}
 VersionInfoDescription={#AppName} Setup
 VersionInfoProductName={#AppName}
+VersionInfoProductVersion={#AppVersion}.0
+VersionInfoProductTextVersion={#AppVersion}
 ; Always Program Files\Cairn: the launcher elevates only from a folder that administrators alone
 ; can change, so there is no folder page and no earlier folder is reused.
 DefaultDirName={autopf}\{#AppName}
@@ -68,9 +78,11 @@ CloseApplications=yes
 CloseApplicationsFilter=*.exe,*.dll,*.pyd
 RestartApplications=no
 UsedUserAreasWarning=no
-#ifdef SignTool
-SignTool={#SignTool}
+; The uninstaller carries an external signature: see the header. Without the define, the setup
+; embeds an unsigned uninstaller.
+#ifdef SignedUninstallerDir
 SignedUninstaller=yes
+SignedUninstallerDir={#SignedUninstallerDir}
 #endif
 
 [Tasks]

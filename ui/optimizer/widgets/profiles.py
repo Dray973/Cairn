@@ -39,6 +39,8 @@ REASON_TEXT = {
     "edition": "Not on this edition of Windows",
     "not_on_this_pc": "Not on this PC",
     "unknown_id": "Unknown to this version of Cairn",
+    "windows_version": "Not on this version of Windows",
+    "retired": "Retired",
 }
 # Plan row status -> (icon, text, colour); a skipped row shows its reason as the text.
 STATUS_STYLE = {
@@ -54,6 +56,9 @@ RESULT_STYLE = {
     "failed": ("⚠", "Failed", theme.CRITICAL),
 }
 NOT_SELECTED_STYLE = ("○", "Not selected", theme.INK_MUTED)
+# A row whose change was written but did not hold when the engine read it back.
+NOT_KEPT_STYLE = ("⚠", "Not kept", theme.WARNING)
+NOT_KEPT_LINE = "Not kept: {label} is {found}, not {expected}."
 # The same texts as `app.RESTART_TEXT`, which the feature mixins cannot import.
 RESTART_TEXT = {
     "explorer": "File Explorer has to restart for some of these changes.",
@@ -144,13 +149,26 @@ def row_status(row: Mapping[str, Any]) -> tuple[str, str, str]:
     return STATUS_STYLE.get(str(status), ("–", str(status or "unknown"), theme.INK_MUTED))
 
 
+def not_kept_lines(result: Mapping[str, Any]) -> list[str]:
+    """One sentence per value of a row's result that did not hold when read back."""
+    return [
+        NOT_KEPT_LINE.format(
+            label=m.get("label", ""), found=m.get("found", ""), expected=m.get("expected", "")
+        )
+        for m in result.get("not_kept") or []
+    ]
+
+
 def result_status(
     row: Mapping[str, Any], results_by_key: Mapping[str, Mapping[str, Any]], selected: Iterable[str]
 ) -> tuple[str, str, str]:
-    """(icon, text, colour) of a row after an apply: its outcome when it has one, "Not
-    selected" for a change row that was left out, else its plan status."""
+    """(icon, text, colour) of a row after an apply: "Not kept" when a value it wrote did not
+    hold, else its outcome when it has one, "Not selected" for a change row that was left out,
+    else its plan status."""
     result = results_by_key.get(str(row.get("key")))
     if result is not None:
+        if result.get("not_kept"):
+            return NOT_KEPT_STYLE
         outcome = str(result.get("outcome"))
         return RESULT_STYLE.get(outcome, ("–", outcome, theme.INK_MUTED))
     if row.get("status") == "change" and row.get("key") not in set(selected):
@@ -396,7 +414,8 @@ class LastAppliedCard(ctk.CTkFrame):
 
 class ProfileRow(ctk.CTkFrame):
     """One row of the sheet: a check box for a change (a spacer otherwise), the title, the
-    detail, an optional caution and the status.
+    detail, an optional caution, the `notes` (warnings such as values that were not kept) and
+    the status.
 
     A plan can hold hundreds of rows, so the texts are plain Tk labels in the font and size
     CustomTkinter would use at the window's scaling; the row updates them itself when the
@@ -414,6 +433,7 @@ class ProfileRow(ctk.CTkFrame):
         detail: str,
         wrap: int,
         on_toggle: Callable[[str], None],
+        notes: Sequence[str] = (),
     ) -> None:
         super().__init__(master, fg_color="transparent")
         self.row = dict(row)
@@ -454,6 +474,10 @@ class ProfileRow(ctk.CTkFrame):
         if caution:
             self.caution_label = self._text(f"⚠ {caution}", 10, theme.WARNING, wraps=True)
             self.caution_label.grid(row=2, column=1, sticky="nw", padx=(self._px(6), 0))
+        self.notes_label: tk.Label | None = None
+        if notes:
+            self.notes_label = self._text("\n".join(f"⚠ {n}" for n in notes), 10, theme.WARNING, wraps=True)
+            self.notes_label.grid(row=3, column=1, sticky="nw", padx=(self._px(6), 0))
         icon, text, color = status
         self.status_label = self._text(f"{icon} {text}", 10, color, wraps=False)
         self.status_label.configure(anchor="ne", justify="right", wraplength=self._px(ROW_STATUS_WIDTH))
@@ -996,6 +1020,7 @@ class ProfileSheet(ctk.CTkFrame):
     def _make_row(self, master: tk.Misc, row: dict[str, Any], checkable: bool) -> ProfileRow:
         key = str(row.get("key") or "")
         detail = str(row.get("detail") or "")
+        notes: list[str] = []
         if self.mode == "result":
             status = result_status(row, self._results, self._chosen)
             result = self._results.get(key)
@@ -1005,6 +1030,8 @@ class ProfileSheet(ctk.CTkFrame):
                 and result.get("details")
             ):
                 detail = "; ".join(str(d) for d in result["details"])
+            if result is not None:
+                notes = not_kept_lines(result)
         elif self.mode == "export":
             status = ("", "", theme.INK_MUTED)
         else:
@@ -1018,6 +1045,7 @@ class ProfileSheet(ctk.CTkFrame):
             detail=detail,
             wrap=self._row_wrap,
             on_toggle=self._toggled,
+            notes=notes,
         )
         self.rows.append(built)
         return built

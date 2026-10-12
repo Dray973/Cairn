@@ -820,9 +820,9 @@ def test_dns_set_failure_reports_details(make_app: AppFactory) -> None:
     assert failure in dialog_text(result)
     pump(app, 5.0, until=lambda: reads(engine) == 2 and listed(app))
     assert status(app) == ("Some DNS settings of Wi-Fi were not changed.", theme.WARNING)
-    # The servers recorded before the failed write stay recorded, so the attempt can be undone.
+    # The failed write changed nothing, so its record was withdrawn and there is nothing to undo.
     wifi = panel.row(WIFI)
-    assert wifi is not None and wifi.undo_shown
+    assert wifi is not None and not wifi.undo_shown
     assert wifi.dns_menu.get() == "Automatic (DHCP)"
     confirm_dialog(app)
 

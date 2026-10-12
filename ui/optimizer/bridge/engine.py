@@ -71,6 +71,10 @@ class EngineBridge:
     other registry records. Turning scheduled maintenance off is an undo of its journal record.
     Profiles: previews, file reads and exports are worker reads that change nothing; applying
     goes through `_mutation`; undoing uses `revert_targets` with the report's `undo` filter.
+    `drift` and `verify` read which recorded changes no longer hold and change nothing;
+    `forget_targets` (Keep as is) only stops tracking records and writes nothing on the PC.
+    `open_url` opens a web page in the signed-in user's browser without Cairn's rights. An
+    older engine lacks some of these; `supports(name)` tells.
 
     Dry runs and restore-point policies are passed to the engine by keyword (`dry_run=`,
     `restore_point=`).
@@ -236,6 +240,19 @@ class EngineBridge:
         return self._submit(
             self._engine.revert_targets, dict(target_filter), dry_run=dry_run, callback=callback
         )
+
+    def drift(self, callback: Callback | None = None) -> Future[Any]:
+        """Read-only: every active journal record whose target no longer holds what Cairn set."""
+        return self._submit(self._engine.drift, callback=callback)
+
+    def verify(self, ids: list[str], callback: Callback | None = None) -> Future[Any]:
+        """Read-only: the same check for the catalog tweaks `ids` only."""
+        return self._submit(self._engine.verify, list(ids), callback=callback)
+
+    def forget_targets(self, target_filter: dict[str, Any], callback: Callback | None = None) -> Future[Any]:
+        """Keep as is: stops tracking the records `target_filter` selects (as in `revert_targets`)
+        whose targets changed since Cairn set them. Nothing on the PC is changed."""
+        return self._submit(self._engine.forget_targets, dict(target_filter), callback=callback)
 
     # -- cleanup -------------------------------------------------------------------
 
@@ -404,6 +421,11 @@ class EngineBridge:
     def install_info(self, *, callback: Callback | None = None) -> Future[Any]:
         """Queued: the installed copy's location and version, or None when Cairn is not installed."""
         return self._submit(self._engine.install_info, callback=callback)
+
+    def open_url(self, url: str, callback: Callback | None = None) -> Future[Any]:
+        """Queued: opens the `https://` page `url` in the signed-in user's browser, started without
+        Cairn's administrator rights; the engine refuses any other URL."""
+        return self._submit(self._engine.open_url, url, callback=callback)
 
     # -- permissions -------------------------------------------------------------------
 

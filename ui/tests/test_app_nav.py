@@ -1,12 +1,14 @@
 """Sidebar navigation of the real window: the start state, that no section is a stub, showing a
 section and its load hook, stepping through the sections, the wide and rail modes, the densities,
-the top bar and the fit of the sections no feature's own test file checks.
+the top bar, the fit of the sections no feature's own test file checks, and the maximum size the
+fit helper raises.
 
 The window uses the FakeEngine; administrator dialogs are never confirmed.
 """
 
 from __future__ import annotations
 
+import tkinter as tk
 from typing import Any
 
 import pytest
@@ -207,6 +209,24 @@ def test_the_sidebar_becomes_a_rail_below_1080_px(make_app: AppFactory) -> None:
     for item in [*app.nav.items.values(), app.nav.about_item]:
         assert item.name_label.winfo_manager() == "grid", item.name
     assert app.brand.winfo_manager() == "grid"
+    assert app.errors == []
+
+
+def test_resizing_raises_only_a_maximum_size_that_is_too_small(make_app: AppFactory) -> None:
+    app, _ = make_app(elevated=True)
+    pump(app, 5.0, until=lambda: scanned(app))
+    app.minsize(900, 560)
+    scale = ctk.ScalingTracker.get_window_scaling(app) or 1.0
+    before = tk.Tk.wm_maxsize(app)
+    if before[0] >= 1120 * scale and before[1] >= 700 * scale:
+        resize_to(app, 1120, 700)
+        assert tk.Tk.wm_maxsize(app) == before, "a large enough maximum is left as it is"
+
+    # A maximum below the fit sizes, as the screen of a small CI runner sets it.
+    app.maxsize(1000, 600)
+    resize_to(app, 1240, 630)
+    width, height = tk.Tk.wm_maxsize(app)
+    assert width >= 1240 * scale - 1 and height >= 630 * scale - 1
     assert app.errors == []
 
 

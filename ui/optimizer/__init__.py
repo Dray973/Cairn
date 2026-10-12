@@ -17,7 +17,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 APP_NAME = "Cairn"
 APP_ID = "Cairn.App"  # AppUserModelID of the installed app (shortcut and taskbar)

@@ -19,6 +19,11 @@ Options (`FakeEngine(**options)`):
   and scheduled maintenance rows; applying one reports it applied;
 - `profile_restarts`: tweak id -> restart need ("explorer", "sign_out", "restart");
 - `other_account`: the plan's `other_account` text; per-user rows are then skipped.
+
+Tweak rows follow the engine's options: a tweak this PC cannot use (`unavailable`, `missing`) is
+skipped with its kind as the reason and its text as the detail, a tweak with an undo limit gets
+it as the row's caution (so the row starts unchecked), and an applied tweak's step result
+carries the engine's `not_kept` mismatches for it. Retired tweaks are never exported.
 """
 
 from __future__ import annotations
@@ -53,12 +58,15 @@ REASON_TEXT = {
     "edition": "Not on this edition of Windows",
     "not_on_this_pc": "Not on this PC",
     "unknown_id": "Unknown to this version of Cairn",
+    "windows_version": "Not on this version of Windows",
+    "retired": "Retired",
 }
 CATEGORY_LABELS = {
     "privacy": "Privacy",
     "gaming": "Gaming",
     "performance": "Performance",
     "interface": "Interface",
+    "security": "Security",
 }
 KIND_LABELS = {"ethernet": "Ethernet", "wifi": "Wi-Fi"}
 FAMILY_LABELS = {"ipv4": "IPv4", "ipv6": "IPv6"}
@@ -106,8 +114,8 @@ FAKE_STARTER_PROFILES = (
         "privacy",
         _profile(
             "Privacy",
-            "Activity history and Cortana off, and the news app removed.",
-            ["privacy.activity_history", "privacy.cortana"],
+            "Activity history and the advertising ID off, and the news app removed.",
+            ["privacy.activity_history", "privacy.advertising_id"],
             [STORE_APP],
         ),
     ),
@@ -194,6 +202,8 @@ class FakeProfiles:
         preset: set[str]
         tweaks: list[tuple[str, str, bool]]
         task_tweaks: dict[str, tuple[str, ...]]
+        undo_limits: dict[str, str]
+        not_kept: dict[str, list[dict[str, Any]]]
         startup: list[Any]
         appx_inventory_error: str | None
         dns_policy: list[str]
@@ -204,6 +214,7 @@ class FakeProfiles:
         def _record(self, name: str, *args: Any) -> None: ...
         def _record_quick(self, name: str, *args: Any) -> None: ...
         def _state(self, item_id: str) -> str: ...
+        def _unmet(self, item_id: str) -> tuple[str, str] | None: ...
         def _items(self) -> list[dict[str, Any]]: ...
         def _startup_entries(self) -> list[dict[str, Any]]: ...
         def _startup_record(self, entry_id: str) -> tuple[str, str, str]: ...
@@ -213,6 +224,7 @@ class FakeProfiles:
             self, adapter: dict[str, Any], family: str, previous: list[str], target: list[str]
         ) -> bool: ...
         def _update_dns_target(self, guid: str, family: str, target: list[str]) -> None: ...
+        def _withdraw_dns(self, guid: str, family: str) -> None: ...
 
     def _init_profiles(self, options: dict[str, Any]) -> None:
         """Pops the profile options this fake understands from `options`."""
@@ -290,7 +302,22 @@ class FakeProfiles:
             per_user = tweak_id not in self.task_tweaks and not tweak_id.startswith("privacy.")
             restart = self.profile_restarts.get(tweak_id, "none")
             state = self._state(tweak_id)
-            if state == "applied":
+            unmet = self._unmet(tweak_id)
+            if unmet is not None:
+                # Checked before the state, so a recorded tweak this PC cannot use is skipped too.
+                kind, text = unmet
+                row = _row(
+                    key,
+                    "tweaks",
+                    title,
+                    "skipped",
+                    text,
+                    reason=kind,
+                    per_user=per_user,
+                    risk="low",
+                    restart=restart,
+                )
+            elif state == "applied":
                 detail = "Already applied" if tweak_id in self.applied else "Already set on this PC"
                 row = _row(
                     key, "tweaks", title, "already", detail, per_user=per_user, risk="low", restart=restart
@@ -310,7 +337,15 @@ class FakeProfiles:
             else:
                 detail = f"{CATEGORY_LABELS.get(known[tweak_id], known[tweak_id])} · not applied"
                 row = _row(
-                    key, "tweaks", title, "change", detail, per_user=per_user, risk="low", restart=restart
+                    key,
+                    "tweaks",
+                    title,
+                    "change",
+                    detail,
+                    per_user=per_user,
+                    risk="low",
+                    restart=restart,
+                    caution=self.undo_limits.get(tweak_id),
                 )
             rows.append(row)
         return rows
@@ -515,9 +550,7 @@ class FakeProfiles:
     ) -> dict[str, Any]:
         key = row["key"]
         result = {
-            "key": key,
-            "section": row["section"],
-            "title": row["title"],
+            **self._profile_result_head(row),
             "outcome": "applied",
             "details": [],
         }
@@ -532,6 +565,7 @@ class FakeProfiles:
             else:
                 undo["registry"].append({"hive": "HKLM", "key_path": "Test", "value_name": rest})
             result["details"] = [f"{rest} detail"]
+            result["not_kept"] = [dict(m) for m in self.not_kept.get(rest, [])]
         elif prefix == "startup":
             self._startup_disabled.add(rest)
             hive, key_path, value_name = self._startup_record(rest)
@@ -558,6 +592,8 @@ class FakeProfiles:
             current = self._static_dns.get(key, [])
             captured = self._record_dns(adapter, family, current, target)
             if family in self.dns_fail:
+                if captured:
+                    self._withdraw_dns(adapter["id"], family)
                 outcomes.append("failed")
                 continue
             self._static_dns[key] = list(target)
@@ -596,6 +632,7 @@ class FakeProfiles:
                             "title": key,
                             "outcome": "skipped",
                             "details": [NOT_IN_PLAN],
+                            "not_kept": [],
                         }
                     )
                 elif row["status"] == "already":
@@ -646,7 +683,7 @@ class FakeProfiles:
 
     @staticmethod
     def _profile_result_head(row: dict[str, Any]) -> dict[str, Any]:
-        return {"key": row["key"], "section": row["section"], "title": row["title"]}
+        return {"key": row["key"], "section": row["section"], "title": row["title"], "not_kept": []}
 
     # -- export ----------------------------------------------------------------------
 
@@ -654,7 +691,7 @@ class FakeProfiles:
         """(row, (section, value)) of every setting this PC can export."""
         out: list[tuple[dict[str, Any], tuple[str, Any]]] = []
         for item in self._items():
-            if item["kind"] != "tweak" or item["state"] != "applied":
+            if item["kind"] != "tweak" or item["state"] != "applied" or item.get("unavailable") == "retired":
                 continue
             item_id = item["id"]
             per_user = item_id not in self.task_tweaks and not item_id.startswith("privacy.")

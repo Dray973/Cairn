@@ -1,7 +1,9 @@
 # Cairn: development tools (not part of the installed copy).
-# Installed together with the runtime packages by requirements.txt.
+# Installed together with the runtime packages by requirements.txt. The lint and test tools are
+# pinned, so a new release of one cannot fail the checks of an unrelated change; Dependabot
+# proposes updates.
 
 debugpy                     # VS Code Python debugger backend
-ruff                        # lint and format
-pytest
-pytest-timeout
+ruff==0.16.8                # lint and format
+pytest==9.1.1
+pytest-timeout==2.4.0

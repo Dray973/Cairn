@@ -8,9 +8,15 @@
 //! per setting.
 //!
 //! Scheduled tasks, task definitions (the Task Scheduler tasks Cairn registered, which a
-//! rollback deletes), live settings, DNS servers and the elevation check reach the system
-//! through `RollbackSystem`; registry values, services, the power scheme and Appx packages
-//! are restored directly.
+//! rollback deletes), live settings, DNS servers, the wait before the read-back and the
+//! elevation check reach the system through `RollbackSystem`; registry values, services, the
+//! power scheme and Appx packages are restored directly.
+//!
+//! Once the groups are done, a rollback that restored something waits [`SETTLE`] once and
+//! reads every restored registry value, service start type, scheduled task flag, power scheme
+//! and DNS server list back. A target that no longer holds what was restored is reported in
+//! `not_restored`; its record stays reverted, since Cairn wrote the original back and does not
+//! write it again.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -18,18 +24,27 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use super::registry_target;
 use super::state_log::{
-    AppxRecord, DnsRecord, Journal, JournalTable, PowerRecord, RegistryRecord, ScheduledTaskRecord,
-    ServiceRecord, TaskDefinitionRecord,
+    scheduled_task_target, AppxRecord, DnsRecord, Journal, JournalTable, PowerRecord,
+    RegistryRecord, ScheduledTaskRecord, ServiceRecord, TaskDefinitionRecord,
 };
+use super::verify::{
+    dns_label, enabled_text, fill, raw_text, read_raw, read_start, registry_label, same_setting,
+    scheme_text, service_label, start_text, task_label, unverified, Mismatch, POWER_PLAN_LABEL,
+    SETTLE,
+};
+use super::Safety;
 use crate::debloat::appx::{self, RestoreOutcome};
 use crate::debloat::catalog::{self, RestartNeed};
 use crate::debloat::live::{self, LiveSetting};
 use crate::debloat::power;
 use crate::debloat::scheduled_tasks::{self, TaskRestore, TaskStore};
-use crate::network::{self, canonical_guid, DnsRestore};
-use crate::win::registry::{delete_key_if_empty, path_within, write_requires_elevation, Hive, Key};
-use crate::win::scm::{Scm, StartType, MUTATE_ACCESS};
+use crate::network::{self, canonical_guid, same_servers, servers_text, DnsRestore};
+use crate::win::registry::{
+    delete_key_if_empty, path_within, write_requires_elevation, Hive, Key, RawValue,
+};
+use crate::win::scm::{Scm, Service, StartType, MUTATE_ACCESS};
 use crate::win::task_scheduler::TaskScheduler;
 use crate::{Error, Result, VERSION};
 
@@ -38,10 +53,15 @@ const SERVICE_START_TIMEOUT: Duration = Duration::from_secs(20);
 const SESSION_LABEL_ALL: &str = "rollback_to_baseline";
 const SESSION_LABEL_FILTERED: &str = "rollback_filtered";
 
+const OP_ROLLBACK_REGISTRY: &str = "rollback_registry";
 const OP_ROLLBACK_DNS: &str = "rollback_dns";
 const OP_FLUSH_DNS: &str = "flush_dns_cache";
 const FLUSH_TARGET: &str = "DNS resolver cache";
 const OP_ROLLBACK_TASK_DEFINITION: &str = "rollback_task_definition";
+/// Audit log operation of a restored target that did not hold the restored value.
+pub(crate) const OP_VERIFY_AFTER_ROLLBACK: &str = "verify_after_rollback";
+/// Report warning of a restored target that could not be read back: `{target}`, `{error}`.
+pub(crate) const READ_BACK_WARNING: &str = "{target}: cannot be read back ({error})";
 
 /// A selected record that could not be restored. Its journal record stays active.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,7 +83,8 @@ pub struct StoreReinstall {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RollbackReport {
     pub dry_run: bool,
-    /// Registry values written back to their recorded data.
+    /// Registry values written back to their recorded data, plus records whose write never
+    /// happened, whose values still held that data and were left as they were.
     pub registry_restored: usize,
     /// Registry values deleted because they did not exist before the first change.
     pub registry_deleted: usize,
@@ -103,12 +124,22 @@ pub struct RollbackReport {
     /// be pushed to the running session raises it to at least a sign-out.
     #[serde(default)]
     pub restart: RestartNeed,
+    /// Restored targets whose read-back after [`SETTLE`] was not the recorded original. Their
+    /// records stay reverted: Cairn wrote the original back and does not write it again.
+    #[serde(default)]
+    pub not_restored: Vec<Mismatch>,
+    /// Restored targets that could not be read back ("{target}: cannot be read back ({e})").
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 impl RollbackReport {
-    /// True when nothing failed and no package is waiting for a Store reinstall.
+    /// True when nothing failed, no package is waiting for a Store reinstall and every
+    /// restored target that was read back held what was restored.
     pub fn is_clean(&self) -> bool {
-        self.failures.is_empty() && self.appx_store_required.is_empty()
+        self.failures.is_empty()
+            && self.appx_store_required.is_empty()
+            && self.not_restored.is_empty()
     }
 
     pub fn total_reverted(&self) -> usize {
@@ -163,7 +194,7 @@ impl RollbackFilter {
             && self.task_definitions.is_empty()
     }
 
-    fn selects_registry(&self, rec: &RegistryRecord) -> bool {
+    pub(crate) fn selects_registry(&self, rec: &RegistryRecord) -> bool {
         self.registry.iter().any(|t| {
             t.hive == rec.hive
                 && t.key_path.eq_ignore_ascii_case(&rec.key_path)
@@ -171,30 +202,30 @@ impl RollbackFilter {
         })
     }
 
-    fn selects_service(&self, rec: &ServiceRecord) -> bool {
+    pub(crate) fn selects_service(&self, rec: &ServiceRecord) -> bool {
         self.services
             .iter()
             .any(|name| name.eq_ignore_ascii_case(&rec.name))
     }
 
-    fn selects_appx(&self, rec: &AppxRecord) -> bool {
+    pub(crate) fn selects_appx(&self, rec: &AppxRecord) -> bool {
         self.appx_families
             .iter()
             .any(|family| family.eq_ignore_ascii_case(&rec.package_family))
     }
 
-    fn selects_scheduled_task(&self, rec: &ScheduledTaskRecord) -> bool {
+    pub(crate) fn selects_scheduled_task(&self, rec: &ScheduledTaskRecord) -> bool {
         self.scheduled_tasks
             .iter()
             .any(|path| path.eq_ignore_ascii_case(&rec.path))
     }
 
-    fn selects_dns(&self, rec: &DnsRecord) -> bool {
+    pub(crate) fn selects_dns(&self, rec: &DnsRecord) -> bool {
         let guid = canonical_guid(&rec.interface_guid);
         self.dns.iter().any(|g| canonical_guid(g) == guid)
     }
 
-    fn selects_task_definition(&self, path: &str) -> bool {
+    pub(crate) fn selects_task_definition(&self, path: &str) -> bool {
         self.task_definitions
             .iter()
             .any(|p| p.eq_ignore_ascii_case(path))
@@ -220,8 +251,8 @@ pub(crate) trait TaskDefinitionRemover {
 }
 
 /// The parts of the system a rollback reaches through a seam: the elevation check,
-/// Task Scheduler, the running session's live settings and the DNS client. Production uses
-/// [`LiveSystem`]; tests use fakes.
+/// Task Scheduler, the running session's live settings, the DNS client and the wait before
+/// restored targets are read back. Production uses [`LiveSystem`]; tests use fakes.
 pub(crate) trait RollbackSystem {
     fn is_elevated(&self) -> bool;
     /// Task Scheduler, requested at most once per rollback and only when a scheduled task
@@ -243,6 +274,11 @@ pub(crate) trait RollbackSystem {
     fn dns_drift(&self, rec: &DnsRecord) -> Result<Option<String>>;
     fn restore_dns(&self, rec: &DnsRecord) -> Result<DnsRestore>;
     fn flush_dns(&self) -> Result<()>;
+    /// Waits before restored targets are read back.
+    fn settle(&self);
+    /// Read-only: the servers now set for the record's adapter and family (`""` when they
+    /// are obtained automatically), `None` when the adapter no longer exists.
+    fn dns_now(&self, rec: &DnsRecord) -> Result<Option<String>>;
 }
 
 /// This PC.
@@ -278,6 +314,14 @@ impl RollbackSystem for LiveSystem {
 
     fn flush_dns(&self) -> Result<()> {
         network::flush_resolver_cache()
+    }
+
+    fn settle(&self) {
+        std::thread::sleep(SETTLE);
+    }
+
+    fn dns_now(&self, rec: &DnsRecord) -> Result<Option<String>> {
+        network::dns_now(rec)
     }
 }
 
@@ -409,15 +453,33 @@ fn rollback_with(
         Some(journal.begin_session(label, VERSION)?)
     };
 
-    let live_settings = revert_registry(journal, session, &selection.registry, &mut report, sys)?;
+    // Task Scheduler is reached at most once: the same store restores the scheduled tasks and
+    // reads them back.
+    let tasks = (!dry_run && !selection.scheduled_tasks.is_empty()).then(|| sys.task_store());
+    let mut restored = Vec::new();
+    let live_settings = revert_registry(
+        journal,
+        session,
+        &selection.registry,
+        &mut report,
+        &mut restored,
+        sys,
+    )?;
     refresh_live(journal, session, &live_settings, &mut report, sys)?;
-    revert_services(journal, session, &selection.services, &mut report)?;
+    revert_services(
+        journal,
+        session,
+        &selection.services,
+        &mut report,
+        &mut restored,
+    )?;
     revert_scheduled_tasks(
         journal,
         session,
         &selection.scheduled_tasks,
         &mut report,
-        sys,
+        &mut restored,
+        tasks.as_ref(),
     )?;
     revert_task_definitions(
         journal,
@@ -426,9 +488,32 @@ fn rollback_with(
         &mut report,
         sys,
     )?;
-    revert_power(journal, session, &selection.power, &mut report)?;
-    revert_dns(journal, session, &selection.dns, &mut report, sys)?;
+    revert_power(
+        journal,
+        session,
+        &selection.power,
+        &mut report,
+        &mut restored,
+    )?;
+    revert_dns(
+        journal,
+        session,
+        &selection.dns,
+        &mut report,
+        &mut restored,
+        sys,
+    )?;
     revert_appx(journal, session, &selection.appx, &mut report)?;
+    if !dry_run && !restored.is_empty() {
+        verify_restored(
+            journal,
+            session,
+            &restored,
+            tasks.as_ref(),
+            &mut report,
+            sys,
+        )?;
+    }
 
     if let Some(id) = session {
         journal.end_session(id)?;
@@ -451,11 +536,23 @@ fn record_failure(
     error: &Error,
     report: &mut RollbackReport,
 ) -> Result<()> {
+    let failure = log_failure(journal, session, op, target, error)?;
+    report.failures.push(failure);
+    Ok(())
+}
+
+/// Logs a failed restore and returns it. The journal record stays active.
+fn log_failure(
+    journal: &Journal,
+    session: Option<i64>,
+    op: &str,
+    target: String,
+    error: &Error,
+) -> Result<RollbackFailure> {
     let error = error.to_string();
     warn!(op, target = %target, error = %error, "rollback failed");
     journal.log_op(session, op, &target, "failed", Some(&error))?;
-    report.failures.push(RollbackFailure { target, error });
-    Ok(())
+    Ok(RollbackFailure { target, error })
 }
 
 // ───────────────────────────── registry ─────────────────────────────
@@ -463,50 +560,170 @@ fn record_failure(
 enum RegistryOutcome {
     Restored,
     Deleted,
+    /// The record's write never happened and its target still holds the original
+    /// ([`Journal::unwritten_registry_ids`]): the record ends with nothing written.
+    NeverWritten,
+}
+
+impl RegistryOutcome {
+    /// The outcome logged with `rollback_registry`.
+    fn label(&self) -> &'static str {
+        match self {
+            RegistryOutcome::Restored => "restored",
+            RegistryOutcome::Deleted => "deleted",
+            RegistryOutcome::NeverWritten => "never_written",
+        }
+    }
 }
 
 /// Restores the registry records and returns the distinct live settings of the records that
-/// were restored or deleted (none in a dry run), for [`refresh_live`].
+/// were restored or deleted (none in a dry run), for [`refresh_live`]. Each record restored
+/// is added to `restored`. A record whose write never happened ends without a write, so it
+/// is counted as restored (its target holds the original) but has nothing to read back or
+/// push to the session.
 fn revert_registry(
     journal: &Journal,
     session: Option<i64>,
     records: &[RegistryRecord],
     report: &mut RollbackReport,
+    restored: &mut Vec<Restored>,
     sys: &dyn RollbackSystem,
 ) -> Result<Vec<LiveSetting>> {
     let mut live_settings = BTreeSet::new();
     for rec in records {
         let target = rec.target();
+        let unchanged = never_written(journal, rec)?;
         let restart = catalog::restart_for_registry(rec.hive, &rec.key_path, &rec.value_name);
-        report
-            .actions
-            .push(format!("{}: {target}", describe_registry(rec)));
+        let action = if unchanged {
+            NEVER_WRITTEN_ACTION.to_string()
+        } else {
+            describe_registry(rec)
+        };
+        report.actions.push(format!("{action}: {target}"));
         if report.dry_run {
-            report.restart = report.restart.max(restart);
+            if !unchanged {
+                report.restart = report.restart.max(restart);
+            }
             continue;
         }
-        let outcome = match restore_registry(journal, rec) {
-            Ok(RegistryOutcome::Restored) => {
+        match revert_registry_record(journal, session, rec, unchanged)? {
+            Ok(RegistryOutcome::Restored) => report.registry_restored += 1,
+            Ok(RegistryOutcome::Deleted) => report.registry_deleted += 1,
+            Ok(RegistryOutcome::NeverWritten) => {
                 report.registry_restored += 1;
-                "restored"
-            }
-            Ok(RegistryOutcome::Deleted) => {
-                report.registry_deleted += 1;
-                "deleted"
-            }
-            Err(e) => {
-                record_failure(journal, session, "rollback_registry", target, &e, report)?;
                 continue;
             }
-        };
+            Err(failure) => {
+                report.failures.push(failure);
+                continue;
+            }
+        }
+        restored.push(Restored::Registry {
+            target: RegistryTarget {
+                hive: rec.hive,
+                key_path: rec.key_path.clone(),
+                value_name: rec.value_name.clone(),
+            },
+            value: rec.original.clone(),
+        });
         report.restart = report.restart.max(restart);
-        journal.mark_reverted(JournalTable::Registry, rec.id)?;
-        journal.log_op(session, "rollback_registry", &target, outcome, None)?;
         if let Some(setting) = sys.live_setting(rec.hive, &rec.key_path, &rec.value_name) {
             live_settings.insert(setting);
         }
     }
     Ok(live_settings.into_iter().collect())
+}
+
+/// Action line of a record whose write never happened (see [`never_written`]).
+const NEVER_WRITTEN_ACTION: &str = "nothing to restore (the change failed and was never made)";
+
+/// Whether the write `rec` recorded never happened (see [`Journal::unwritten_registry_ids`])
+/// and its target still holds the original, so nothing was changed.
+fn never_written(journal: &Journal, rec: &RegistryRecord) -> Result<bool> {
+    Ok(journal.registry_record_unwritten(rec.id)? && holds_original(rec))
+}
+
+/// Restores one registry record, marks it reverted and logs `rollback_registry` under
+/// `session`. A restore that fails is logged and returned as the failure; its record stays
+/// active. A record whose write never happened (`unchanged`, from [`never_written`]) ends
+/// without touching the registry: nothing was changed, and a key Windows protects would refuse
+/// the restore anyway.
+fn revert_registry_record(
+    journal: &Journal,
+    session: Option<i64>,
+    rec: &RegistryRecord,
+    unchanged: bool,
+) -> Result<std::result::Result<RegistryOutcome, RollbackFailure>> {
+    let target = rec.target();
+    let restored = if unchanged {
+        Ok(RegistryOutcome::NeverWritten)
+    } else {
+        restore_registry(journal, rec)
+    };
+    match restored {
+        Ok(outcome) => {
+            journal.mark_reverted(JournalTable::Registry, rec.id)?;
+            journal.log_op(
+                session,
+                OP_ROLLBACK_REGISTRY,
+                &target,
+                outcome.label(),
+                None,
+            )?;
+            Ok(Ok(outcome))
+        }
+        Err(e) => Ok(Err(log_failure(
+            journal,
+            session,
+            OP_ROLLBACK_REGISTRY,
+            target,
+            &e,
+        )?)),
+    }
+}
+
+/// Restores the active registry records `filter` selects under `safety`'s own session (no new
+/// session), marks them reverted and logs `rollback_registry`, exactly like the registry group
+/// of a rollback; only the filter's registry targets are read. Each record first passes the
+/// checks of a registry write through `safety` (elevation, and the signed-in account for HKCU
+/// values). Live settings are not pushed.
+///
+/// Returns one line per selected record, newest first: "{target}: restored to {value}", where
+/// the value is the recorded original as reports show it or "not set" when there was none, or
+/// the failure, whose record stays active.
+pub(crate) fn restore_registry_in(
+    safety: &Safety,
+    filter: &RollbackFilter,
+) -> Result<Vec<std::result::Result<String, RollbackFailure>>> {
+    if filter.registry.is_empty() {
+        return Ok(Vec::new());
+    }
+    let journal = safety.journal();
+    let session = Some(safety.session_id());
+    let mut lines = Vec::new();
+    for rec in journal
+        .active_registry()?
+        .iter()
+        .filter(|rec| filter.selects_registry(rec))
+    {
+        if let Err(e) = safety.check_registry_write(rec.hive, &rec.key_path) {
+            let failure = log_failure(journal, session, OP_ROLLBACK_REGISTRY, rec.target(), &e)?;
+            lines.push(Err(failure));
+            continue;
+        }
+        let unchanged = never_written(journal, rec)?;
+        let line = revert_registry_record(journal, session, rec, unchanged)?
+            .map(|_| format!("{}: restored to {}", rec.target(), restored_value(rec)));
+        lines.push(line);
+    }
+    Ok(lines)
+}
+
+/// The value a restore of `rec` puts back, as reports show it: the recorded original, or
+/// "not set" when the value did not exist.
+fn restored_value(rec: &RegistryRecord) -> String {
+    rec.original_decoded()
+        .map_or_else(|| "not set".to_string(), |value| value.display())
 }
 
 /// Pushes each restored live setting to the running session once. A failure is not a
@@ -564,6 +781,15 @@ fn own_created_root(rec: &RegistryRecord) -> Option<&str> {
         Some(root) if path_within(&rec.key_path, root) => root,
         _ => rec.key_path.as_str(),
     })
+}
+
+/// Whether the target of `rec` holds its recorded original now (absent when the value did not
+/// exist). A target that cannot be read does not count.
+fn holds_original(rec: &RegistryRecord) -> bool {
+    matches!(
+        read_raw(rec.hive, &rec.key_path, &rec.value_name),
+        Ok(current) if current == rec.original
+    )
 }
 
 /// Restores or deletes the value. After a delete, the keys the engine created on the way
@@ -635,11 +861,14 @@ fn remove_created_keys(journal: &Journal, rec: &RegistryRecord) -> Result<()> {
 
 // ───────────────────────────── services ─────────────────────────────
 
+/// Restores each service's start type (and starts it when it was running) and adds each one
+/// restored to `restored`.
 fn revert_services(
     journal: &Journal,
     session: Option<i64>,
     records: &[ServiceRecord],
     report: &mut RollbackReport,
+    restored: &mut Vec<Restored>,
 ) -> Result<()> {
     if records.is_empty() {
         return Ok(());
@@ -659,7 +888,10 @@ fn revert_services(
             report.restart = report.restart.max(restart);
             continue;
         };
-        match restore_service(scm, rec) {
+        let opened = scm
+            .open_required(&rec.name, MUTATE_ACCESS)
+            .map(ServiceHandle);
+        match opened.and_then(|svc| restore_service(&svc, rec)) {
             Ok(started) => {
                 report.services_restored += 1;
                 report.restart = report.restart.max(restart);
@@ -668,6 +900,11 @@ fn revert_services(
                 }
                 journal.mark_reverted(JournalTable::Service, rec.id)?;
                 journal.log_op(session, "rollback_service", &target, "restored", None)?;
+                restored.push(Restored::Service {
+                    name: rec.name.clone(),
+                    start_type: rec.start_type,
+                    delayed: rec.delayed_auto_start,
+                });
             }
             Err(e) => record_failure(journal, session, "rollback_service", target, &e, report)?,
         }
@@ -686,18 +923,46 @@ fn describe_service(rec: &ServiceRecord) -> String {
     s
 }
 
-/// Returns `true` when the service was started as part of the restore.
-fn restore_service(scm: &Scm, rec: &ServiceRecord) -> Result<bool> {
-    let svc = scm.open_required(&rec.name, MUTATE_ACCESS)?;
-    svc.set_start_type(rec.start_type)?;
-    if rec.start_type == StartType::Automatic {
-        svc.set_delayed_auto_start(rec.delayed_auto_start)?;
+/// The service operations a restore needs: [`Service`] in production, a fake in tests.
+trait ServiceRestore {
+    fn set_start_type(&self, start: StartType) -> Result<()>;
+    fn set_delayed_auto_start(&self, on: bool) -> Result<()>;
+    fn is_active(&self) -> Result<bool>;
+    fn start(&self) -> Result<()>;
+}
+
+/// Wraps an opened [`Service`] as a [`ServiceRestore`].
+struct ServiceHandle(Service);
+
+impl ServiceRestore for ServiceHandle {
+    fn set_start_type(&self, start: StartType) -> Result<()> {
+        self.0.set_start_type(start)
     }
-    if rec.was_running && rec.start_type != StartType::Disabled && !svc.status()?.state.is_active()
-    {
+    fn set_delayed_auto_start(&self, on: bool) -> Result<()> {
+        self.0.set_delayed_auto_start(on)
+    }
+    fn is_active(&self) -> Result<bool> {
+        Ok(self.0.status()?.state.is_active())
+    }
+    fn start(&self) -> Result<()> {
+        self.0.start()
+    }
+}
+
+/// Restores the service's start type (and starts it when it was running). Returns `true`
+/// when the service was started as part of the restore. The delayed-autostart flag is written
+/// back only when the recorded original had it set: a service that was Automatic without a
+/// `DelayedAutostart` value keeps none, instead of gaining a `DelayedAutostart = 0` that was
+/// not there before (functionally identical, but the registry would differ from the baseline).
+fn restore_service(svc: &dyn ServiceRestore, rec: &ServiceRecord) -> Result<bool> {
+    svc.set_start_type(rec.start_type)?;
+    if rec.start_type == StartType::Automatic && rec.delayed_auto_start {
+        svc.set_delayed_auto_start(true)?;
+    }
+    if rec.was_running && rec.start_type != StartType::Disabled && !svc.is_active()? {
         svc.start()?;
         let deadline = std::time::Instant::now() + SERVICE_START_TIMEOUT;
-        while std::time::Instant::now() < deadline && !svc.status()?.state.is_active() {
+        while std::time::Instant::now() < deadline && !svc.is_active()? {
             std::thread::sleep(Duration::from_millis(100));
         }
         return Ok(true);
@@ -707,30 +972,24 @@ fn restore_service(scm: &Scm, rec: &ServiceRecord) -> Result<bool> {
 
 // ───────────────────────────── scheduled tasks ─────────────────────────────
 
-/// Writes each record's enabled flag back. Task Scheduler is requested once, and only
-/// outside a dry run; when it cannot be reached, every record fails and the rollback
-/// continues with the next group.
+/// Writes each record's enabled flag back through `store`, the Task Scheduler connection the
+/// rollback requested once (`None` in a dry run); when it could not be reached, every record
+/// fails and the rollback continues with the next group. Each task whose flag was written is
+/// added to `restored`.
 fn revert_scheduled_tasks(
     journal: &Journal,
     session: Option<i64>,
     records: &[ScheduledTaskRecord],
     report: &mut RollbackReport,
-    sys: &dyn RollbackSystem,
+    restored: &mut Vec<Restored>,
+    store: Option<&Result<Box<dyn TaskStore + '_>>>,
 ) -> Result<()> {
-    if records.is_empty() {
-        return Ok(());
-    }
-    let store = if report.dry_run {
-        None
-    } else {
-        Some(sys.task_store())
-    };
     for rec in records {
         let target = rec.target();
         let restart = catalog::restart_for_scheduled_task(&rec.path);
         let verb = if rec.was_enabled { "enable" } else { "disable" };
         report.actions.push(format!("{verb} {target}"));
-        let store = match store.as_ref() {
+        let store = match store {
             None => {
                 report.restart = report.restart.max(restart);
                 continue;
@@ -765,6 +1024,10 @@ fn revert_scheduled_tasks(
                     "restored",
                     Some(state),
                 )?;
+                restored.push(Restored::ScheduledTask {
+                    path: rec.path.clone(),
+                    enabled: rec.was_enabled,
+                });
             }
             Ok(TaskRestore::AlreadyInState) => {
                 report.scheduled_tasks_restored += 1;
@@ -896,11 +1159,13 @@ fn folder_detail(remover: &dyn TaskDefinitionRemover, rec: &TaskDefinitionRecord
 
 // ───────────────────────────── power ─────────────────────────────
 
+/// Reactivates each record's scheme and adds each one restored to `restored`.
 fn revert_power(
     journal: &Journal,
     session: Option<i64>,
     records: &[PowerRecord],
     report: &mut RollbackReport,
+    restored: &mut Vec<Restored>,
 ) -> Result<()> {
     for rec in records {
         let target = format!("power scheme {}", rec.previous_scheme);
@@ -915,6 +1180,9 @@ fn revert_power(
                 report.restart = report.restart.max(catalog::restart_for_power());
                 journal.mark_reverted(JournalTable::Power, rec.id)?;
                 journal.log_op(session, "rollback_power", &target, "restored", None)?;
+                restored.push(Restored::Power {
+                    scheme: rec.previous_scheme.clone(),
+                });
             }
             Err(e) => record_failure(journal, session, "rollback_power", target, &e, report)?,
         }
@@ -926,12 +1194,13 @@ fn revert_power(
 
 /// Writes each record's DNS servers back. A dry run only reads whether the servers were
 /// changed outside Cairn since. The resolver cache is flushed once, best effort,
-/// after at least one record was written.
+/// after at least one record was written. Each record written is added to `restored`.
 fn revert_dns(
     journal: &Journal,
     session: Option<i64>,
     records: &[DnsRecord],
     report: &mut RollbackReport,
+    restored: &mut Vec<Restored>,
     sys: &dyn RollbackSystem,
 ) -> Result<()> {
     let mut written = false;
@@ -964,6 +1233,7 @@ fn revert_dns(
                     "restored",
                     Some("written"),
                 )?;
+                restored.push(Restored::Dns(rec.clone()));
             }
             Ok(DnsRestore::AlreadyInState) => {
                 report.dns_restored += 1;
@@ -1089,10 +1359,198 @@ fn revert_appx(
     Ok(())
 }
 
+// ───────────────────────────── read-back ─────────────────────────────
+
+/// A record this rollback restored, with what its target should now hold.
+#[derive(Debug, Clone)]
+pub(crate) enum Restored {
+    /// A registry value written back (`value`) or deleted (`None`).
+    Registry {
+        target: RegistryTarget,
+        value: Option<RawValue>,
+    },
+    Service {
+        name: String,
+        start_type: StartType,
+        delayed: bool,
+    },
+    ScheduledTask {
+        path: String,
+        enabled: bool,
+    },
+    /// The scheme reactivated: the recorded one, or Balanced when it no longer exists.
+    Power {
+        scheme: String,
+    },
+    Dns(DnsRecord),
+}
+
+impl Restored {
+    /// The journal's target text of the restored record.
+    fn target(&self) -> String {
+        match self {
+            Restored::Registry { target, .. } => {
+                registry_target(target.hive, &target.key_path, &target.value_name)
+            }
+            Restored::Service { name, .. } => format!("service {name}"),
+            Restored::ScheduledTask { path, .. } => scheduled_task_target(path),
+            Restored::Power { scheme } => format!("power scheme {scheme}"),
+            Restored::Dns(rec) => rec.target(),
+        }
+    }
+}
+
+/// Waits `sys.settle()` once, reads every restored target back and reports the ones that do
+/// not hold what was restored in `not_restored`, with a `verify_after_rollback` row each; their
+/// records stay reverted. Values Windows changes on its own (`verify::unverified`) and
+/// services, scheduled tasks and adapters that no longer exist are not read; a target that
+/// cannot be read adds a warning. Scheduled tasks are read through `tasks`, the store the
+/// rollback restored them with.
+fn verify_restored(
+    journal: &Journal,
+    session: Option<i64>,
+    restored: &[Restored],
+    tasks: Option<&Result<Box<dyn TaskStore + '_>>>,
+    report: &mut RollbackReport,
+    sys: &dyn RollbackSystem,
+) -> Result<()> {
+    sys.settle();
+    for item in restored {
+        match read_restored(item, tasks, sys) {
+            Ok(None) => {}
+            Ok(Some(mismatch)) => {
+                let detail = format!("found {}; restored {}", mismatch.found, mismatch.expected);
+                journal.log_op(
+                    session,
+                    OP_VERIFY_AFTER_ROLLBACK,
+                    &mismatch.target,
+                    "not_restored",
+                    Some(&detail),
+                )?;
+                report.not_restored.push(mismatch);
+            }
+            Err(e) => {
+                let (target, error) = (item.target(), e.to_string());
+                warn!(target = %target, error = %error, "cannot read a restored target back");
+                report.warnings.push(fill(
+                    READ_BACK_WARNING,
+                    &[("target", &target), ("error", &error)],
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The mismatch of a restored target that does not hold what was restored; `None` when it
+/// holds or is not read. The original is what was restored.
+fn read_restored(
+    item: &Restored,
+    tasks: Option<&Result<Box<dyn TaskStore + '_>>>,
+    sys: &dyn RollbackSystem,
+) -> Result<Option<Mismatch>> {
+    let mismatch = |label: String, expected: String, found: String| Mismatch {
+        target: item.target(),
+        label,
+        original: Some(expected.clone()),
+        expected,
+        found,
+        back_to_original: false,
+    };
+    match item {
+        Restored::Registry { target, value } => {
+            let (hive, key_path, value_name) = (
+                target.hive,
+                target.key_path.as_str(),
+                target.value_name.as_str(),
+            );
+            if unverified(hive, key_path, value_name) {
+                return Ok(None);
+            }
+            let current = read_raw(hive, key_path, value_name)?;
+            if same_setting(hive, key_path, value_name, value.as_ref(), current.as_ref()) {
+                return Ok(None);
+            }
+            Ok(Some(mismatch(
+                registry_label(value_name),
+                raw_text(hive, key_path, value_name, value.as_ref()),
+                raw_text(hive, key_path, value_name, current.as_ref()),
+            )))
+        }
+        Restored::Service {
+            name,
+            start_type,
+            delayed,
+        } => {
+            let Some((start, now_delayed)) = read_start(name)? else {
+                return Ok(None);
+            };
+            let held =
+                start == *start_type && (start != StartType::Automatic || now_delayed == *delayed);
+            Ok((!held).then(|| {
+                mismatch(
+                    service_label(name),
+                    start_text(*start_type, *delayed),
+                    start_text(start, now_delayed),
+                )
+            }))
+        }
+        Restored::ScheduledTask { path, enabled } => {
+            let store = match tasks {
+                Some(Ok(store)) => store,
+                Some(Err(e)) => return Err(Error::Other(e.to_string())),
+                None => return Err(Error::Other("Task Scheduler was not reached".to_string())),
+            };
+            let Some(info) = store.query(path)? else {
+                return Ok(None);
+            };
+            Ok((info.enabled != *enabled).then(|| {
+                mismatch(
+                    task_label(path),
+                    enabled_text(*enabled).to_string(),
+                    enabled_text(info.enabled).to_string(),
+                )
+            }))
+        }
+        Restored::Power { scheme } => {
+            let active = power::active_scheme()?;
+            if active.guid.eq_ignore_ascii_case(scheme) {
+                return Ok(None);
+            }
+            // A recorded scheme that no longer exists is restored as Balanced.
+            if active.guid.eq_ignore_ascii_case(power::BALANCED_GUID)
+                && !power::scheme_exists(scheme)?
+            {
+                return Ok(None);
+            }
+            Ok(Some(mismatch(
+                POWER_PLAN_LABEL.to_string(),
+                scheme_text(scheme, power::scheme_name(scheme).as_deref()),
+                scheme_text(&active.guid, Some(&active.name)),
+            )))
+        }
+        Restored::Dns(rec) => {
+            let Some(current) = sys.dns_now(rec)? else {
+                return Ok(None);
+            };
+            if same_servers(&current, &rec.previous_servers) {
+                return Ok(None);
+            }
+            Ok(Some(mismatch(
+                dns_label(rec),
+                servers_text(&rec.previous_servers),
+                servers_text(&current),
+            )))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
+    use std::rc::Rc;
+    use std::sync::Arc;
 
     use super::*;
     use crate::debloat::scheduled_tasks::fake::FakeTasks;
@@ -1100,7 +1558,8 @@ mod tests {
     use crate::safety::state_log::{
         NewDnsRecord, NewRegistryRecord, NewScheduledTaskRecord, NewTaskDefinitionRecord,
     };
-    use crate::win::registry::{delete_sandbox_tree, read_value, RegValue};
+    use crate::safety::test_safety;
+    use crate::win::registry::{delete_sandbox_tree, exists, read_value, RegValue};
 
     const TASK: &str = r"\PCOptimizerSelfTest\Rollback";
     const OTHER_TASK: &str = r"\PCOptimizerSelfTest\RollbackOther";
@@ -1152,6 +1611,14 @@ mod tests {
         /// `refresh_live` fails with this message.
         live_error: Option<String>,
         live_calls: RefCell<Vec<LiveSetting>>,
+        /// Runs at every `settle`, standing in for Windows or another program changing a
+        /// restored target while the rollback waits.
+        settle_hook: RefCell<Option<Box<dyn Fn()>>>,
+        /// Task flags set at every `settle`, as Windows or another program would.
+        settle_tasks: Vec<(String, bool)>,
+        settles: Cell<usize>,
+        /// Answers of `dns_now`; `Ok(None)` (the adapter no longer exists) once empty.
+        dns_now: RefCell<VecDeque<Result<Option<String>>>>,
     }
 
     impl FakeSystem {
@@ -1174,6 +1641,10 @@ mod tests {
                 folders: RefCell::new(Vec::new()),
                 live_error: None,
                 live_calls: RefCell::new(Vec::new()),
+                settle_hook: RefCell::new(None),
+                settle_tasks: Vec::new(),
+                settles: Cell::new(0),
+                dns_now: RefCell::new(VecDeque::new()),
             }
         }
 
@@ -1243,6 +1714,20 @@ mod tests {
                 Some(message) => Err(Error::Other(message.clone())),
                 None => Ok(()),
             }
+        }
+
+        fn settle(&self) {
+            self.settles.set(self.settles.get() + 1);
+            for (path, enabled) in &self.settle_tasks {
+                self.tasks.set(path, *enabled);
+            }
+            if let Some(hook) = self.settle_hook.borrow().as_ref() {
+                hook();
+            }
+        }
+
+        fn dns_now(&self, _rec: &DnsRecord) -> Result<Option<String>> {
+            self.dns_now.borrow_mut().pop_front().unwrap_or(Ok(None))
         }
     }
 
@@ -1916,6 +2401,17 @@ mod tests {
         fn flush_dns(&self) -> Result<()> {
             crate::network::NetStack::flush_resolver_cache(self.0)
         }
+
+        fn settle(&self) {}
+
+        fn dns_now(&self, rec: &DnsRecord) -> Result<Option<String>> {
+            use crate::network::NetStack;
+            let guid = canonical_guid(&rec.interface_guid);
+            if !self.0.adapters()?.iter().any(|a| a.id == guid) {
+                return Ok(None);
+            }
+            Ok(Some(self.0.static_dns(&guid, rec.family)?.servers))
+        }
     }
 
     #[test]
@@ -1923,12 +2419,11 @@ mod tests {
         use crate::network::adapters::AdapterKind;
         use crate::network::dns::{run, DnsRequest, Mode};
         use crate::network::tests::{adapter, guid, journal as shared_journal, FakeStack};
-        use crate::safety::test_safety;
 
         let (_dir, journal) = shared_journal();
         let stack = FakeStack::with(vec![adapter(1, "Wi-Fi", AdapterKind::Wifi)]);
         for preset in ["cloudflare", "google"] {
-            let safety = test_safety(std::sync::Arc::clone(&journal), "dns", false);
+            let safety = test_safety(Arc::clone(&journal), "dns", false);
             run(
                 &stack,
                 Mode::Apply(&safety),
@@ -2014,6 +2509,93 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(counted.total_reverted(), 2);
+    }
+
+    #[test]
+    fn report_without_not_restored_still_deserializes() {
+        let old: RollbackReport = serde_json::from_str(
+            r#"{"dry_run":false,"registry_restored":1,"registry_deleted":0,"services_restored":0,
+                "services_started":0,"scheduled_tasks_restored":0,"appx_restored":0,
+                "appx_store_required":[],"power_restored":0,"dns_restored":0,
+                "task_definitions_deleted":0,"actions":[],"failures":[],"restart":"none"}"#,
+        )
+        .unwrap();
+        assert!(old.not_restored.is_empty());
+        assert!(old.warnings.is_empty());
+        assert!(old.is_clean());
+        let json = serde_json::to_value(RollbackReport::default()).unwrap();
+        assert_eq!(json["not_restored"], serde_json::json!([]));
+        assert_eq!(json["warnings"], serde_json::json!([]));
+
+        let changed_again = RollbackReport {
+            registry_restored: 1,
+            not_restored: vec![Mismatch {
+                target: r"HKCU\Software\PCOptimizer\SelfTest\Example\Value".to_string(),
+                label: "Value".to_string(),
+                expected: "not set".to_string(),
+                found: "0".to_string(),
+                original: Some("not set".to_string()),
+                back_to_original: false,
+            }],
+            ..Default::default()
+        };
+        assert!(
+            !changed_again.is_clean(),
+            "a target changed again after its restore"
+        );
+        assert_eq!(changed_again.total_reverted(), 1, "the restore happened");
+        let round: RollbackReport =
+            serde_json::from_value(serde_json::to_value(&changed_again).unwrap()).unwrap();
+        assert_eq!(round.not_restored, changed_again.not_restored);
+        let unread = RollbackReport {
+            warnings: vec![r"HKCU\Example\Value: cannot be read back (Access is denied.)".into()],
+            ..Default::default()
+        };
+        assert!(unread.is_clean(), "a read-back warning is not a failure");
+    }
+
+    #[test]
+    fn fake_systems_settle_and_read_dns_servers() {
+        use crate::network::adapters::AdapterKind;
+        use crate::network::tests::{adapter, guid, FakeStack};
+
+        let sys = FakeSystem::new();
+        sys.settle();
+        let hook_runs = Rc::new(Cell::new(0));
+        let runs = Rc::clone(&hook_runs);
+        *sys.settle_hook.borrow_mut() = Some(Box::new(move || runs.set(runs.get() + 1)));
+        sys.settle();
+        assert_eq!((sys.settles.get(), hook_runs.get()), (2, 1));
+
+        let rec = dns_record(GUID, IpFamily::Ipv4);
+        sys.dns_now.borrow_mut().extend([
+            Ok(Some("9.9.9.9".to_string())),
+            Err(Error::Other("cannot read".to_string())),
+        ]);
+        assert_eq!(sys.dns_now(&rec).unwrap(), Some("9.9.9.9".to_string()));
+        assert!(sys.dns_now(&rec).is_err());
+        assert_eq!(
+            sys.dns_now(&rec).unwrap(),
+            None,
+            "the adapter is gone once the answers run out"
+        );
+
+        let stack = FakeStack::with(vec![adapter(1, "Wi-Fi", AdapterKind::Wifi)]);
+        stack.set_static(&guid(1), IpFamily::Ipv4, "9.9.9.9");
+        let sys = StackSystem(&stack);
+        sys.settle();
+        let now = |interface: &str, family| sys.dns_now(&dns_record(interface, family)).unwrap();
+        assert_eq!(
+            now(&guid(1).to_uppercase(), IpFamily::Ipv4),
+            Some("9.9.9.9".to_string())
+        );
+        assert_eq!(
+            now(&guid(1), IpFamily::Ipv6),
+            Some(String::new()),
+            "obtained automatically"
+        );
+        assert_eq!(now(GUID, IpFamily::Ipv4), None, "no such adapter");
+        assert!(stack.calls().is_empty(), "reads only");
     }
 
     // ── task definitions ──
@@ -2306,7 +2888,12 @@ mod tests {
         }
 
         fn new(name: &str) -> SandboxKey {
-            let key = SandboxKey(SandboxKey::name_for(name));
+            SandboxKey::at(SandboxKey::name_for(name))
+        }
+
+        /// The key `path` below the SelfTest key, removed first.
+        fn at(path: String) -> SandboxKey {
+            let key = SandboxKey(path);
             delete_sandbox_tree(&key.0).unwrap();
             key
         }
@@ -2459,5 +3046,789 @@ mod tests {
             "nothing restored"
         );
         assert!(journal.ops(10).unwrap().is_empty());
+    }
+
+    // ── restores under the caller's session ──
+
+    /// Name prefix of the registry keys the `restore_registry_in` tests write, one direct
+    /// child of the SelfTest key per test.
+    const RESTORE_SANDBOX: &str = r"Software\PCOptimizer\SelfTest\RollbackRestoreIn";
+
+    /// A temporary journal that sessions can share; keep the directory alive as long as it.
+    fn session_journal() -> (tempfile::TempDir, Arc<Journal>) {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(dir.path().join("journal.db")).unwrap());
+        (dir, journal)
+    }
+
+    fn sandbox_target(key_path: &str, value_name: &str) -> RegistryTarget {
+        RegistryTarget {
+            hive: Hive::CurrentUser,
+            key_path: key_path.to_string(),
+            value_name: value_name.to_string(),
+        }
+    }
+
+    /// Sets each `(key_path, value_name)` to 0 through a session of its own, which journals
+    /// the values first, as an earlier apply would.
+    fn apply_values(journal: &Arc<Journal>, values: &[(&str, &str)]) {
+        let safety = test_safety(Arc::clone(journal), "apply", false);
+        for &(key_path, value_name) in values {
+            safety
+                .set_registry_value(Hive::CurrentUser, key_path, value_name, &RegValue::Dword(0))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn restore_registry_in_marks_reverted_and_logs_rollback_registry() {
+        let key = SandboxKey::at(format!("{RESTORE_SANDBOX}Marks"));
+        let created = format!(r"{}\Created\Leaf", key.0);
+        let (_dir, journal) = session_journal();
+        let (handle, _) = Key::create(Hive::CurrentUser, &key.0).unwrap();
+        handle.set("Kept", &RegValue::Dword(1)).unwrap();
+        drop(handle);
+        apply_values(
+            &journal,
+            &[(&key.0, "Kept"), (&created, "Removed"), (&key.0, "Other")],
+        );
+        record_task(&journal, TASK, true);
+
+        let safety = test_safety(Arc::clone(&journal), "apply", false);
+        let filter = RollbackFilter {
+            registry: vec![
+                sandbox_target(&key.0.to_uppercase(), "kept"),
+                sandbox_target(&created, "Removed"),
+            ],
+            scheduled_tasks: vec![TASK.to_string()],
+            ..Default::default()
+        };
+        let lines: Vec<_> = restore_registry_in(&safety, &filter)
+            .unwrap()
+            .into_iter()
+            .map(|line| line.map_err(|failure| failure.error))
+            .collect();
+        let kept = format!(r"HKCU\{}\Kept", key.0);
+        let removed = format!(r"HKCU\{created}\Removed");
+        assert_eq!(
+            lines,
+            vec![
+                Ok(format!("{removed}: restored to not set")),
+                Ok(format!("{kept}: restored to 0x00000001 (1)")),
+            ],
+            "newest record first"
+        );
+
+        assert_eq!(
+            read_value(Hive::CurrentUser, &key.0, "Kept").unwrap(),
+            Some(RegValue::Dword(1))
+        );
+        assert!(
+            !exists(Hive::CurrentUser, &format!(r"{}\Created", key.0)).unwrap(),
+            "the keys the earlier write created are removed"
+        );
+        assert_eq!(
+            read_value(Hive::CurrentUser, &key.0, "Other").unwrap(),
+            Some(RegValue::Dword(0)),
+            "a record the filter does not select is left alone"
+        );
+        let active: Vec<String> = journal
+            .active_registry()
+            .unwrap()
+            .into_iter()
+            .map(|rec| rec.value_name)
+            .collect();
+        assert_eq!(active, vec!["Other".to_string()]);
+        assert!(journal
+            .all_registry()
+            .unwrap()
+            .iter()
+            .filter(|rec| rec.value_name != "Other")
+            .all(|rec| rec.reverted_at.is_some()));
+        assert_eq!(
+            journal.active_scheduled_tasks().unwrap().len(),
+            1,
+            "only registry records are restored"
+        );
+        let restores: Vec<_> = ops(&journal)
+            .into_iter()
+            .filter(|r| r.0 == OP_ROLLBACK_REGISTRY)
+            .collect();
+        assert_eq!(
+            restores,
+            vec![
+                row(OP_ROLLBACK_REGISTRY, &removed, "deleted", None),
+                row(OP_ROLLBACK_REGISTRY, &kept, "restored", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn restore_registry_in_uses_the_callers_session() {
+        let key = SandboxKey::at(format!("{RESTORE_SANDBOX}Session"));
+        let (_dir, journal) = session_journal();
+        apply_values(&journal, &[(&key.0, "Probe")]);
+
+        let safety = test_safety(Arc::clone(&journal), "apply", false);
+        let sessions_before = journal.sessions().unwrap().len();
+        let ops_before = journal.ops(100).unwrap().len();
+        for nothing in [
+            RollbackFilter::default(),
+            RollbackFilter {
+                power: true,
+                services: vec!["PCOptimizerSelfTestService".to_string()],
+                ..Default::default()
+            },
+        ] {
+            assert!(restore_registry_in(&safety, &nothing).unwrap().is_empty());
+        }
+        assert_eq!(journal.ops(100).unwrap().len(), ops_before);
+
+        let filter = RollbackFilter {
+            registry: vec![sandbox_target(&key.0, "Probe")],
+            ..Default::default()
+        };
+        let lines = restore_registry_in(&safety, &filter).unwrap();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].is_ok(), "{:?}", lines[0]);
+        assert_eq!(
+            read_value(Hive::CurrentUser, &key.0, "Probe").unwrap(),
+            None
+        );
+
+        let sessions = journal.sessions().unwrap();
+        assert_eq!(sessions.len(), sessions_before, "no session of its own");
+        assert_eq!(sessions[0].id, safety.session_id());
+        assert!(
+            sessions[0].ended_at.is_none(),
+            "the caller's session stays open"
+        );
+        let logged: Vec<_> = journal
+            .ops(100)
+            .unwrap()
+            .into_iter()
+            .filter(|o| o.op == OP_ROLLBACK_REGISTRY)
+            .map(|o| o.session_id)
+            .collect();
+        assert_eq!(logged, vec![Some(safety.session_id())]);
+    }
+
+    #[test]
+    fn restore_registry_in_keeps_a_refused_record_active() {
+        let key = SandboxKey::at(format!("{RESTORE_SANDBOX}Refused"));
+        let (_dir, journal) = session_journal();
+        apply_values(&journal, &[(&key.0, "Probe")]);
+
+        let safety = test_safety(Arc::clone(&journal), "apply", false);
+        safety.assume_other_user();
+        let filter = RollbackFilter {
+            registry: vec![sandbox_target(&key.0, "Probe")],
+            ..Default::default()
+        };
+        let lines = restore_registry_in(&safety, &filter).unwrap();
+        let target = format!(r"HKCU\{}\Probe", key.0);
+        let error = crate::win::session::other_user_error().to_string();
+        assert_eq!(lines.len(), 1);
+        let failure = lines[0].as_ref().unwrap_err();
+        assert_eq!(
+            (failure.target.as_str(), failure.error.as_str()),
+            (target.as_str(), error.as_str())
+        );
+        assert_eq!(
+            read_value(Hive::CurrentUser, &key.0, "Probe").unwrap(),
+            Some(RegValue::Dword(0)),
+            "nothing restored"
+        );
+        assert_eq!(journal.active_registry().unwrap().len(), 1);
+        assert_eq!(
+            ops(&journal).last().cloned(),
+            Some(row(OP_ROLLBACK_REGISTRY, &target, "failed", Some(&error)))
+        );
+    }
+
+    // ── records whose write never happened ──
+
+    /// Journals `Probe` under `key` as an earlier version of Cairn did before a write: the key
+    /// did not exist, so the write was to create it (`created_root` is the key), the value was
+    /// absent and no written value is kept. The session logs `op` for the write (`None`:
+    /// nothing, as that version did when the write failed).
+    fn record_earlier_write(journal: &Journal, key: &str, op: Option<(&str, &str)>) {
+        let session = journal.begin_session("earlier-unit", "0.2.0").unwrap();
+        assert!(journal
+            .record_registry(
+                session,
+                &NewRegistryRecord {
+                    hive: Hive::CurrentUser,
+                    key_path: key.to_string(),
+                    value_name: "Probe".to_string(),
+                    key_existed: false,
+                    value_existed: false,
+                    original: None,
+                    created_root: Some(key.to_string()),
+                },
+            )
+            .unwrap());
+        if let Some((op, outcome)) = op {
+            let target = format!(r"HKCU\{key}\Probe");
+            journal
+                .log_op(Some(session), op, &target, outcome, None)
+                .unwrap();
+        }
+        journal.end_session(session).unwrap();
+    }
+
+    #[test]
+    fn a_record_whose_write_never_happened_ends_without_touching_the_registry() {
+        let silent = SandboxKey::at(format!("{RESTORE_SANDBOX}NeverSilent"));
+        let failed = SandboxKey::at(format!("{RESTORE_SANDBOX}NeverFailed"));
+        let applied = SandboxKey::at(format!("{RESTORE_SANDBOX}NeverApplied"));
+        let changed = SandboxKey::at(format!("{RESTORE_SANDBOX}NeverChanged"));
+        let (_dir, journal) = journal();
+        // Each write created its key, which is there and empty: the write of the value failed
+        // after that (logged nothing, or logged its failure), or it happened and the value was
+        // removed outside Cairn since. Changed's write failed too, but its value was set
+        // outside Cairn afterwards.
+        for key in [&silent, &failed, &applied, &changed] {
+            Key::create(Hive::CurrentUser, &key.0).unwrap();
+        }
+        record_earlier_write(&journal, &silent.0, None);
+        record_earlier_write(&journal, &failed.0, Some(("set_registry_value", "failed")));
+        record_earlier_write(
+            &journal,
+            &applied.0,
+            Some(("set_registry_value", "applied")),
+        );
+        record_earlier_write(&journal, &changed.0, None);
+        Key::open(Hive::CurrentUser, &changed.0, true)
+            .unwrap()
+            .unwrap()
+            .set("Probe", &RegValue::Dword(5))
+            .unwrap();
+        let target = |key: &SandboxKey| format!(r"HKCU\{}\Probe", key.0);
+        let sys = FakeSystem::new();
+
+        let plan = rollback_with(&journal, None, true, &sys).unwrap();
+        let never = |key: &SandboxKey| format!("{NEVER_WRITTEN_ACTION}: {}", target(key));
+        let delete = |key: &SandboxKey| format!("delete value and created key: {}", target(key));
+        assert_eq!(
+            plan.actions,
+            vec![
+                delete(&changed),
+                delete(&applied),
+                never(&failed),
+                never(&silent)
+            ],
+            "newest record first"
+        );
+
+        let report = rollback_with(&journal, None, false, &sys).unwrap();
+        assert!(report.is_clean(), "{:?}", report.failures);
+        assert_eq!((report.registry_restored, report.registry_deleted), (2, 2));
+        assert!(
+            journal.active_registry().unwrap().is_empty(),
+            "every record ended"
+        );
+        for key in [&silent, &failed] {
+            assert!(
+                exists(Hive::CurrentUser, &key.0).unwrap(),
+                "nothing was written for {}: the key its write created stays",
+                key.0
+            );
+        }
+        for key in [&applied, &changed] {
+            assert!(
+                !exists(Hive::CurrentUser, &key.0).unwrap(),
+                "{} was restored as usual",
+                key.0
+            );
+        }
+        let restores: Vec<_> = ops(&journal)
+            .into_iter()
+            .filter(|r| r.0 == OP_ROLLBACK_REGISTRY)
+            .collect();
+        assert_eq!(
+            restores,
+            vec![
+                row(OP_ROLLBACK_REGISTRY, &target(&changed), "deleted", None),
+                row(OP_ROLLBACK_REGISTRY, &target(&applied), "deleted", None),
+                row(
+                    OP_ROLLBACK_REGISTRY,
+                    &target(&failed),
+                    "never_written",
+                    None
+                ),
+                row(
+                    OP_ROLLBACK_REGISTRY,
+                    &target(&silent),
+                    "never_written",
+                    None
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn restore_registry_in_ends_a_record_whose_write_never_happened() {
+        let key = SandboxKey::at(format!("{RESTORE_SANDBOX}NeverIn"));
+        let (_dir, journal) = session_journal();
+        Key::create(Hive::CurrentUser, &key.0).unwrap();
+        record_earlier_write(&journal, &key.0, None);
+
+        let safety = test_safety(Arc::clone(&journal), "apply", false);
+        let filter = RollbackFilter {
+            registry: vec![sandbox_target(&key.0, "Probe")],
+            ..Default::default()
+        };
+        let target = format!(r"HKCU\{}\Probe", key.0);
+        let lines = restore_registry_in(&safety, &filter).unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0].as_ref().unwrap(),
+            &format!("{target}: restored to not set")
+        );
+        assert!(
+            exists(Hive::CurrentUser, &key.0).unwrap(),
+            "nothing written"
+        );
+        assert!(journal.active_registry().unwrap().is_empty());
+        assert_eq!(
+            ops(&journal).last().cloned(),
+            Some(row(OP_ROLLBACK_REGISTRY, &target, "never_written", None))
+        );
+    }
+
+    // ── read-back after the restore ──
+
+    /// Name prefix of the registry keys the read-back tests restore, one direct child of the
+    /// SelfTest key per test.
+    const VERIFY_SANDBOX: &str = r"Software\PCOptimizer\SelfTest\RollbackVerify";
+
+    /// Sets `name` under `key` to 0 through a session of its own, over `original` (`None`:
+    /// absent), as an earlier apply would.
+    fn changed_value(journal: &Arc<Journal>, key: &str, name: &str, original: Option<u32>) {
+        if let Some(value) = original {
+            let (handle, _) = Key::create(Hive::CurrentUser, key).unwrap();
+            handle.set(name, &RegValue::Dword(value)).unwrap();
+        }
+        apply_values(journal, &[(key, name)]);
+    }
+
+    fn verify_rows(journal: &Journal) -> Vec<(String, String, String, Option<String>)> {
+        ops(journal)
+            .into_iter()
+            .filter(|row| row.0 == OP_VERIFY_AFTER_ROLLBACK)
+            .collect()
+    }
+
+    #[test]
+    fn restored_values_are_read_back_once_after_the_settle() {
+        let key = SandboxKey::at(format!("{VERIFY_SANDBOX}Once"));
+        let (_dir, journal) = session_journal();
+        changed_value(&journal, &key.0, "Restored", Some(1));
+        changed_value(&journal, &key.0, "Deleted", None);
+        record_task(&journal, TASK, true);
+        record_dns(&journal, GUID, IpFamily::Ipv4, "");
+        let mut sys = FakeSystem::with_dns(vec![Ok(DnsRestore::Written)]);
+        sys.tasks = FakeTasks::with(&[(TASK, false, false)]);
+        sys.dns_now.borrow_mut().push_back(Ok(Some(String::new())));
+
+        let report = rollback_with(&journal, None, false, &sys).unwrap();
+        assert!(
+            report.is_clean(),
+            "{:?} {:?}",
+            report.failures,
+            report.not_restored
+        );
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert_eq!(
+            (
+                report.registry_restored,
+                report.registry_deleted,
+                report.scheduled_tasks_restored,
+                report.dns_restored
+            ),
+            (1, 1, 1, 1)
+        );
+        assert_eq!(sys.settles.get(), 1, "one wait for the whole rollback");
+        assert_eq!(sys.store_requests.get(), 1);
+        assert!(
+            sys.dns_now.borrow().is_empty(),
+            "the restored servers were read"
+        );
+        assert!(
+            verify_rows(&journal).is_empty(),
+            "targets that hold add no row"
+        );
+        assert_eq!(
+            read_value(Hive::CurrentUser, &key.0, "Restored").unwrap(),
+            Some(RegValue::Dword(1))
+        );
+
+        // Nothing restored, nothing to wait for: the task already has its flag and the adapter
+        // is gone.
+        let (_dir, journal) = session_journal();
+        record_task(&journal, TASK, true);
+        record_dns(&journal, GUID, IpFamily::Ipv4, "");
+        let mut sys = FakeSystem::with_dns(vec![Ok(DnsRestore::NotFound)]);
+        sys.tasks = FakeTasks::with(&[(TASK, true, false)]);
+        let report = rollback_with(&journal, None, false, &sys).unwrap();
+        assert_eq!(report.total_reverted(), 2);
+        assert_eq!(sys.settles.get(), 0);
+    }
+
+    #[test]
+    fn a_restore_windows_changes_again_is_not_restored_and_stays_reverted() {
+        let key = SandboxKey::at(format!("{VERIFY_SANDBOX}Again"));
+        let (_dir, journal) = session_journal();
+        changed_value(&journal, &key.0, "Restored", Some(1));
+        record_task(&journal, TASK, true);
+        record_dns(&journal, GUID, IpFamily::Ipv4, "");
+        let mut sys = FakeSystem::with_dns(vec![Ok(DnsRestore::Written)]);
+        sys.tasks = FakeTasks::with(&[(TASK, false, false)]);
+        // While the rollback waits, another program changes the restored value and turns the
+        // task off again, and the adapter has other servers.
+        let path = key.0.clone();
+        *sys.settle_hook.borrow_mut() = Some(Box::new(move || {
+            let (handle, _) = Key::create(Hive::CurrentUser, &path).unwrap();
+            handle.set("Restored", &RegValue::Dword(5)).unwrap();
+        }));
+        sys.settle_tasks = vec![(TASK.to_string(), false)];
+        sys.dns_now
+            .borrow_mut()
+            .push_back(Ok(Some("9.9.9.9".to_string())));
+
+        let report = rollback_with(&journal, None, false, &sys).unwrap();
+        assert!(!report.is_clean(), "changed again after the restore");
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.total_reverted(), 3, "the restores happened");
+        let value = format!(r"HKCU\{}\Restored", key.0);
+        let not_restored = |target: &str, label: &str, expected: &str, found: &str| Mismatch {
+            target: target.to_string(),
+            label: label.to_string(),
+            expected: expected.to_string(),
+            found: found.to_string(),
+            original: Some(expected.to_string()),
+            back_to_original: false,
+        };
+        assert_eq!(
+            report.not_restored,
+            vec![
+                not_restored(&value, "Restored", "0x00000001 (1)", "0x00000005 (5)"),
+                not_restored(&task_target(TASK), "task Rollback", "enabled", "disabled"),
+                not_restored(
+                    &dns_target(IpFamily::Ipv4),
+                    &format!("DNS servers of {ADAPTER} (IPv4)"),
+                    "automatic",
+                    "9.9.9.9"
+                ),
+            ]
+        );
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+
+        // The records stay reverted: Cairn wrote the originals back and does not write them
+        // again.
+        let summary = journal.summary().unwrap();
+        assert_eq!(
+            (
+                summary.registry_active,
+                summary.scheduled_tasks_active,
+                summary.dns_active
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(sys.tasks.writes.get(), 1);
+        assert_eq!(
+            read_value(Hive::CurrentUser, &key.0, "Restored").unwrap(),
+            Some(RegValue::Dword(5))
+        );
+        assert_eq!(
+            verify_rows(&journal),
+            vec![
+                row(
+                    OP_VERIFY_AFTER_ROLLBACK,
+                    &value,
+                    "not_restored",
+                    Some("found 0x00000005 (5); restored 0x00000001 (1)")
+                ),
+                row(
+                    OP_VERIFY_AFTER_ROLLBACK,
+                    &task_target(TASK),
+                    "not_restored",
+                    Some("found disabled; restored enabled")
+                ),
+                row(
+                    OP_VERIFY_AFTER_ROLLBACK,
+                    &dns_target(IpFamily::Ipv4),
+                    "not_restored",
+                    Some("found 9.9.9.9; restored automatic")
+                ),
+            ]
+        );
+        let session = summary.last_session.unwrap();
+        assert_eq!(session.label, "rollback_to_baseline");
+        assert!(journal
+            .ops(100)
+            .unwrap()
+            .iter()
+            .filter(|o| o.op == OP_VERIFY_AFTER_ROLLBACK)
+            .all(|o| o.session_id == Some(session.id)));
+    }
+
+    #[test]
+    fn dry_run_reads_nothing_back() {
+        let key = SandboxKey::at(format!("{VERIFY_SANDBOX}DryRun"));
+        let (_dir, journal) = session_journal();
+        changed_value(&journal, &key.0, "Restored", Some(1));
+        record_task(&journal, TASK, true);
+        record_dns(&journal, GUID, IpFamily::Ipv4, "");
+        let sys = FakeSystem::new();
+        sys.dns_now
+            .borrow_mut()
+            .push_back(Ok(Some("9.9.9.9".to_string())));
+
+        let plan = rollback_with(&journal, None, true, &sys).unwrap();
+        assert_eq!(plan.actions.len(), 3, "{:?}", plan.actions);
+        assert!(plan.not_restored.is_empty() && plan.warnings.is_empty());
+        assert_eq!(sys.settles.get(), 0);
+        assert_eq!(sys.store_requests.get(), 0);
+        assert_eq!(sys.dns_now.borrow().len(), 1, "nothing was read back");
+        assert_eq!(
+            read_value(Hive::CurrentUser, &key.0, "Restored").unwrap(),
+            Some(RegValue::Dword(0))
+        );
+        assert!(verify_rows(&journal).is_empty());
+    }
+
+    #[test]
+    fn task_store_is_requested_at_most_once_with_verification() {
+        let (_dir, journal) = journal();
+        record_task(&journal, TASK, true);
+        record_task(&journal, OTHER_TASK, false);
+        let mut sys = FakeSystem::new();
+        sys.tasks = FakeTasks::with(&[(TASK, false, false), (OTHER_TASK, true, false)]);
+        let report = rollback_with(&journal, None, false, &sys).unwrap();
+        assert!(report.is_clean(), "{:?}", report.not_restored);
+        assert_eq!(report.scheduled_tasks_restored, 2);
+        assert_eq!(sys.settles.get(), 1);
+        assert_eq!(
+            sys.store_requests.get(),
+            1,
+            "one connection restores both tasks and reads them back"
+        );
+
+        // A store that cannot be reached: every task fails, so nothing is read back.
+        let (_dir, journal) = self::journal();
+        record_task(&journal, TASK, true);
+        let mut sys = FakeSystem::new();
+        sys.connect_error = Some("cannot connect to Task Scheduler: unavailable".to_string());
+        let report = rollback_with(&journal, None, false, &sys).unwrap();
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!((sys.store_requests.get(), sys.settles.get()), (1, 0));
+    }
+
+    #[test]
+    fn unverified_targets_are_not_read_back() {
+        let key = SandboxKey::at(format!("{VERIFY_SANDBOX}Unverified"));
+        let (handle, _) = Key::create(Hive::CurrentUser, &key.0).unwrap();
+        handle.set("Changed", &RegValue::Dword(2)).unwrap();
+        drop(handle);
+        let (_dir, journal) = journal();
+        let sys = FakeSystem::new();
+        // A value no PC holds: reading any of these targets would report it.
+        let unlikely = Some(RegValue::Sz("Cairn self-test".to_string()).to_raw());
+        let mut restored: Vec<Restored> = crate::updates::wu::pause_targets()
+            .into_iter()
+            .map(|target| Restored::Registry {
+                target,
+                value: unlikely.clone(),
+            })
+            .collect();
+        restored.push(Restored::Registry {
+            target: RegistryTarget {
+                hive: Hive::CurrentUser,
+                key_path: r"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\webcam".to_string(),
+                value_name: "LastSetTime".to_string(),
+            },
+            value: unlikely,
+        });
+        restored.push(Restored::Registry {
+            target: sandbox_target(&key.0, "Changed"),
+            value: Some(RegValue::Dword(1).to_raw()),
+        });
+
+        let mut report = RollbackReport::default();
+        verify_restored(&journal, None, &restored, None, &mut report, &sys).unwrap();
+        assert_eq!(sys.settles.get(), 1);
+        let labels: Vec<&str> = report
+            .not_restored
+            .iter()
+            .map(|m| m.label.as_str())
+            .collect();
+        assert_eq!(labels, ["Changed"], "only the sandbox value is read");
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    }
+
+    #[test]
+    fn a_target_that_cannot_be_read_back_is_a_warning() {
+        let (_dir, journal) = journal();
+        let sys = FakeSystem::new();
+        sys.dns_now
+            .borrow_mut()
+            .push_back(Err(Error::Other("cannot read".to_string())));
+        let restored = [
+            Restored::ScheduledTask {
+                path: TASK.to_string(),
+                enabled: true,
+            },
+            Restored::Dns(dns_record(GUID, IpFamily::Ipv4)),
+        ];
+        let mut report = RollbackReport::default();
+        verify_restored(&journal, None, &restored, None, &mut report, &sys).unwrap();
+        assert_eq!(
+            report.warnings,
+            vec![
+                format!(
+                    "{}: cannot be read back (Task Scheduler was not reached)",
+                    task_target(TASK)
+                ),
+                format!(
+                    "{}: cannot be read back (cannot read)",
+                    dns_target(IpFamily::Ipv4)
+                ),
+            ]
+        );
+        assert!(report.not_restored.is_empty());
+        assert!(report.is_clean(), "a read-back warning is not a failure");
+        assert!(journal.ops(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn services_and_the_power_plan_are_read_back_read_only() {
+        let sys = FakeSystem::new();
+        let gone = Restored::Service {
+            name: "PCOptimizerNoSuchService".to_string(),
+            start_type: StartType::Manual,
+            delayed: false,
+        };
+        assert_eq!(
+            read_restored(&gone, None, &sys).unwrap(),
+            None,
+            "not installed"
+        );
+
+        let active = power::active_scheme().unwrap();
+        let same = Restored::Power {
+            scheme: active.guid.to_ascii_uppercase(),
+        };
+        assert_eq!(read_restored(&same, None, &sys).unwrap(), None);
+        let missing_scheme = "00000000-0000-0000-0000-00000000c0de";
+        let other = Restored::Power {
+            scheme: missing_scheme.to_string(),
+        };
+        let read = read_restored(&other, None, &sys).unwrap();
+        if active.guid.eq_ignore_ascii_case(power::BALANCED_GUID) {
+            assert_eq!(read, None, "a scheme that is gone is restored as Balanced");
+        } else {
+            let mismatch = read.expect("another scheme is active");
+            assert_eq!(mismatch.target, format!("power scheme {missing_scheme}"));
+            assert_eq!(mismatch.label, "the power plan");
+            assert_eq!(mismatch.expected, format!("power plan {missing_scheme}"));
+        }
+        assert_eq!(
+            Restored::Service {
+                name: "SysMain".to_string(),
+                start_type: StartType::Manual,
+                delayed: false,
+            }
+            .target(),
+            "service SysMain"
+        );
+    }
+
+    /// Records every start-type and delayed-autostart write a restore makes.
+    #[derive(Default)]
+    struct RecordingService {
+        start_type: std::cell::Cell<Option<StartType>>,
+        delayed_writes: std::cell::RefCell<Vec<bool>>,
+        active: std::cell::Cell<bool>,
+        started: std::cell::Cell<bool>,
+    }
+
+    impl ServiceRestore for RecordingService {
+        fn set_start_type(&self, start: StartType) -> Result<()> {
+            self.start_type.set(Some(start));
+            Ok(())
+        }
+        fn set_delayed_auto_start(&self, on: bool) -> Result<()> {
+            self.delayed_writes.borrow_mut().push(on);
+            Ok(())
+        }
+        fn is_active(&self) -> Result<bool> {
+            Ok(self.active.get())
+        }
+        fn start(&self) -> Result<()> {
+            self.started.set(true);
+            self.active.set(true);
+            Ok(())
+        }
+    }
+
+    fn service_record(start_type: StartType, delayed: bool, was_running: bool) -> ServiceRecord {
+        ServiceRecord {
+            id: 1,
+            session_id: 1,
+            recorded_at: "2026-01-01T00:00:00+00:00".into(),
+            name: "SelfTestSvc".into(),
+            display_name: "Cairn self-test".into(),
+            start_type,
+            delayed_auto_start: delayed,
+            was_running,
+            active: true,
+            reverted_at: None,
+        }
+    }
+
+    #[test]
+    fn restoring_an_undelayed_automatic_service_writes_no_delayed_flag() {
+        // The recorded original was Automatic with no DelayedAutostart value: the restore
+        // sets the start type but never writes the flag, so no DelayedAutostart = 0 is left.
+        let svc = RecordingService {
+            active: std::cell::Cell::new(true),
+            ..RecordingService::default()
+        };
+        let started =
+            restore_service(&svc, &service_record(StartType::Automatic, false, true)).unwrap();
+        assert!(!started, "already active");
+        assert_eq!(svc.start_type.get(), Some(StartType::Automatic));
+        assert!(
+            svc.delayed_writes.borrow().is_empty(),
+            "an undelayed original leaves DelayedAutostart untouched"
+        );
+    }
+
+    #[test]
+    fn restoring_a_delayed_automatic_service_writes_the_flag_and_starts_it() {
+        let svc = RecordingService::default();
+        let started =
+            restore_service(&svc, &service_record(StartType::Automatic, true, true)).unwrap();
+        assert!(started, "was running and not active, so it is started");
+        assert!(svc.started.get());
+        assert_eq!(svc.start_type.get(), Some(StartType::Automatic));
+        assert_eq!(
+            *svc.delayed_writes.borrow(),
+            [true],
+            "a delayed original is restored delayed"
+        );
+    }
+
+    #[test]
+    fn restoring_a_manual_service_writes_no_delayed_flag() {
+        let svc = RecordingService {
+            active: std::cell::Cell::new(true),
+            ..RecordingService::default()
+        };
+        restore_service(&svc, &service_record(StartType::Manual, false, false)).unwrap();
+        assert_eq!(svc.start_type.get(), Some(StartType::Manual));
+        assert!(svc.delayed_writes.borrow().is_empty());
     }
 }

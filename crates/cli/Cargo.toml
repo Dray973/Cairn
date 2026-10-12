@@ -12,8 +12,11 @@ publish.workspace = true
 name = "optctl"
 path = "src/main.rs"
 # The embedded requireAdministrator manifest also applies to the test harness, which then
-# cannot start from a non-elevated `cargo test`. The CLI logic is covered through
-# optimizer_core's tests.
+# cannot start from a non-elevated `cargo test`, so `cargo test --workspace` leaves it out.
+# Its tests (the command line's own output, exit codes and help) run with
+# `cargo test -p optctl --bin optctl` from an elevated shell: the CI does that, and
+# scripts\build_release.ps1 does when its shell is elevated. The rest of the CLI logic is
+# covered through optimizer_core's tests.
 test = false
 
 [[bin]]
@@ -35,3 +38,5 @@ tracing-subscriber.workspace = true
 # activeCodePage System into every binary of this crate (optctl.exe and cairn-maintenance.exe),
 # so Windows shows the UAC prompt the moment optctl.exe starts.
 embed-manifest = "1.4"
+# Version resources of optctl.exe and cairn-maintenance.exe.
+cairn-winres.workspace = true

@@ -4,7 +4,11 @@
 //! row: a change, a setting already in place, or a skipped entry with its reason. A source
 //! that cannot be read skips its section's rows and adds a warning; it never fails the plan.
 //! Every write target comes from the catalog, the DNS presets or an entry, package or
-//! adapter listed on this PC; the profile's own strings are only compared with those.
+//! adapter listed on this PC; the profile's own strings are only compared with those. A tweak
+//! the scan reports as not offered here (its app or component is missing, another Windows
+//! version or edition, retired) is a skipped row with that reason, a tweak with something Undo
+//! cannot bring back starts unselected with that as its caution, and an export never holds a
+//! retired tweak.
 //!
 //! Applying plans again, keeps the chosen change rows and applies them in one session in the
 //! order tweaks, startup, DNS, Windows Update, maintenance, Store apps. The `apply_profile`
@@ -30,7 +34,8 @@ use super::system::ProfileSystem;
 use super::OP_APPLY_PROFILE;
 use crate::debloat::catalog::{self, Action, Category, RestartNeed, Risk, BLOAT_PACKAGES};
 use crate::debloat::engine::touches_current_user;
-use crate::debloat::{ItemKind, ItemOutcome, ItemState, ScanItem, ScanReport};
+use crate::debloat::requirements::Unavailable;
+use crate::debloat::{ItemKind, ItemOutcome, ItemState, Mismatch, ScanItem, ScanReport};
 use crate::network::{
     self, canonical_guid, Adapter, AdapterKind, ChangeOutcome, DnsChoice, DnsConfig, DnsMode,
     DnsReport, DnsRequest, IpFamily, LinkStatus, NetworkReport, PRESETS,
@@ -122,6 +127,9 @@ pub struct RowResult {
     pub title: String,
     pub outcome: StepOutcome,
     pub details: Vec<String>,
+    /// Targets the row's change wrote that did not hold when read back.
+    #[serde(default)]
+    pub not_kept: Vec<Mismatch>,
 }
 
 /// What applying a profile did.
@@ -211,6 +219,18 @@ pub fn reason_text(reason: StepReason) -> &'static str {
         StepReason::Edition => "Not on this edition of Windows",
         StepReason::NotOnThisPc => "Not on this PC",
         StepReason::UnknownId => "Unknown to this version of Cairn",
+        StepReason::WindowsVersion => "Not on this version of Windows",
+        StepReason::Retired => "Retired",
+    }
+}
+
+/// The skip reason of a tweak that is not offered on this PC.
+fn unavailable_reason(kind: Unavailable) -> StepReason {
+    match kind {
+        Unavailable::NotOnThisPc => StepReason::NotOnThisPc,
+        Unavailable::WindowsVersion => StepReason::WindowsVersion,
+        Unavailable::Edition => StepReason::Edition,
+        Unavailable::Retired => StepReason::Retired,
     }
 }
 
@@ -220,6 +240,7 @@ fn category_label(category: Category) -> &'static str {
         Category::Gaming => "Gaming",
         Category::Performance => "Performance",
         Category::Interface => "Interface",
+        Category::Security => "Security",
         Category::Bloatware => "Store apps",
     }
 }
@@ -623,6 +644,21 @@ fn tweak_rows(
             ));
             continue;
         };
+        // A tweak that is not offered on this PC is skipped whatever its state, even while
+        // its records still undo: applying never changes it.
+        if let Some(reason) = item.unavailable.map(unavailable_reason) {
+            let detail = item
+                .note
+                .clone()
+                .or_else(|| item.actions.first().map(|a| a.detail.clone()))
+                .unwrap_or_else(|| reason_text(reason).to_string());
+            let mut r = skipped_row(key, Section::Tweaks, title, reason, detail);
+            r.per_user = touches_current_user(tweak);
+            r.risk = Some(tweak.risk);
+            r.restart = tweak.restart;
+            rows.push(r);
+            continue;
+        }
         let mut r = match item.state {
             ItemState::Applied => row(
                 key,
@@ -670,9 +706,13 @@ fn tweak_rows(
                 r.caution = if power && scan.has_battery {
                     Some(BATTERY_CAUTION.to_string())
                 } else if tweak.risk == Risk::High {
-                    Some(format!("High risk: {}", tweak.description))
+                    Some(match &item.undo_limit {
+                        Some(limit) => format!("High risk: {} {limit}", tweak.description),
+                        None => format!("High risk: {}", tweak.description),
+                    })
                 } else {
-                    None
+                    // What Undo cannot bring back is a choice the user makes, not a default.
+                    item.undo_limit.clone()
                 };
                 r
             }
@@ -1313,6 +1353,7 @@ fn result_of(r: &PlanRow, outcome: StepOutcome, details: Vec<String>) -> RowResu
         title: r.title.clone(),
         outcome,
         details,
+        not_kept: Vec::new(),
     }
 }
 
@@ -1409,6 +1450,7 @@ pub(crate) fn apply_with(
                         title: key.clone(),
                         outcome: StepOutcome::Skipped,
                         details: vec![NOT_IN_PLAN.into()],
+                        not_kept: Vec::new(),
                     }),
                     Some(r) => match r.status {
                         StepStatus::Change => {
@@ -1683,7 +1725,9 @@ fn apply_items(
                 if matches!(outcome, StepOutcome::Applied | StepOutcome::Failed) {
                     changed.push(item.id.clone());
                 }
-                results[index] = Some(result_of(rows[index], outcome, details));
+                let mut result = result_of(rows[index], outcome, details);
+                result.not_kept = item.not_kept;
+                results[index] = Some(result);
             }
             warnings.extend(report.warnings);
             let results = results
@@ -1728,6 +1772,7 @@ fn step_results(rows: &[&PlanRow], steps: Vec<StepResult>) -> Vec<RowResult> {
             title,
             outcome: step.outcome,
             details: step.details,
+            not_kept: step.not_kept,
         });
     }
     for r in rows {
@@ -1866,6 +1911,10 @@ fn candidate_list(sys: &dyn ProfileSystem) -> CandidateList {
                 let Some(tweak) = catalog::tweak(&item.id) else {
                     continue;
                 };
+                // A retired tweak is never applied again, so a profile never carries it.
+                if tweak.retired.is_some() || item.unavailable == Some(Unavailable::Retired) {
+                    continue;
+                }
                 candidates.push(Candidate {
                     row: export_row(
                         format!("tweak:{}", item.id),

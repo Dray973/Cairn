@@ -301,8 +301,10 @@ impl MaintenanceSystem for Fake {
 }
 
 struct Setup {
-    dir: tempfile::TempDir,
     journal: Arc<Journal>,
+    /// Declared last because fields drop in declaration order: the folder can be removed only
+    /// after the journal in it is closed.
+    dir: tempfile::TempDir,
 }
 
 fn setup() -> Setup {

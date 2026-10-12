@@ -143,7 +143,7 @@ static WINDOWS_TOOLS: [WindowsTool; 11] = [
 
 /// Windows tools that fix a finding of the security checkup; the Tools section does not
 /// list them.
-static FIX_TOOLS: [WindowsTool; 4] = [
+static FIX_TOOLS: [WindowsTool; 5] = [
     tool(
         "uac_settings",
         "User Account Control settings",
@@ -175,6 +175,14 @@ static FIX_TOOLS: [WindowsTool; 4] = [
         true,
         "OptionalFeatures.exe",
         None,
+    ),
+    tool(
+        "task_scheduler",
+        "Task Scheduler",
+        "Scheduled tasks of Windows and apps, and whether each one is turned on.",
+        true,
+        "mmc.exe",
+        Some("taskschd.msc"),
     ),
 ];
 
@@ -260,7 +268,8 @@ mod tests {
                 "uac_settings",
                 "remote_settings",
                 "user_accounts",
-                "windows_features"
+                "windows_features",
+                "task_scheduler"
             ]
         );
         for id in &fixes {
@@ -268,7 +277,12 @@ mod tests {
             assert_eq!(windows_tool(id).map(|t| t.id), Some(*id));
         }
         assert!(!windows_tool("uac_settings").unwrap().requires_admin);
-        for id in ["remote_settings", "user_accounts", "windows_features"] {
+        for id in [
+            "remote_settings",
+            "user_accounts",
+            "windows_features",
+            "task_scheduler",
+        ] {
             assert!(windows_tool(id).unwrap().requires_admin, "{id}");
         }
         assert_eq!(
@@ -287,7 +301,7 @@ mod tests {
             .chain(fix_tools())
             .map(|t| t.id)
             .collect();
-        assert_eq!(all.len(), 15, "ids are unique across both sets");
+        assert_eq!(all.len(), 16, "ids are unique across both sets");
         for tool in windows_tools().iter().chain(fix_tools()) {
             let mut calls = Vec::new();
             open_windows_tool_with(tool.id, &mut |program, args| {
@@ -361,6 +375,30 @@ mod tests {
             );
         }
         assert!(windows_tool_command(Path::new("taskmgr.exe"), &[]).is_err());
+    }
+
+    #[test]
+    fn task_scheduler_fix_tool_is_listed() {
+        let tool = windows_tool("task_scheduler").expect("the Task Scheduler fix tool");
+        assert_eq!(tool.title, "Task Scheduler");
+        assert!(tool.requires_admin);
+        assert_eq!(
+            (tool.program, tool.snap_in),
+            ("mmc.exe", Some("taskschd.msc"))
+        );
+        assert!(fix_tools().iter().any(|t| t.id == "task_scheduler"));
+        assert!(!windows_tools().iter().any(|t| t.id == "task_scheduler"));
+        let system = system_dir().unwrap();
+        let mut calls = Vec::new();
+        open_windows_tool_with("task_scheduler", &mut |program, args| {
+            calls.push((program.to_path_buf(), args.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            calls,
+            [(system.join("mmc.exe"), vec![system.join("taskschd.msc")])]
+        );
     }
 
     #[test]

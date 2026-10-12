@@ -36,6 +36,11 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
+// The app version ("0.3.0"), defined by telemetry/CMakeLists.txt from Cargo.toml.
+#ifndef TEL_VERSION
+#error TEL_VERSION is not defined: build optimizer_telemetry with its CMake project.
+#endif
+
 namespace tel {
 
 NtApi g_nt;
@@ -48,7 +53,7 @@ constexpr uint32_t    kDefaultTopProcessCount   = 16;
 constexpr DWORD       kThreadStopTimeoutMs      = 5000;
 constexpr size_t      kErrorChars               = 512;
 constexpr size_t      kSystemMessageChars       = 256;  // UTF-16 units from FormatMessageW
-constexpr const char* kVersionString            = "optimizer_telemetry 0.2.0";
+constexpr const char* kVersionString            = "optimizer_telemetry " TEL_VERSION;
 
 thread_local char t_error[kErrorChars] = {};
 

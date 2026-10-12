@@ -459,6 +459,10 @@ fn print_batch(batch: &BatchResult) {
         println!();
         println!("Restart Windows to finish.");
     }
+    if batch.pending_restart {
+        println!();
+        println!("{}", winget::codes::PENDING_RESTART_TEXT);
+    }
 }
 
 /// Prints the plan of `request` and, with `yes`, starts it and follows it to the end.
@@ -653,7 +657,24 @@ fn print_apps(list: &AppList, json: bool) -> anyhow::Result<()> {
     for warning in &list.warnings {
         println!("warning: {warning}");
     }
+    let missing = missing_defaults(list);
+    if missing > 0 {
+        println!(
+            "note: the built-in list has {missing} app{} your list doesn't; Restore the default list \
+             in Install apps shows them and removes your own additions.",
+            if missing == 1 { "" } else { "s" }
+        );
+    }
     Ok(())
+}
+
+/// How many apps of the built-in list an account's own list lacks (ids compared ignoring
+/// ASCII case); 0 for the built-in list.
+fn missing_defaults(list: &AppList) -> usize {
+    list.default_ids
+        .iter()
+        .filter(|id| !list.apps.iter().any(|a| a.id.eq_ignore_ascii_case(id)))
+        .count()
 }
 
 // ───────────────────────────── Windows Update ─────────────────────────────
@@ -773,4 +794,37 @@ fn wu_undo(
         bail!("some values could not be restored");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use optimizer_core::updates::apps::AppEntry;
+
+    fn entry(id: &str) -> AppEntry {
+        AppEntry {
+            id: id.into(),
+            name: id.into(),
+            category: AppCategory::Utilities,
+            source: "winget".into(),
+        }
+    }
+
+    #[test]
+    fn an_own_list_counts_the_default_apps_it_lacks() {
+        let list = AppList {
+            apps: vec![entry("contoso.editor"), entry("Wingtip.Notes")],
+            custom: true,
+            path: String::new(),
+            warnings: Vec::new(),
+            default_ids: vec!["Contoso.Editor".into(), "Fabrikam.Chat".into()],
+        };
+        assert_eq!(missing_defaults(&list), 1);
+        let defaults = AppList {
+            custom: false,
+            default_ids: Vec::new(),
+            ..list
+        };
+        assert_eq!(missing_defaults(&defaults), 0);
+    }
 }

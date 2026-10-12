@@ -12,9 +12,10 @@ use optimizer_core::debloat::catalog::{
     TWEAKS,
 };
 use optimizer_core::debloat::engine::{catalog_view, ItemKind, ItemState, REINSTALLED_NOTE};
+use optimizer_core::debloat::requirements::Unavailable;
 use optimizer_core::debloat::{
-    registry, scheduled_tasks, services, ActionState, ApplyOptions, Engine, ItemOutcome,
-    RestartNeed,
+    registry, scheduled_tasks, services, ActionState, ApplyOptions, DriftKind, Engine, ItemOutcome,
+    Mismatch, RestartNeed,
 };
 use optimizer_core::safety::rollback::{rollback_filtered, RollbackFilter};
 use optimizer_core::safety::state_log::{
@@ -46,6 +47,22 @@ fn sandbox_session(journal: &Arc<Journal>) -> Safety {
     .expect("begin session")
 }
 
+/// Logs the write of `key_path\value_name` under `session`, as the safety layer does after it
+/// records the baseline and writes the value; a record without it stands for a write that
+/// failed and changed nothing.
+fn log_write(journal: &Journal, session: i64, hive: Hive, key_path: &str, value_name: &str) {
+    let target = format!(r"{}\{key_path}\{value_name}", hive.short());
+    journal
+        .log_op(
+            Some(session),
+            "set_registry_value",
+            &target,
+            "applied",
+            None,
+        )
+        .unwrap();
+}
+
 fn clean_sandbox(names: &[&str]) {
     if let Ok(Some(key)) = Key::open(Hive::CurrentUser, SANDBOX, true) {
         for n in names {
@@ -53,6 +70,36 @@ fn clean_sandbox(names: &[&str]) {
         }
     }
     let _ = delete_key_if_empty(Hive::CurrentUser, SANDBOX);
+}
+
+/// The note a scan shows for a tweak whose recorded targets no longer hold, in the words the
+/// scan uses.
+fn drift_note(drift: &[Mismatch]) -> Option<String> {
+    let labels = |drift: &[Mismatch]| match drift {
+        [first, second] => format!("{} and {}", first.label, second.label),
+        [first, second, rest @ ..] => {
+            format!("{}, {} and {} more", first.label, second.label, rest.len())
+        }
+        _ => unreachable!("several mismatches"),
+    };
+    match drift {
+        [] => None,
+        [one] if one.back_to_original => Some(format!(
+            "Changed back since Cairn applied it: {} is {} again, its value before Cairn's \
+             change. Apply sets it again.",
+            one.label, one.found
+        )),
+        [one] => Some(format!(
+            "Changed since Cairn applied it: {} is {}, not {}. Apply sets it again.",
+            one.label, one.found, one.expected
+        )),
+        several => Some(format!(
+            "Changed since Cairn applied it: {} settings no longer hold ({}). Apply sets them \
+             again.",
+            several.len(),
+            labels(several)
+        )),
+    }
 }
 
 #[test]
@@ -154,6 +201,12 @@ fn scan_is_read_only_and_covers_every_tweak() {
         assert_eq!(item.actions.len(), t.actions.len(), "{} action count", t.id);
         assert_eq!(item.kind, ItemKind::Tweak);
         assert_eq!(item.category, t.category);
+        assert_eq!(item.topic, Some(t.topic), "{}", t.id);
+        assert_eq!(item.undo_limit.as_deref(), t.undo_limit, "{}", t.id);
+        assert!(item.mode_undo || !t.default_on, "{} mode undo", t.id);
+        // An empty journal: nothing recorded, so nothing is held, drifted or former.
+        assert!(item.actions.iter().all(|a| a.held.is_none()), "{}", t.id);
+        assert!(item.drift.is_empty() && item.former.is_empty(), "{}", t.id);
         if t.default_on {
             let power = t
                 .actions
@@ -228,23 +281,37 @@ fn requirement_items_are_unavailable_with_a_note_or_read() {
         checked += 1;
         let missing = req.missing_text();
         let item = report.item(t.id).expect("scanned");
-        if item.state == ItemState::Unavailable && item.note.as_deref() == Some(missing) {
+        if item.unavailable == Some(Unavailable::NotOnThisPc) {
+            assert_eq!(item.state, ItemState::Unavailable, "{}", t.id);
+            // The note is the requirement's own text, or the more specific reason its probe
+            // gives (the Office probe tells a PC without Office from a consumer edition).
+            let note = item.note.clone().unwrap_or_default();
+            assert!(
+                note == missing
+                    || (req == catalog::Requirement::OfficeBusiness && !note.is_empty()),
+                "{}: {note:?}",
+                t.id
+            );
             assert!(
                 item.actions
                     .iter()
-                    .all(|a| a.state == ActionState::Unavailable && a.detail.ends_with(missing)),
+                    .all(|a| a.state == ActionState::Unavailable && a.detail.ends_with(&note)),
                 "{}: {:?}",
                 t.id,
                 item.actions
             );
-            println!("{}: not on this PC", t.id);
+            println!("{}: not on this PC ({note})", t.id);
         } else {
             let read_failed = report
                 .warnings
                 .iter()
                 .any(|w| w.starts_with(&format!("{}:", t.id)));
+            // Retired or outside its Windows range: unavailable for that reason instead.
+            let other_reason = item
+                .unavailable
+                .is_some_and(|kind| kind != Unavailable::NotOnThisPc);
             assert!(
-                item.state != ItemState::Unavailable || read_failed,
+                item.state != ItemState::Unavailable || read_failed || other_reason,
                 "{} is unavailable without its reason or a warning",
                 t.id
             );
@@ -256,7 +323,9 @@ fn requirement_items_are_unavailable_with_a_note_or_read() {
             println!("{}: {:?}, note {:?}", t.id, item.state, item.note);
         }
     }
-    assert_eq!(checked, 8, "Office 3, Edge 4, GPU scheduling 1");
+    let with_requirement = TWEAKS.iter().filter(|t| t.requires.is_some()).count();
+    assert!(with_requirement > 0);
+    assert_eq!(checked, with_requirement);
     assert_eq!(journal.summary().unwrap().sessions, 0);
 }
 
@@ -358,9 +427,15 @@ fn apply_requires_elevation() {
     }
     let (_dir, journal) = temp_journal();
     let engine = Engine::new(journal.clone());
-    let ids = vec!["privacy.activity_history".to_string()];
+    // A tweak offered on every PC: retired and unavailable tweaks are skipped before the
+    // elevation check, so the apply would succeed with nothing to do.
+    let id = TWEAKS
+        .iter()
+        .find(|t| t.retired.is_none() && t.requires.is_none() && t.windows == catalog::ANY_WINDOWS)
+        .expect("a tweak offered on every PC")
+        .id;
     let err = engine
-        .apply(&ids, &ApplyOptions::default())
+        .apply(&[id.to_string()], &ApplyOptions::default())
         .expect_err("apply without elevation");
     assert!(matches!(err, Error::NotElevated), "{err}");
     assert_eq!(journal.summary().unwrap().sessions, 0);
@@ -572,6 +647,7 @@ fn scan_marks_journaled_items_revertible() {
             },
         )
         .unwrap());
+    log_write(&journal, session, action.hive, action.path, action.name);
     // A removed Copilot app: shown as removed, or as installed again with a note.
     let family = "Microsoft.Copilot_8wekyb3d8bbwe";
     assert!(journal
@@ -596,14 +672,26 @@ fn scan_marks_journaled_items_revertible() {
             "{} revertible",
             item.id
         );
-        // Tweaks with a requirement may carry its note (not on this PC, GPU scheduling state).
-        if catalog::tweak(&item.id)
-            .expect("catalog tweak")
-            .requires
-            .is_none()
-        {
-            assert_eq!(item.note, None, "{}", item.id);
+        // Tweaks not offered here carry the reason, and tweaks with a requirement may carry its
+        // note (GPU scheduling state); the recorded tweak has the drift note when its value
+        // no longer holds.
+        let requires = catalog::tweak(&item.id).expect("catalog tweak").requires;
+        if requires.is_none() && item.unavailable.is_none() {
+            assert_eq!(item.note, drift_note(&item.drift), "{}", item.id);
         }
+    }
+    // The record says the value was 1 before Cairn set it: the drift says so whatever this PC
+    // holds now.
+    let extensions = report.item("interface.file_extensions").expect("scanned");
+    let held = extensions.actions[0]
+        .held
+        .expect("the recorded target was read");
+    assert_eq!(extensions.drift.is_empty(), held);
+    for m in &extensions.drift {
+        assert_eq!(m.label, action.name);
+        assert_eq!(m.expected, "0x00000000 (0)");
+        assert_eq!(m.original.as_deref(), Some("0x00000001 (1)"));
+        assert_eq!(m.back_to_original, m.found == "0x00000001 (1)");
     }
     let copilot = report.item("appx.Microsoft.Copilot").expect("Copilot item");
     assert!(copilot.revertible);
@@ -651,35 +739,63 @@ fn scan_notes_recorded_tasks_that_are_enabled_again() {
         }
         let item = report.item(t.id).expect("task tweak");
         assert!(item.revertible, "{}", t.id);
-        // The expected note follows the scanned states, so the test holds whichever tasks
-        // are enabled on this PC.
-        let enabled_again = t
+        seen += 1;
+        if item.unavailable == Some(Unavailable::Retired) {
+            assert!(
+                item.drift.is_empty(),
+                "{}: a retired row lists no drift",
+                t.id
+            );
+            continue;
+        }
+        // The drift follows the scanned states, so the test holds whichever tasks are enabled
+        // on this PC: every recorded task enabled again is listed, back at its recorded flag.
+        let enabled_again: Vec<&str> = t
             .actions
             .iter()
             .zip(&item.actions)
-            .filter(|(a, status)| is_task(a) && status.state == ActionState::NotApplied)
-            .count();
-        let expected = match enabled_again {
-            0 => None,
-            1 => Some(
-                "1 scheduled task this tool turned off was turned back on; apply again to \
-                 turn it off."
-                    .to_string(),
-            ),
-            n => Some(format!(
-                "{n} scheduled tasks this tool turned off were turned back on; apply again \
-                 to turn them off."
-            )),
-        };
-        assert_eq!(item.note, expected, "{}", t.id);
+            .filter_map(|(a, status)| match a {
+                catalog::Action::ScheduledTask(task) if status.state == ActionState::NotApplied => {
+                    Some(task.path)
+                }
+                _ => None,
+            })
+            .collect();
+        let drifted: Vec<&str> = item.drift.iter().map(|m| m.target.as_str()).collect();
+        let targets: Vec<String> = enabled_again
+            .iter()
+            .map(|path| format!("scheduled task {path}"))
+            .collect();
+        assert_eq!(drifted, targets, "{}", t.id);
+        for (m, path) in item.drift.iter().zip(&enabled_again) {
+            let name = path.rsplit('\\').next().expect("a task name");
+            assert_eq!(m.label, format!("task {name}"));
+            assert_eq!(
+                (m.expected.as_str(), m.found.as_str()),
+                ("disabled", "enabled")
+            );
+            assert_eq!(m.original.as_deref(), Some("enabled"));
+            assert!(m.back_to_original, "{}: {m:?}", t.id);
+        }
+        assert_eq!(item.note, drift_note(&item.drift), "{}", t.id);
+        // Every recorded task that could be read has `held` from that same read; a task that
+        // no longer exists is not checked and so holds.
+        for status in &item.actions {
+            match status.held {
+                Some(held) => assert_eq!(held, status.state != ActionState::NotApplied, "{}", t.id),
+                None => assert_eq!(status.state, ActionState::Unavailable, "{}", t.id),
+            }
+        }
         println!("{}: {:?}", t.id, item.note);
-        seen += 1;
     }
     assert_eq!(seen, 4);
     for item in report.items.iter().filter(|i| i.kind == ItemKind::Tweak) {
         let tweak = catalog::tweak(&item.id).expect("catalog tweak");
-        // Tweaks with a requirement may carry its note instead.
-        if !tweak.actions.iter().any(is_task) && tweak.requires.is_none() {
+        // Tweaks not offered here, or with a requirement, may carry their note instead.
+        if !tweak.actions.iter().any(is_task)
+            && tweak.requires.is_none()
+            && item.unavailable.is_none()
+        {
             assert_eq!(item.note, None, "{} has no scheduled tasks", item.id);
         }
     }
@@ -688,4 +804,97 @@ fn scan_notes_recorded_tasks_that_are_enabled_again() {
         sessions,
         "scan is read-only"
     );
+}
+
+#[test]
+fn real_scan_without_records_has_no_held_flags() {
+    let (_dir, journal) = temp_journal();
+    let engine = Engine::new(journal.clone());
+    let report = engine.scan().expect("scan");
+    for item in &report.items {
+        assert!(item.actions.iter().all(|a| a.held.is_none()), "{}", item.id);
+        assert!(item.drift.is_empty(), "{}", item.id);
+        if let Some(note) = &item.note {
+            assert!(!note.starts_with("Changed"), "{}: {note}", item.id);
+        }
+    }
+
+    // Nothing recorded: nothing to read, and nothing that no longer holds.
+    let drift = engine.drift().expect("drift");
+    assert!(drift.entries.is_empty() && drift.warnings.is_empty());
+    assert_eq!((drift.checked, drift.unchecked), (0, 0));
+    let ids: Vec<String> = TWEAKS.iter().map(|t| t.id.to_string()).collect();
+    let verify = engine.verify(&ids).expect("verify");
+    assert!(verify.entries.is_empty());
+    assert_eq!(verify.checked, 0);
+    assert_eq!(journal.summary().unwrap().sessions, 0);
+}
+
+#[test]
+fn real_drift_check_reads_a_recorded_catalog_target() {
+    let (_dir, journal) = temp_journal();
+    // A record for one catalog target, written into the temporary journal only: the checks
+    // below read the PC and change nothing on it.
+    let t = catalog::tweak("interface.file_extensions").expect("tweak");
+    let catalog::Action::Registry(action) = t.actions[0] else {
+        panic!("file_extensions writes a registry value")
+    };
+    let session = journal.begin_session("drift-selftest", "test").unwrap();
+    assert!(journal
+        .record_registry(
+            session,
+            &NewRegistryRecord {
+                hive: action.hive,
+                key_path: action.path.to_string(),
+                value_name: action.name.to_string(),
+                key_existed: true,
+                value_existed: true,
+                original: Some(RegValue::Dword(1).to_raw()),
+                created_root: None,
+            },
+        )
+        .unwrap());
+    log_write(&journal, session, action.hive, action.path, action.name);
+    journal.end_session(session).unwrap();
+    let before = read_value(action.hive, action.path, action.name).unwrap();
+    let holds = before == Some(RegValue::Dword(0));
+    let engine = Engine::new(journal.clone());
+
+    let report = engine.drift().expect("drift");
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert_eq!((report.checked, report.unchecked), (1, 0));
+    assert_eq!(report.entries.is_empty(), holds, "{:?}", report.entries);
+    for entry in &report.entries {
+        assert_eq!(entry.item.as_deref(), Some("interface.file_extensions"));
+        assert_eq!(entry.kind, DriftKind::Registry);
+        assert_eq!(entry.mismatch.label, "HideFileExt");
+        assert_eq!(entry.mismatch.expected, "0x00000000 (0)");
+        assert_eq!(entry.mismatch.original.as_deref(), Some("0x00000001 (1)"));
+        assert_eq!(entry.filter.registry, vec![registry::target(&action)]);
+    }
+    let only = engine
+        .verify(&["interface.file_extensions".to_string()])
+        .expect("verify");
+    assert_eq!(only.entries.len(), report.entries.len());
+    let other = engine
+        .verify(&["privacy.error_reporting".to_string()])
+        .expect("verify");
+    assert!(other.entries.is_empty());
+    assert_eq!(other.checked, 0);
+
+    // Keep as is changes only the journal: a target that still holds is refused, and one that
+    // changed is no longer tracked; the PC keeps its value either way.
+    let filter = RollbackFilter {
+        registry: vec![registry::target(&action)],
+        ..Default::default()
+    };
+    let kept = engine.forget(&filter).expect("forget");
+    assert_eq!(kept.refused.len(), usize::from(holds), "{:?}", kept.refused);
+    assert_eq!(kept.forgotten.len(), usize::from(!holds));
+    assert_eq!(
+        read_value(action.hive, action.path, action.name).unwrap(),
+        before
+    );
+    assert_eq!(journal.summary().unwrap().registry_active, i64::from(holds));
+    assert_eq!(journal.summary().unwrap().sessions, 1);
 }

@@ -179,6 +179,13 @@ pub fn dns_drift(rec: &DnsRecord) -> Result<Option<String>> {
     dns::drift_with(&IpHelper, rec)
 }
 
+/// Read-only. The DNS servers now set for the record's interface and family, as a server
+/// list in the journal's form (`""` when they are obtained automatically), or `None` when
+/// the adapter no longer exists (it is not listed: removed, or disabled).
+pub fn dns_now(rec: &DnsRecord) -> Result<Option<String>> {
+    dns::now_with(&IpHelper, rec)
+}
+
 /// Clears the DNS resolver cache. Nothing is logged; callers log.
 pub fn flush_resolver_cache() -> Result<()> {
     IpHelper.flush_resolver_cache()

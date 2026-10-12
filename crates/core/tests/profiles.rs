@@ -5,6 +5,9 @@
 
 use std::sync::Arc;
 
+use optimizer_core::debloat::requirements::Unavailable;
+use optimizer_core::debloat::Engine;
+use optimizer_core::profiles::step::{StepReason, StepStatus};
 use optimizer_core::profiles::{self, Section};
 use optimizer_core::safety::state_log::Journal;
 
@@ -31,6 +34,41 @@ fn starter_plan_is_read_only() {
         );
     }
     assert_eq!(plan.changes + plan.already + plan.skipped, plan.rows.len());
+    assert!(journal.sessions().unwrap().is_empty());
+    assert!(journal.ops(10).unwrap().is_empty());
+}
+
+#[test]
+fn starter_rows_skip_what_the_scan_does_not_offer() {
+    let (_dir, journal) = temp_journal();
+    let scan = Engine::new(journal.clone()).scan().unwrap();
+    for summary in profiles::starters() {
+        let starter = profiles::parse(&summary.text).unwrap();
+        let plan = profiles::plan(journal.clone(), &starter).unwrap();
+        for row in plan.rows.iter().filter(|r| r.section == Section::Tweaks) {
+            let id = row.key.trim_start_matches("tweak:");
+            let item = scan
+                .item(id)
+                .unwrap_or_else(|| panic!("{id} of {} is not scanned", starter.name));
+            let reason = item.unavailable.map(|kind| match kind {
+                Unavailable::NotOnThisPc => StepReason::NotOnThisPc,
+                Unavailable::WindowsVersion => StepReason::WindowsVersion,
+                Unavailable::Edition => StepReason::Edition,
+                Unavailable::Retired => StepReason::Retired,
+            });
+            if let Some(reason) = reason {
+                assert_eq!(row.status, StepStatus::Skipped, "{}", row.key);
+                assert_eq!(row.reason, Some(reason), "{}", row.key);
+                assert_eq!(row.detail, item.note.clone().unwrap_or_default());
+            }
+            assert_ne!(
+                row.reason,
+                Some(StepReason::Retired),
+                "{} holds a retired tweak",
+                starter.name
+            );
+        }
+    }
     assert!(journal.sessions().unwrap().is_empty());
     assert!(journal.ops(10).unwrap().is_empty());
 }

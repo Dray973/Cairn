@@ -912,6 +912,7 @@ fn result(outcome: ProfileOutcome, details: Vec<String>) -> StepResult {
         key: PROFILE_KEY.to_string(),
         outcome,
         details,
+        not_kept: Vec::new(),
     }
 }
 

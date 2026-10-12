@@ -24,7 +24,6 @@
   // C++ / CMake
   "cmake.sourceDirectory": "${workspaceFolder}",
   "cmake.buildDirectory": "${workspaceFolder}/build/cpp",
-  "cmake.generator": "Visual Studio 17 2022",
   "cmake.configureOnOpen": false,
   "C_Cpp.default.cppStandard": "c++20",
   "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",

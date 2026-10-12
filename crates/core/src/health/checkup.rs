@@ -1,5 +1,5 @@
 //! The security checkup: check types, the score, and the run that reads every source under
-//! one deadline and evaluates the 24 checks.
+//! one deadline and evaluates the 25 checks.
 
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::probe::{CheckupRaw, Context, Probe};
 use super::updates::{UpdateScanView, UpdateScanner};
-use super::{accounts, apps, device, network, protection, updates};
+use super::{accounts, apps, certificates, device, network, protection, updates};
 use crate::win::deadline;
 
 /// Shared deadline of the checkup's source reads.
@@ -51,6 +51,40 @@ pub fn allowed_uri(uri: &str) -> bool {
     lower.starts_with("ms-settings:") && lower.len() > "ms-settings:".len()
 }
 
+/// Microsoft's overview of the Secure Boot certificate update (KB5062710).
+pub(crate) const SECURE_BOOT_GUIDANCE: &str = "https://aka.ms/getsecureboot";
+/// "If you're prevented from updating Secure Boot certificates" (KB5105943).
+pub(crate) const SECURE_BOOT_PREVENTED: &str =
+    "https://support.microsoft.com/topic/e01cc486-8721-457f-9bc7-5cb801c1759e";
+/// Microsoft's list of the manufacturers' Secure Boot pages (KB5067177).
+pub(crate) const SECURE_BOOT_MANUFACTURERS: &str =
+    "https://support.microsoft.com/topic/9ecc3ba4-fb50-4bd3-9e9b-f16b35b8fb68";
+/// The Secure Boot troubleshooting guide (KB5085046).
+pub(crate) const SECURE_BOOT_TROUBLESHOOTING: &str =
+    "https://support.microsoft.com/topic/5d1bf6b4-7972-455a-a421-0184f1e1ed7d";
+/// The Secure Boot DB and DBX variable update events and what to do about each (KB5016061).
+pub(crate) const SECURE_BOOT_EVENTS: &str =
+    "https://support.microsoft.com/topic/37e47cf8-608b-4a87-8175-bdead630eb69";
+/// Where a Microsoft account keeps the recovery key of device encryption.
+pub(crate) const RECOVERY_KEY: &str = "https://aka.ms/myrecoverykey";
+
+/// Microsoft web pages a fix may open in the web browser: exact strings, language-neutral
+/// (aka.ms short links and `support.microsoft.com/topic/<id>`).
+pub const MICROSOFT_LINKS: [&str; 6] = [
+    SECURE_BOOT_GUIDANCE,
+    SECURE_BOOT_PREVENTED,
+    SECURE_BOOT_MANUFACTURERS,
+    SECURE_BOOT_TROUBLESHOOTING,
+    SECURE_BOOT_EVENTS,
+    RECOVERY_KEY,
+];
+
+/// Whether a fix may open the web page `url`: exactly one of [`MICROSOFT_LINKS`], never a
+/// prefix or a variant of one.
+pub fn allowed_link(url: &str) -> bool {
+    MICROSOFT_LINKS.contains(&url)
+}
+
 // ───────────────────────────── Types ─────────────────────────────
 
 /// One check of the checkup, in display order.
@@ -71,6 +105,7 @@ pub enum CheckId {
     UpdateRestart,
     Encryption,
     SecureBoot,
+    SecureBootCertificates,
     Tpm,
     MemoryIntegrity,
     Uac,
@@ -84,7 +119,7 @@ pub enum CheckId {
 }
 
 impl CheckId {
-    pub const ALL: [CheckId; 24] = [
+    pub const ALL: [CheckId; 25] = [
         CheckId::Antivirus,
         CheckId::RealtimeProtection,
         CheckId::SecurityIntelligence,
@@ -99,6 +134,7 @@ impl CheckId {
         CheckId::UpdateRestart,
         CheckId::Encryption,
         CheckId::SecureBoot,
+        CheckId::SecureBootCertificates,
         CheckId::Tpm,
         CheckId::MemoryIntegrity,
         CheckId::Uac,
@@ -118,7 +154,9 @@ impl CheckId {
             | ThreatActions => CheckGroup::Protection,
             Firewall | RemoteDesktop | RemoteAssistance | Smb1 => CheckGroup::Network,
             WindowsUpdate | PendingUpdates | UpdateRestart => CheckGroup::Updates,
-            Encryption | SecureBoot | Tpm | MemoryIntegrity => CheckGroup::Device,
+            Encryption | SecureBoot | SecureBootCertificates | Tpm | MemoryIntegrity => {
+                CheckGroup::Device
+            }
             Uac | AdminAccount | BuiltinAccounts | AutoSignIn => CheckGroup::Accounts,
             Smartscreen | EdgeSmartscreen | SmartAppControl | FileExtensions => CheckGroup::Apps,
         }
@@ -142,6 +180,7 @@ impl CheckId {
             UpdateRestart => "Restart for updates",
             Encryption => "Drive encryption",
             SecureBoot => "Secure Boot",
+            SecureBootCertificates => "Secure Boot certificates",
             Tpm => "TPM",
             MemoryIntegrity => "Memory integrity",
             Uac => "User Account Control",
@@ -165,9 +204,12 @@ impl CheckId {
             | Encryption | SecureBoot | BuiltinAccounts | AutoSignIn | Smartscreen => {
                 Severity::High
             }
-            TamperProtection | UpdateRestart | Tpm | MemoryIntegrity | EdgeSmartscreen => {
-                Severity::Medium
-            }
+            TamperProtection
+            | UpdateRestart
+            | SecureBootCertificates
+            | Tpm
+            | MemoryIntegrity
+            | EdgeSmartscreen => Severity::Medium,
             RemoteAssistance | AdminAccount | FileExtensions => Severity::Low,
             SmartAppControl => Severity::Info,
         }
@@ -270,6 +312,8 @@ pub enum FixAction {
     UpdateScan { online: bool },
     /// Restarts Cairn as administrator.
     Elevate,
+    /// Opens one of [`MICROSOFT_LINKS`] in the web browser.
+    Link { url: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -336,10 +380,11 @@ pub enum Source {
     Accounts,
     Remote,
     Apps,
+    SecureBootCertificates,
 }
 
 impl Source {
-    pub const ALL: [Source; 10] = [
+    pub const ALL: [Source; 11] = [
         Source::Os,
         Source::Device,
         Source::SecurityCenter,
@@ -350,6 +395,7 @@ impl Source {
         Source::Accounts,
         Source::Remote,
         Source::Apps,
+        Source::SecureBootCertificates,
     ];
 
     pub fn title(self) -> &'static str {
@@ -364,6 +410,7 @@ impl Source {
             Source::Accounts => "Account settings",
             Source::Remote => "Remote access settings",
             Source::Apps => "App and browser settings",
+            Source::SecureBootCertificates => "Secure Boot certificates",
         }
     }
 
@@ -379,6 +426,7 @@ impl Source {
             Source::Accounts => "health-accounts",
             Source::Remote => "health-remote",
             Source::Apps => "health-apps",
+            Source::SecureBootCertificates => "health-secure-boot-certificates",
         }
     }
 }
@@ -522,6 +570,13 @@ impl Check {
         self.fix(label, FixAction::Uri { uri: uri.into() })
     }
 
+    /// A fix that opens the Microsoft page `url`, one of [`MICROSOFT_LINKS`], in the web
+    /// browser.
+    pub(crate) fn link(self, label: &str, url: &str) -> Check {
+        debug_assert!(allowed_link(url), "{url} is not an allowed link");
+        self.fix(label, FixAction::Link { url: url.into() })
+    }
+
     /// A fix that opens the Windows tool `tool`; whether it needs administrator rights comes
     /// from the tool list.
     pub(crate) fn tool(self, label: &str, tool: &str) -> Check {
@@ -612,6 +667,7 @@ pub(crate) fn evaluate(
         updates::update_restart(raw),
         device::encryption(raw, ctx, home),
         device::secure_boot(raw),
+        certificates::secure_boot_certificates(raw, ctx, now),
         device::tpm(raw),
         device::memory_integrity(raw),
         accounts::uac(raw),
@@ -656,6 +712,7 @@ enum Reading {
     Accounts(Result<accounts::AccountsRaw, String>),
     Remote(Result<network::RemoteRaw, String>),
     Apps(Result<apps::AppsRaw, String>),
+    SecureBootCertificates(Result<certificates::CertificatesRaw, String>),
 }
 
 /// Runs `read` in the calling thread's COM apartment without critical-error dialogs; an
@@ -724,6 +781,9 @@ pub(crate) fn checkup_with(
             Source::Accounts => Reading::Accounts(read_source(|| probe.accounts(&ctx))),
             Source::Remote => Reading::Remote(read_source(|| probe.remote())),
             Source::Apps => Reading::Apps(read_source(|| probe.apps(&ctx.hive))),
+            Source::SecureBootCertificates => Reading::SecureBootCertificates(read_source(|| {
+                probe.secure_boot_certificates(ctx.elevated)
+            })),
         });
         jobs.push((source.thread_name(), work));
     }
@@ -740,6 +800,7 @@ pub(crate) fn checkup_with(
         accounts: late(Source::Accounts, deadline),
         remote: late(Source::Remote, deadline),
         apps: late(Source::Apps, deadline),
+        certificates: late(Source::SecureBootCertificates, deadline),
     };
     for reading in results.into_iter().flatten() {
         match reading {
@@ -753,6 +814,7 @@ pub(crate) fn checkup_with(
             Reading::Accounts(r) => raw.accounts = r,
             Reading::Remote(r) => raw.remote = r,
             Reading::Apps(r) => raw.apps = r,
+            Reading::SecureBootCertificates(r) => raw.certificates = r,
         }
     }
 
@@ -788,6 +850,7 @@ mod tests {
 
     use serde_json::Value;
 
+    use super::super::certificates::UpdateStatus;
     use super::super::probe::fixtures::{self, now};
     use super::super::probe::{OsRaw, UserHive};
     use super::super::updates::{PendingUpdate, ScanState, UpdateAgent};
@@ -851,7 +914,7 @@ mod tests {
     #[test]
     fn every_check_id_is_listed_once_and_every_group_is_used() {
         let ids: HashSet<CheckId> = CheckId::ALL.into_iter().collect();
-        assert_eq!(ids.len(), 24);
+        assert_eq!(ids.len(), 25);
         let groups: HashSet<CheckGroup> = CheckId::ALL.into_iter().map(CheckId::group).collect();
         assert_eq!(groups.len(), 6);
         for id in CheckId::ALL {
@@ -860,7 +923,26 @@ mod tests {
         }
         assert_eq!(CheckId::SmartAppControl.max_severity(), Severity::Info);
         let sources: HashSet<Source> = Source::ALL.into_iter().collect();
-        assert_eq!(sources.len(), 10);
+        assert_eq!(sources.len(), 11);
+        // The certificate check sits right after Secure Boot in the Device group.
+        let at = CheckId::ALL
+            .iter()
+            .position(|id| *id == CheckId::SecureBootCertificates)
+            .unwrap();
+        assert_eq!(CheckId::ALL[at - 1], CheckId::SecureBoot);
+        assert_eq!(at, 14);
+        let certificates = CheckId::SecureBootCertificates;
+        assert_eq!(certificates.group(), CheckGroup::Device);
+        assert_eq!(certificates.title(), "Secure Boot certificates");
+        assert_eq!(certificates.max_severity(), Severity::Medium);
+        assert!(!certificates.per_user());
+        assert_eq!(Source::ALL.last(), Some(&Source::SecureBootCertificates));
+        assert_eq!(
+            Source::SecureBootCertificates.title(),
+            "Secure Boot certificates"
+        );
+        let threads: HashSet<&str> = Source::ALL.into_iter().map(Source::thread_name).collect();
+        assert_eq!(threads.len(), Source::ALL.len());
     }
 
     #[test]
@@ -889,7 +971,7 @@ mod tests {
             (score.value, score.grade, score.to_fix),
             (100, Grade::Good, 0)
         );
-        assert_eq!(score.checked, 24);
+        assert_eq!(score.checked, 25);
         assert!(notes(&fixtures::raw(), &fixtures::ctx())
             .contains(&"Drive encryption can only be checked with administrator rights.".into()));
     }
@@ -922,6 +1004,32 @@ mod tests {
             "shell:startup",
         ] {
             assert!(!allowed_uri(uri), "{uri}");
+        }
+    }
+
+    #[test]
+    fn allowed_links_are_exact() {
+        for url in MICROSOFT_LINKS {
+            assert!(allowed_link(url), "{url}");
+            assert!(url.starts_with("https://"), "{url}");
+            // A link is never a settings page, and a settings page is never a link.
+            assert!(!allowed_uri(url), "{url}");
+        }
+        let unique: HashSet<&str> = MICROSOFT_LINKS.into_iter().collect();
+        assert_eq!(unique.len(), MICROSOFT_LINKS.len());
+        for url in [
+            "https://aka.ms/getsecureboot/",
+            "http://aka.ms/getsecureboot",
+            "https://aka.ms/getsecureboot?x=1",
+            "HTTPS://AKA.MS/GETSECUREBOOT",
+            " https://aka.ms/getsecureboot",
+            "https://support.microsoft.com/topic/00000000-0000-0000-0000-000000000000",
+            "https://support.microsoft.com/en-us/topic/5d1bf6b4-7972-455a-a421-0184f1e1ed7d",
+            "https://github.com/Dray973/Cairn",
+            "ms-settings:windowsupdate",
+            "",
+        ] {
+            assert!(!allowed_link(url), "{url}");
         }
     }
 
@@ -960,6 +1068,12 @@ mod tests {
             volumes[0].protection = Some(0);
             volumes[0].conversion = Some(0);
         }
+        fixtures::with_certificates(&mut bad, |c| {
+            if let Ok(servicing) = &mut c.servicing {
+                servicing.status = Some(UpdateStatus::NotStarted);
+            }
+            c.events = Ok(vec![fixtures::event(1801, 1)]);
+        });
         let mut pro = bad.clone();
         pro.os = fixtures::raw().os;
         if let Ok(remote) = &mut pro.remote {
@@ -983,6 +1097,7 @@ mod tests {
         failed.accounts = Err("x".into());
         failed.remote = Err("x".into());
         failed.apps = Err("x".into());
+        failed.certificates = Err("x".into());
         let mut not_elevated = fixtures::raw();
         not_elevated.encryption = Ok(super::super::device::EncryptionRaw::NotElevated);
         vec![fixtures::raw(), bad, pro, failed, not_elevated]
@@ -991,6 +1106,8 @@ mod tests {
     #[test]
     fn every_fix_uri_is_allowed() {
         let mut seen = BTreeSet::new();
+        let mut links = BTreeSet::new();
+        let mut tweaks = BTreeSet::new();
         for raw in troubled() {
             for check in evaluate(&raw, &fixtures::ctx(), &fixtures::scan_done(), now()) {
                 assert!(!check.summary.is_empty(), "{:?}", check.id);
@@ -1000,6 +1117,10 @@ mod tests {
                             assert!(allowed_uri(uri), "{:?}: {uri}", check.id);
                             seen.insert(uri.clone());
                         }
+                        FixAction::Link { url } => {
+                            assert!(allowed_link(url), "{:?}: {url}", check.id);
+                            links.insert(url.clone());
+                        }
                         FixAction::WindowsTool { tool, .. } => {
                             assert!(
                                 crate::tools::windows_tools::windows_tool(tool).is_some(),
@@ -1008,6 +1129,7 @@ mod tests {
                         }
                         FixAction::Tweak { id } => {
                             assert!(crate::debloat::catalog::tweak(id).is_some(), "{id}");
+                            tweaks.insert(id.clone());
                         }
                         FixAction::UpdateScan { .. } | FixAction::Elevate => {}
                     }
@@ -1017,6 +1139,11 @@ mod tests {
         assert!(seen.len() >= 15, "{seen:?}");
         assert!(seen.contains(BITLOCKER_URI));
         assert!(seen.contains("ms-settings:deviceencryption"));
+        assert!(links.contains(SECURE_BOOT_GUIDANCE), "{links:?}");
+        assert!(
+            tweaks.contains(crate::debloat::catalog::REMOTE_ASSISTANCE_TWEAK),
+            "{tweaks:?}"
+        );
     }
 
     #[test]
@@ -1121,8 +1248,11 @@ mod tests {
         assert_eq!(json["checks"][0]["group"], "protection");
         assert_eq!(json["checks"][0]["state"], "good");
         assert_eq!(json["checks"][0]["severity"], "critical");
-        assert_eq!(json["checks"][21]["id"], "edge_smartscreen");
-        assert_eq!(json["checks"][21]["per_user"], true);
+        assert_eq!(json["checks"][14]["id"], "secure_boot_certificates");
+        assert_eq!(json["checks"][14]["group"], "device");
+        assert_eq!(json["checks"][14]["title"], "Secure Boot certificates");
+        assert_eq!(json["checks"][22]["id"], "edge_smartscreen");
+        assert_eq!(json["checks"][22]["per_user"], true);
         assert_eq!(
             keys(&json["checks"][0]["facts"][0]),
             set(&["label", "value"])
@@ -1173,6 +1303,13 @@ mod tests {
                 "update_scan",
             ),
             (FixAction::Elevate, vec!["kind"], "elevate"),
+            (
+                FixAction::Link {
+                    url: SECURE_BOOT_GUIDANCE.into(),
+                },
+                vec!["kind", "url"],
+                "link",
+            ),
         ];
         for (action, names, kind) in actions {
             let json = serde_json::to_value(&action).unwrap();
@@ -1265,6 +1402,13 @@ mod tests {
             assert_eq!(*hive, UserHive::Current);
             Ok(fixtures::apps())
         }
+        fn secure_boot_certificates(
+            &self,
+            elevated: bool,
+        ) -> crate::Result<certificates::CertificatesRaw> {
+            assert!(!elevated);
+            Ok(fixtures::certificates())
+        }
     }
 
     #[test]
@@ -1278,7 +1422,11 @@ mod tests {
             Duration::from_millis(300),
         );
         assert!(started.elapsed() < Duration::from_millis(1400));
-        assert_eq!(checkup.checks.len(), 24);
+        assert_eq!(checkup.checks.len(), 25);
+        assert_eq!(
+            checkup.checks[14].summary,
+            "The 2023 certificates are installed"
+        );
         let by_id = |id: CheckId| checkup.checks.iter().find(|c| c.id == id).unwrap();
         assert_eq!(by_id(CheckId::Firewall).state, CheckState::Unknown);
         assert_eq!(

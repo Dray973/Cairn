@@ -17,8 +17,8 @@ use crate::blocking;
 ///   `displays`, `displays_unavailable`, `board`, `disks`, `volumes`, `security`,
 ///   `errors`); a section that could not be read is None or empty and has an entry
 ///   `{"section", "message"}` in `errors`.
-/// - `summary`: one line such as "Windows 11 Home 25H2  ·  Intel Core Ultra 7 265F  ·
-///   32 GB RAM  ·  NVIDIA GeForce RTX 5060 Ti  ·  1.02 TB NVMe SSD".
+/// - `summary`: one line such as "Windows 11 Home 25H2  ·  Intel Core Ultra 5 245K  ·
+///   32 GB RAM  ·  NVIDIA GeForce RTX 4060 Ti  ·  1.02 TB NVMe SSD".
 /// - `sections`: in the order windows, processor, memory, graphics, displays, board,
 ///   storage, security; each is `{"id", "title", "error", "note", "rows", "groups"}` with
 ///   rows `{"label", "value", "level" ("normal" | "good" | "warning"), "note", "fraction",

@@ -79,7 +79,7 @@ const ONLINE_DEADLINE: Duration = Duration::from_secs(15 * 60);
 /// A search that finished longer ago than this is repeated when the checkup loads.
 const SCAN_FRESH_MINUTES: i64 = 30;
 
-const WINDOWS_UPDATE_PAGE: &str = "ms-settings:windowsupdate";
+pub(crate) const WINDOWS_UPDATE_PAGE: &str = "ms-settings:windowsupdate";
 
 /// Windows Update's configuration and records.
 #[derive(Debug, Clone, PartialEq)]
@@ -267,9 +267,12 @@ pub(crate) fn last_installed(status: &UpdateStatus) -> Option<&HistoryEntry> {
         .max_by_key(|e| e.date)
 }
 
-/// The latest pause end in the future; `Err` with the raw text when a value cannot be
+/// The latest pause end in the future, and the raw text of every value that cannot be
 /// parsed.
-fn paused_until(values: &[String], now: DateTime<Utc>) -> (Option<DateTime<Utc>>, Vec<String>) {
+pub(crate) fn paused_until(
+    values: &[String],
+    now: DateTime<Utc>,
+) -> (Option<DateTime<Utc>>, Vec<String>) {
     let mut latest: Option<DateTime<Utc>> = None;
     let mut unparsed = Vec::new();
     for value in values {

@@ -1,0 +1,30 @@
+# Weekly update pull requests, at most one open per ecosystem with all of its updates grouped:
+# the actions the workflows pin by commit (with the version in the comment), the Rust crates of
+# Cargo.lock and the pinned Python packages of the requirements files (the runtime pins with
+# their hashes).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 1
+    groups:
+      actions:
+        patterns: ['*']
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 1
+    groups:
+      cargo:
+        patterns: ['*']
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 1
+    groups:
+      pip:
+        patterns: ['*']

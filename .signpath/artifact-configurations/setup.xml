@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  SignPath artifact configuration "setup": the second signing round of a Cairn release.
+
+  release.yml uploads build\dist\Cairn-<version>-setup.exe (built by build_release.ps1
+  -PackageOnly around the signed files of the first round) as a GitHub artifact, which is a zip
+  file. SignPath keeps its own copy of this configuration; this file records it for review.
+
+  The setup must name the product Cairn and carry the release version, which the action passes
+  as the parameter "version". Inno Setup pads the strings of the setup: ProductName is "Cairn"
+  followed by spaces to 60 characters, ProductVersion the version followed by spaces to 50
+  characters. How SignPath compares product-name and product-version is not documented; the
+  first test-signing request decides whether the restriction must carry the padding. If it
+  must, the attributes become "Cairn" with 55 spaces and "${version}" with the spaces that make
+  50 characters; build_release.ps1 -FinalizeOnly writes the exact strings of each build into
+  build\dist\signpath-metadata.txt.
+
+  The parameter has no default, so a request without a version cannot be signed.
+-->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <parameters>
+    <parameter name="version" />
+  </parameters>
+  <zip-file>
+    <pe-file path="Cairn-${version}-setup.exe" product-name="Cairn" product-version="${version}">
+      <authenticode-sign description="Cairn Setup" description-url="https://github.com/Dray973/Cairn" />
+    </pe-file>
+  </zip-file>
+</artifact-configuration>

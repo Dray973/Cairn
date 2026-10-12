@@ -430,8 +430,8 @@ mod tests {
     #[test]
     fn name_whitespace_is_collapsed() {
         assert_eq!(
-            collapse_whitespace("  Intel(R) Core(TM) Ultra 7 265F      "),
-            "Intel(R) Core(TM) Ultra 7 265F"
+            collapse_whitespace("  Intel(R) Core(TM) Ultra 5 245K      "),
+            "Intel(R) Core(TM) Ultra 5 245K"
         );
         assert_eq!(
             collapse_whitespace("AMD Ryzen 9 7950X 16-Core Processor\t\t "),
@@ -443,8 +443,8 @@ mod tests {
     #[test]
     fn short_cpu_name_cases() {
         assert_eq!(
-            short_cpu_name("Intel(R) Core(TM) Ultra 7 265F"),
-            "Intel Core Ultra 7 265F"
+            short_cpu_name("Intel(R) Core(TM) Ultra 5 245K"),
+            "Intel Core Ultra 5 245K"
         );
         assert_eq!(
             short_cpu_name("Intel(R) Core(TM) i7-8700K CPU @ 3.70GHz"),

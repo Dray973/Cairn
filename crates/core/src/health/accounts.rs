@@ -1,5 +1,5 @@
 //! Accounts and sign-in: User Account Control, whether the signed-in user is an
-//! administrator, the built-in accounts and automatic sign-in; checks 17 to 20.
+//! administrator, the built-in accounts and automatic sign-in; checks 18 to 21.
 //!
 //! Account names are never shown for the signed-in user. The Winlogon `DefaultPassword`
 //! value is only checked for existence through `Key::value_info`; its data is never read.
@@ -83,7 +83,7 @@ fn accounts_raw<'a>(
 
 const UAC_DETAIL: &str = "User Account Control asks before apps get administrator rights.";
 
-/// Check 17: User Account Control.
+/// Check 18: User Account Control.
 pub(crate) fn uac(raw: &CheckupRaw) -> Check {
     let a = match accounts_raw(raw, CheckId::Uac, UAC_DETAIL) {
         Ok(a) => a,
@@ -158,7 +158,7 @@ const ADMIN_DETAIL: &str = "Apps you run can ask for full control of the PC with
     Everyday use with a standard account, and a separate administrator account for changes, \
     stops that.";
 
-/// Check 18: the signed-in user's account type.
+/// Check 19: the signed-in user's account type.
 pub(crate) fn admin_account(raw: &CheckupRaw, ctx: &Context) -> Check {
     let a = match accounts_raw(raw, CheckId::AdminAccount, ADMIN_DETAIL) {
         Ok(a) => a,
@@ -189,7 +189,7 @@ const BUILTIN_DETAIL: &str =
 /// Applies only while the built-in Administrator runs without Admin Approval Mode.
 const UNPROMPTED_DETAIL: &str = "It runs everything with full rights and never shows UAC prompts.";
 
-/// Check 19: the built-in Administrator and Guest accounts are disabled.
+/// Check 20: the built-in Administrator and Guest accounts are disabled.
 pub(crate) fn builtin_accounts(raw: &CheckupRaw) -> Check {
     let a = match accounts_raw(raw, CheckId::BuiltinAccounts, BUILTIN_DETAIL) {
         Ok(a) => a,
@@ -244,7 +244,7 @@ const AUTO_SIGN_IN_NOTE: &str = "Tick “Users must enter a user name and passwo
     computer”. If the box is missing, first turn off “For improved security, only allow \
     Windows Hello sign-in” in Sign-in options.";
 
-/// Check 20: automatic sign-in.
+/// Check 21: automatic sign-in.
 pub(crate) fn auto_sign_in(raw: &CheckupRaw) -> Check {
     const DETAIL: &str = "Automatic sign-in signs a user in without a password when the PC starts.";
     let a = match accounts_raw(raw, CheckId::AutoSignIn, DETAIL) {

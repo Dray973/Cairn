@@ -9,12 +9,16 @@
 //! - [`engine`]           scan, apply and revert across all of the above
 //! - [`live`]             settings pushed to the running session after their values change
 //! - [`requirements`]     whether this PC has what a tweak needs (Office, Edge, GPU scheduling)
+//!   and which Windows builds and editions use its settings
+//! - `verify`             reading a catalog target back after it was written
+//! - [`drift`]            recorded targets that no longer hold what Cairn set, and Keep as is
 //!
 //! Every mutation goes through [`crate::safety::Safety`], which journals the original
 //! state first, so any change made here can be reverted item by item or all at once.
 
 pub mod appx;
 pub mod catalog;
+pub mod drift;
 pub mod engine;
 pub mod live;
 pub mod power;
@@ -22,10 +26,13 @@ pub mod registry;
 pub mod requirements;
 pub mod scheduled_tasks;
 pub mod services;
+pub(crate) mod verify;
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::safety::verify::Mismatch;
 pub use catalog::{Category, RestartNeed, Risk};
+pub use drift::{DriftEntry, DriftKind, DriftReport, ForgetReport};
 pub use engine::{
     catalog_view, ApplyOptions, ApplyReport, CatalogEntry, Engine, ItemKind, ItemOutcome,
     ItemResult, ItemState, ScanItem, ScanReport,
@@ -47,6 +54,10 @@ pub enum ActionState {
 pub struct ActionStatus {
     pub state: ActionState,
     pub detail: String,
+    /// Set for a target with an active journal record: whether it still holds what the
+    /// action sets (`Some(false)` is drift). `None` without a record.
+    #[serde(default)]
+    pub held: Option<bool>,
 }
 
 impl ActionStatus {
@@ -54,6 +65,7 @@ impl ActionStatus {
         Self {
             state,
             detail: detail.into(),
+            held: None,
         }
     }
 }

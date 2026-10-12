@@ -30,17 +30,14 @@ const STARTERS: &[Starter] = &[
     Starter {
         id: "gaming",
         name: "Gaming",
-        description: "Game Mode on, background recording off, games first in multimedia \
-                      scheduling, raw mouse input, no accessibility-shortcut prompts, and less \
-                      background work from Edge and update sharing.",
+        description: "Game Mode on, background recording off, raw mouse input, no \
+                      accessibility-shortcut prompts, and less background work from Edge and \
+                      update sharing.",
         tweaks: &[
             "gaming.background_recording",
             "gaming.game_mode",
-            "gaming.multimedia_scheduling",
             "gaming.mouse_acceleration",
             "gaming.sticky_keys",
-            "gaming.network_throttling",
-            "performance.startup_delay",
             "performance.edge_background",
             "performance.delivery_optimization",
             "performance.menu_delay",
@@ -50,30 +47,25 @@ const STARTERS: &[Starter] = &[
     Starter {
         id: "privacy",
         name: "Privacy",
-        description: "Limits diagnostic data and ads across Windows, Office and Edge, turns off \
-                      activity, typing and app-launch tracking, error reports and feedback \
-                      prompts, and removes Cortana, Feedback Hub and the Bing app.",
+        description: "Limits diagnostic data and ads across Windows and Edge, turns off \
+                      app-launch tracking, error reports, the feedback survey tasks, Start \
+                      suggestions, setup reminders and lock-screen notifications, and removes \
+                      Cortana, Feedback Hub and the Bing app.",
         tweaks: &[
             "privacy.diagnostic_data",
             "privacy.diagtrack_service",
-            "privacy.activity_history",
-            "privacy.cortana",
             "privacy.advertising_id",
             "privacy.tailored_experiences",
             "privacy.suggested_content",
-            "privacy.web_search",
-            "privacy.feedback_prompts",
             "privacy.feedback_tasks",
-            "privacy.recall",
             "privacy.app_launch_tracking",
-            "privacy.typing_data",
-            "privacy.online_speech",
             "privacy.error_reporting",
             "privacy.error_report_task",
-            "privacy.ceip",
             "privacy.ceip_tasks",
             "privacy.lock_screen_ads",
-            "privacy.office_telemetry",
+            "privacy.start_suggestions",
+            "privacy.setup_reminders",
+            "privacy.lock_screen_notifications",
             "privacy.edge_telemetry",
         ],
         apps: &[
@@ -86,12 +78,12 @@ const STARTERS: &[Starter] = &[
         id: "clean",
         name: "Clean",
         description: "Removes promoted games, streaming and rarely used preinstalled apps and \
-                      hides Widgets, the Task View button, suggested apps and lock screen ads. \
-                      The Store, Xbox, media and Office apps stay.",
+                      hides the Task View button, suggested apps, lock screen ads and sync app \
+                      notices in File Explorer. The Store, Xbox, media and Office apps stay.",
         tweaks: &[
-            "interface.widgets",
             "interface.task_view_button",
             "interface.search_icon",
+            "interface.explorer_sync_ads",
             "privacy.suggested_content",
             "privacy.lock_screen_ads",
         ],
@@ -193,7 +185,7 @@ mod tests {
             }
         }
         let privacy = starter("privacy").unwrap();
-        assert_eq!(privacy.tweaks.len(), 21);
+        assert_eq!(privacy.tweaks.len(), 15);
         let low_default_privacy: Vec<&str> = catalog::TWEAKS
             .iter()
             .filter(|t| {
@@ -201,18 +193,102 @@ mod tests {
                     && t.risk == Risk::Low
                     && t.default_on
                     && t.requires.is_none()
+                    && t.retired.is_none()
             })
             .map(|t| t.id)
             .collect();
-        assert_eq!(low_default_privacy.len(), 19);
+        assert_eq!(low_default_privacy.len(), 14);
         for id in low_default_privacy {
             assert!(privacy.tweaks.iter().any(|t| t == id), "{id}");
         }
-        assert!(privacy
+        // Tweaks whose effect no available PC could show are not recommended, so the starter
+        // leaves them out too.
+        for id in [
+            "privacy.feedback_prompts",
+            "privacy.typing_data",
+            "privacy.online_speech",
+        ] {
+            assert!(!privacy.tweaks.iter().any(|t| t == id), "{id}");
+        }
+        // Office policies are offered for business and enterprise Office only and are not
+        // recommended, so the starter leaves them out; Edge is on every PC.
+        assert!(!privacy
             .tweaks
             .iter()
             .any(|t| t == "privacy.office_telemetry"));
         assert!(privacy.tweaks.iter().any(|t| t == "privacy.edge_telemetry"));
+    }
+
+    #[test]
+    fn starters_hold_only_offered_recommended_tweaks() {
+        for summary in starters() {
+            for id in starter(summary.id).unwrap().tweaks {
+                let tweak = catalog::tweak(&id).unwrap();
+                assert!(tweak.retired.is_none(), "{}: {id} is retired", summary.id);
+                assert!(
+                    tweak.undo_limit.is_none(),
+                    "{}: {id} has an undo limit",
+                    summary.id
+                );
+            }
+        }
+        // Every tweak the Privacy starter applies is recommended; the Gaming and Clean
+        // starters also pick Low-risk tweaks that are not.
+        for id in starter("privacy").unwrap().tweaks {
+            assert!(catalog::tweak(&id).unwrap().default_on, "{id}");
+        }
+    }
+
+    #[test]
+    fn starter_descriptions_name_what_they_change() {
+        let privacy = starter("privacy").unwrap();
+        for group in [
+            "Start suggestions",
+            "setup reminders",
+            "lock-screen notifications",
+        ] {
+            assert!(privacy.description.contains(group), "{group}");
+        }
+        for id in [
+            "privacy.start_suggestions",
+            "privacy.setup_reminders",
+            "privacy.lock_screen_notifications",
+        ] {
+            assert!(privacy.tweaks.iter().any(|t| t == id), "{id}");
+        }
+        for retired in [
+            "privacy.cortana",
+            "privacy.activity_history",
+            "privacy.web_search",
+            "privacy.ceip",
+        ] {
+            assert!(!privacy.tweaks.iter().any(|t| t == retired), "{retired}");
+        }
+        assert!(!privacy.tweaks.iter().any(|t| t == "privacy.recall"));
+        for gone in ["search highlights", "Office"] {
+            assert!(!privacy.description.contains(gone), "{gone}");
+        }
+
+        let clean = starter("clean").unwrap();
+        assert!(clean
+            .tweaks
+            .iter()
+            .any(|t| t == "interface.explorer_sync_ads"));
+        assert!(clean
+            .description
+            .contains("sync app notices in File Explorer"));
+        assert!(!clean.description.contains("Widgets"));
+        assert_eq!(clean.tweaks.len(), 5);
+
+        let gaming = starter("gaming").unwrap();
+        assert!(!gaming.description.contains("multimedia scheduling"));
+        for retired in [
+            "gaming.multimedia_scheduling",
+            "gaming.network_throttling",
+            "performance.startup_delay",
+        ] {
+            assert!(!gaming.tweaks.iter().any(|t| t == retired), "{retired}");
+        }
     }
 
     #[test]
@@ -276,7 +352,7 @@ mod tests {
         assert_eq!(starter(" clean ").unwrap().name, "Clean");
         assert!(starter("work").is_none());
         let gaming = &starters()[0];
-        assert_eq!(gaming.counts.tweaks, 10);
+        assert_eq!(gaming.counts.tweaks, 7);
         assert_eq!(gaming.counts.apps, 0);
     }
 }

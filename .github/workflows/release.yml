@@ -1,0 +1,275 @@
+# Builds a release from a version tag (vX.Y.Z on main): the checks of ci.yml with the
+# verification records gate, then the stage, the setup and the release files from a clean
+# checkout (no caches), a build-provenance attestation and a draft release that the owner
+# publishes after checking it on the test PC.
+#
+# Signing stays off until the repository variable SIGNPATH_ORGANIZATION_ID is set. Then a tag
+# run signs with the SignPath Foundation certificate (policy release-signing, one approval per
+# request) and a manual run on main rehearses the same flow with the test certificate (policy
+# test-signing) and keeps the result as a workflow artifact instead of a release. Each signing
+# round uploads its files as an artifact that SignPath fetches from GitHub: first Cairn's own
+# programs and libraries with the uninstaller, then the setup built around them.
+#
+# A manual run on a tag with ui_ci_required turned off depends on the rust, msrv and telemetry
+# jobs only; its release notes then say that the UI tests ran locally.
+#
+# Only a tag run attests the setup, so only its release notes show `gh attestation verify`.
+# GitHub attests a release when it publishes it as immutable. Once the repository publishes
+# immutable releases, the repository variable IMMUTABLE_RELEASES set to true adds
+# `gh release verify` to the release notes.
+
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+    inputs:
+      ui_ci_required:
+        description: Wait for the UI tests on GitHub's runner (turn off only when scripts/pytest_serial.ps1 passed locally for this commit)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHONUTF8: '1'
+  CAIRN_RELEASE: '1'
+  CAIRN_REQUIRE_RESOURCES: '1'
+  OPTIMIZER_FORBID_RESTORE_POINT: '1'
+  OPTIMIZER_FORBID_DRIVE_TESTS: '1'
+  OPTIMIZER_FORBID_UPDATE_SEARCH: '1'
+  OPTIMIZER_FORBID_APP_INSTALLS: '1'
+
+jobs:
+  checks:
+    name: Checks
+    uses: ./.github/workflows/ci.yml
+    with:
+      release: true
+      skip_ui: ${{ github.event_name == 'workflow_dispatch' && !inputs.ui_ci_required }}
+
+  release:
+    name: Build, sign and draft the release
+    needs: checks
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 300
+    environment: ${{ github.ref_type == 'tag' && 'release' || 'signing-test' }}
+    permissions:
+      contents: write # the draft release
+      actions: read # SignPath fetches the uploaded artifacts
+      id-token: write # the build-provenance attestation
+      attestations: write # the build-provenance attestation
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      REF_TYPE: ${{ github.ref_type }}
+      REF_NAME: ${{ github.ref_name }}
+      SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+      SIGNPATH_TEST_THUMBPRINT: ${{ vars.SIGNPATH_TEST_THUMBPRINT }}
+      IMMUTABLE_RELEASES: ${{ vars.IMMUTABLE_RELEASES }}
+      UI_CI_REQUIRED: ${{ github.event_name != 'workflow_dispatch' || inputs.ui_ci_required }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Version and signing mode
+        run: |
+          $line = Select-String -Path Cargo.toml -Pattern '^version = "(\d+\.\d+\.\d+)"$' | Select-Object -First 1
+          if (-not $line) { throw 'Cargo.toml has no workspace version.' }
+          $version = $line.Matches[0].Groups[1].Value
+          if ($env:REF_TYPE -eq 'tag') {
+            if ($env:REF_NAME -ne "v$version") { throw "The tag $env:REF_NAME does not match the version $version." }
+            git merge-base --is-ancestor HEAD origin/main
+            if ($LASTEXITCODE -ne 0) { throw "The tag $env:REF_NAME is not on main." }
+          } elseif ($env:REF_NAME -ne 'main') {
+            throw 'A manual run builds a tag, or rehearses signing on main.'
+          }
+          $mode = 'none'
+          $policy = ''
+          if ($env:SIGNPATH_ORGANIZATION_ID) {
+            if ($env:REF_TYPE -eq 'tag') { $mode = 'release'; $policy = 'release-signing' }
+            else { $mode = 'test'; $policy = 'test-signing' }
+          }
+          if ($mode -eq 'test' -and $env:SIGNPATH_TEST_THUMBPRINT -notmatch '^[0-9A-Fa-f]{40}$') {
+            throw 'Test signing needs the repository variable SIGNPATH_TEST_THUMBPRINT: the 40 hex digits of the test certificate.'
+          }
+          "CAIRN_VERSION=$version" >> $env:GITHUB_ENV
+          "SIGNING_MODE=$mode" >> $env:GITHUB_ENV
+          "SIGNING_POLICY=$policy" >> $env:GITHUB_ENV
+          "Cairn $version, signing: $mode"
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        id: python
+        with:
+          python-version: '3.12.10'
+      - name: Rust toolchain of rust-toolchain.toml
+        run: rustup toolchain install
+      - name: Build information
+        run: |
+          $commands = @(
+            { rustc -vV },
+            { cargo -V },
+            { cmake --version },
+            { py --list },
+            { & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property catalog_productDisplayVersion },
+            { "Image $env:ImageOS $env:ImageVersion" },
+            { Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{ n = 'Free GB'; e = { [math]::Round($_.Free / 1GB, 1) } } -AutoSize | Out-String }
+          )
+          foreach ($command in $commands) { try { & $command } catch { Write-Warning $_ } }
+      - name: Inno Setup 6.7.3
+        run: .\.github\scripts\install_inno_setup.ps1
+
+      - name: Stage and collect the files to sign
+        shell: powershell
+        env:
+          BASE_PYTHON: ${{ steps.python.outputs.python-path }}
+        run: .\scripts\build_release.ps1 -SkipChecks -StageOnly -SigningDir build\sign -Python $env:BASE_PYTHON
+
+      - name: Upload the programs to sign
+        id: unsigned-binaries
+        if: env.SIGNING_MODE != 'none'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unsigned-binaries
+          path: build/sign/binaries/
+          retention-days: 1
+          if-no-files-found: error
+      - name: Sign the programs (SignPath)
+        if: env.SIGNING_MODE != 'none'
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3.0
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: cairn
+          signing-policy-slug: ${{ env.SIGNING_POLICY }}
+          artifact-configuration-slug: binaries
+          github-artifact-id: ${{ steps.unsigned-binaries.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 7200
+          output-artifact-directory: build/sign/signed
+          parameters: |
+            version: "${{ env.CAIRN_VERSION }}"
+
+      - name: Setup
+        shell: powershell
+        env:
+          BASE_PYTHON: ${{ steps.python.outputs.python-path }}
+        run: |
+          $arguments = @{ PackageOnly = $true; Python = $env:BASE_PYTHON }
+          if ($env:SIGNING_MODE -ne 'none') {
+            $arguments.SigningDir = 'build\sign'
+            $arguments.SignedDir = 'build\sign\signed'
+            $arguments.SigningMode = $env:SIGNING_MODE
+            if ($env:SIGNING_MODE -eq 'test') { $arguments.TestSignerThumbprint = $env:SIGNPATH_TEST_THUMBPRINT }
+          }
+          .\scripts\build_release.ps1 @arguments
+
+      - name: Upload the setup to sign
+        id: unsigned-setup
+        if: env.SIGNING_MODE != 'none'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unsigned-setup
+          path: build/dist/Cairn-${{ env.CAIRN_VERSION }}-setup.exe
+          retention-days: 1
+          if-no-files-found: error
+      - name: Sign the setup (SignPath)
+        if: env.SIGNING_MODE != 'none'
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3.0
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: cairn
+          signing-policy-slug: ${{ env.SIGNING_POLICY }}
+          artifact-configuration-slug: setup
+          github-artifact-id: ${{ steps.unsigned-setup.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 7200
+          output-artifact-directory: build/sign/signed-setup
+          parameters: |
+            version: "${{ env.CAIRN_VERSION }}"
+
+      - name: Release files
+        shell: powershell
+        run: |
+          $arguments = @{ FinalizeOnly = $true }
+          if ($env:SIGNING_MODE -ne 'none') {
+            $arguments.SignedSetup = "build\sign\signed-setup\Cairn-$env:CAIRN_VERSION-setup.exe"
+            $arguments.SigningMode = $env:SIGNING_MODE
+            if ($env:SIGNING_MODE -eq 'test') { $arguments.TestSignerThumbprint = $env:SIGNPATH_TEST_THUMBPRINT }
+          }
+          if ($env:REF_TYPE -eq 'tag') { $arguments.Attested = $true }
+          if ($env:IMMUTABLE_RELEASES -eq 'true') { $arguments.ImmutableReleases = $true }
+          .\scripts\build_release.ps1 @arguments
+      - name: Release notes for UI tests run locally
+        if: env.UI_CI_REQUIRED != 'true'
+        run: |
+          $notes = 'build/dist/release-notes.md'
+          $line = 'UI tests ran locally (pytest_serial.ps1) for this release.'
+          $text = (Get-Content -Raw $notes) -replace '(?m)^## Changes', "$line`n`n## Changes"
+          Set-Content -Path $notes -Value $text -NoNewline -Encoding utf8NoBOM
+
+      - name: Install, upgrade and uninstall
+        continue-on-error: true
+        # A hung installer must not use up the job's time before the attestation and the draft.
+        timeout-minutes: 20
+        shell: powershell
+        run: .\.github\scripts\install_smoke.ps1 -Dist build\dist
+
+      - name: Attestation
+        if: github.ref_type == 'tag'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            build/dist/Cairn-${{ env.CAIRN_VERSION }}-setup.exe
+            build/dist/SHA256SUMS.txt
+
+      - name: Symbols and build information
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cairn-${{ env.CAIRN_VERSION }}-symbols
+          path: |
+            build/dist/Cairn-${{ env.CAIRN_VERSION }}-symbols.zip
+            build/dist/build-info.json
+            build/dist/signpath-metadata.txt
+          retention-days: 90
+          if-no-files-found: error
+      - name: Test-signed setup
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cairn-test-signed-${{ github.sha }}
+          path: |
+            build/dist/Cairn-${{ env.CAIRN_VERSION }}-setup.exe
+            build/dist/SHA256SUMS.txt
+            build/dist/release-notes.md
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Draft release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $files = @("build/dist/Cairn-$env:CAIRN_VERSION-setup.exe", 'build/dist/SHA256SUMS.txt')
+          $draft = gh release view $env:REF_NAME --repo $env:GITHUB_REPOSITORY --json isDraft --jq .isDraft 2> $null
+          if ($LASTEXITCODE -eq 0) {
+            if ($draft -ne 'true') { throw "The release $env:REF_NAME is published; its files are not replaced." }
+            gh release upload $env:REF_NAME @files --clobber --repo $env:GITHUB_REPOSITORY
+            if ($LASTEXITCODE -eq 0) {
+              gh release edit $env:REF_NAME --notes-file build/dist/release-notes.md --repo $env:GITHUB_REPOSITORY
+            }
+          } else {
+            gh release create $env:REF_NAME @files --draft --verify-tag --title "Cairn $env:CAIRN_VERSION" --notes-file build/dist/release-notes.md --repo $env:GITHUB_REPOSITORY
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'Creating the draft release failed.' }

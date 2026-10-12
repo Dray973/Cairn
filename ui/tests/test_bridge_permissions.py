@@ -184,7 +184,7 @@ def test_fake_journal_holds_the_records_of_earlier_builds_until_they_are_undone(
 
     # Undo of one entry (History's group), then Revert All for the rest.
     targets = [{"hive": r["hive"], "key_path": r["key_path"], "value_name": r["value_name"]} for r in rows]
-    other = {"hive": "HKLM", "key_path": "Test", "value_name": "privacy.cortana"}
+    other = {"hive": "HKLM", "key_path": "Test", "value_name": "privacy.advertising_id"}
     actions, restored, remaining = engine._permission_revert([*targets[2:], other], dry_run=True)
     assert (restored, remaining) == (0, [other])
     assert actions[-1] == f"restore 0x00000001 (1): {sensor_target()}"

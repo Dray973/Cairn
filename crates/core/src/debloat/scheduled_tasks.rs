@@ -13,7 +13,7 @@ use tracing::{info, warn};
 use super::catalog::ScheduledTaskAction;
 use super::{ActionState, ActionStatus};
 use crate::safety::state_log::{
-    scheduled_task_target, JournalTable, NewScheduledTaskRecord, ScheduledTaskRecord,
+    scheduled_task_target, NewScheduledTaskRecord, ScheduledTaskRecord,
 };
 use crate::safety::{MutationOutcome, Safety};
 use crate::win::task_scheduler::{TaskRunState, TaskScheduler};
@@ -230,25 +230,20 @@ pub(crate) fn apply_with(
     Ok(MutationOutcome::Applied)
 }
 
-/// Marks this session's active record of `path` as reverted. Best effort: a journal error
-/// is only logged.
+/// Ends this session's active record of `path` without restoring it, because the write that
+/// followed failed. Best effort: a journal error is only logged.
 fn withdraw(safety: &Safety, path: &str) {
-    let active = match safety.journal().active_scheduled_tasks() {
-        Ok(active) => active,
+    match safety
+        .journal()
+        .withdraw_scheduled_task(safety.session_id(), path)
+    {
+        Ok(true) => {}
+        Ok(false) => warn!(
+            task = path,
+            "no scheduled task record of this session to withdraw"
+        ),
         Err(e) => {
-            warn!(task = path, error = %e, "cannot read the scheduled task journal to withdraw a record");
-            return;
-        }
-    };
-    let own = active
-        .iter()
-        .find(|r| r.session_id == safety.session_id() && r.path.eq_ignore_ascii_case(path));
-    if let Some(rec) = own {
-        if let Err(e) = safety
-            .journal()
-            .mark_reverted(JournalTable::ScheduledTask, rec.id)
-        {
-            warn!(task = path, error = %e, "cannot withdraw the scheduled task journal record");
+            warn!(task = path, error = %e, "cannot withdraw the scheduled task journal record")
         }
     }
 }

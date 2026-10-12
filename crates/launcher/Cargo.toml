@@ -22,3 +22,4 @@ optimizer_core.workspace = true
 
 [build-dependencies]
 embed-manifest = "1.4"
+cairn-winres.workspace = true

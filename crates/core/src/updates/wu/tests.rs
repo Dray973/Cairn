@@ -814,6 +814,7 @@ fn the_catalog_names_every_setting_with_journal_target_strings() {
                     active: true,
                     reverted_at: None,
                     created_root: None,
+                    written: None,
                 }
                 .target()
             })

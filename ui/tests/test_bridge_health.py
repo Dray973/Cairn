@@ -1,11 +1,13 @@
 """EngineBridge health calls: the checkup and the boot history run on the worker and carry
 engine errors; the Windows Update search is started, read and stopped synchronously; an
-outdated engine without them is tolerated; the FakeEngine mirrors the engine's signatures.
+outdated engine without them is tolerated; the FakeEngine mirrors the engine's signatures; the
+Microsoft pages the engine's link fixes may open are the window's allowlist.
 
-Of the real module only `health_update_scan` (the idle view; nothing starts) and
-`health_boot_history(limit=5)` (an event-log read that needs administrator rights) are called.
-`health_security_checkup` and `health_update_scan_start` never run on the real module: Windows
-Update Agent objects can start the Windows Update service.
+Of the real module only `health_update_scan` (the idle view; nothing starts),
+`health_boot_history(limit=5)` (an event-log read that needs administrator rights) and
+`health_microsoft_links` (a constant list) are called. `health_security_checkup` and
+`health_update_scan_start` never run on the real module: Windows Update Agent objects can start
+the Windows Update service.
 """
 
 from __future__ import annotations
@@ -17,12 +19,14 @@ from typing import Any
 import pytest
 
 from optimizer.bridge.engine import EngineBridge, EngineUnavailable, load_engine_module
+from optimizer.widgets.security import MICROSOFT_LINKS, allowed_link
 
 from .bridge_support import assert_signatures_match, wait
 from .fake_engine import FakeEngine
 
 HEALTH_SIGNATURES = {
     "health_security_checkup": "()",
+    "health_microsoft_links": "()",
     "health_update_scan_start": "(online=False)",
     "health_update_scan": "()",
     "health_update_scan_cancel": "()",
@@ -55,7 +59,7 @@ def test_checkup_and_boot_history_run_on_the_worker() -> None:
         wait(bridge, [first, second])
         assert checkup == [True]
         assert boots == [True]
-        assert len(first.result()["checks"]) == 24
+        assert len(first.result()["checks"]) == 25
         assert engine.calls_named("health_boot_history") == [(7,)]
         assert second.result()["access"] == "ok"
     finally:
@@ -201,6 +205,20 @@ def test_fake_checkup_follows_elevation_and_the_scan() -> None:
     assert engine.health_security_checkup()["update_scan_due"] is False
 
 
+def test_fake_checkup_has_the_certificate_check_and_the_remote_assistance_tweak() -> None:
+    checks = FakeEngine(elevated=True).health_security_checkup()["checks"]
+    ids = [c["id"] for c in checks]
+    assert ids.index("secure_boot_certificates") == ids.index("secure_boot") + 1
+    certificates = checks[ids.index("secure_boot_certificates")]
+    assert certificates["group"] == "device"
+    assert certificates["state"] == "good"
+    assert certificates["fixes"][0]["action"] == {"kind": "uri", "uri": "windowsdefender://devicesecurity/"}
+    remote = checks[ids.index("remote_assistance")]
+    assert remote["fixes"][0]["action"] == {"kind": "tweak", "id": "security.remote_assistance"}
+    assert remote["fixes"][0]["label"] == "Turn off Remote Assistance"
+    assert FakeEngine().health_microsoft_links() == list(MICROSOFT_LINKS)
+
+
 def test_boot_history_notes_and_errors_in_the_fake() -> None:
     plain = FakeEngine(elevated=True).health_boot_history()
     assert plain["notes"] == [] and plain["errors"] == []
@@ -246,6 +264,19 @@ def _real_module() -> Any:
 def test_fake_health_signatures_match_real_module() -> None:
     module = _real_module()
     assert_signatures_match(FakeEngine(), module, HEALTH_SIGNATURES)
+
+
+def test_every_link_the_engine_can_open_passes_the_window_allowlist() -> None:
+    """The engine's link fixes open only the pages it lists, and its checkup tests make every
+    listed page a fix; the window opens a link fix only when `allowed_link` accepts it."""
+    module = _real_module()
+    if not hasattr(module, "health_microsoft_links"):
+        pytest.skip("the deployed engine predates link fixes")
+    links = module.health_microsoft_links()
+    assert links, "the engine lists no pages"
+    for url in links:
+        assert allowed_link(url), url
+    assert sorted(links) == sorted(MICROSOFT_LINKS)
 
 
 def test_real_module_update_scan_view_is_idle() -> None:

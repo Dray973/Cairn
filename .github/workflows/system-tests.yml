@@ -1,0 +1,49 @@
+# The tests marked #[ignore] reach Windows itself (a throwaway service, scheduled tasks under
+# \PCOptimizerSelfTest\, Windows Update's status) and never run on a developer's PC unless
+# named. A GitHub-hosted runner is elevated and discarded after the job, so they run here once
+# a week. A failure is reported without failing the workflow until the job has been green.
+
+name: System tests
+
+on:
+  schedule:
+    - cron: '23 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  OPTIMIZER_FORBID_RESTORE_POINT: '1'
+  OPTIMIZER_FORBID_DRIVE_TESTS: '1'
+  OPTIMIZER_FORBID_UPDATE_SEARCH: '1'
+  OPTIMIZER_FORBID_APP_INSTALLS: '1'
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  system-tests:
+    name: Ignored tests on a disposable runner
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        id: python
+        with:
+          python-version: '3.12.10'
+      - name: Rust toolchain of rust-toolchain.toml
+        run: rustup toolchain install
+      - name: Tests that reach Windows (#[ignore])
+        run: cargo test --workspace --locked -- --ignored
+        env:
+          PYO3_PYTHON: ${{ steps.python.outputs.python-path }}

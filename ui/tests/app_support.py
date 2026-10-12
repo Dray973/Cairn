@@ -7,6 +7,7 @@ The `make_app` fixture (see conftest.py) creates the windows.
 
 from __future__ import annotations
 
+import math
 import time
 import tkinter as tk
 from collections.abc import Callable, Iterator
@@ -90,8 +91,15 @@ def show_section(app: App, name: str, *, run_hook: bool = True) -> None:
 
 
 def resize_to(app: App, width: int, height: int) -> None:
-    """Sets the window to `width` x `height` logical pixels and waits until it is drawn."""
+    """Sets the window to `width` x `height` logical pixels and waits until it is drawn.
+
+    Tk keeps a window within its maximum size, the screen size by default, so the maximum is
+    raised first where it is smaller than the request: a small screen (a CI runner's) does not
+    clamp the sizes the fit tests use. A maximum that is large enough is left as it is."""
     scale = ctk.ScalingTracker.get_window_scaling(app) or 1.0
+    max_width, max_height = (math.floor(size / scale) for size in tk.Tk.wm_maxsize(app))
+    if width > max_width or height > max_height:
+        app.maxsize(max(width, max_width), max(height, max_height))
     app.geometry(f"{width}x{height}")
     sizes = {(width, height), (round(width * scale), round(height * scale))}
     pump(app, 5.0, until=lambda: (app.winfo_width(), app.winfo_height()) in sizes)

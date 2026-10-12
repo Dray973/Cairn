@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 
 from optimizer.bridge.engine import EngineBridge, EngineUnavailable, load_engine_module
+from optimizer.widgets import updates as view
 
 from .bridge_support import assert_signatures_match, wait
 from .fake_engine import FakeEngine
@@ -331,11 +332,18 @@ def test_fake_windows_update_rules_follow_the_engine() -> None:
 
 def test_fake_install_list_validates_and_restores_the_defaults() -> None:
     engine = FakeEngine()
-    assert [a["id"] for a in engine.updates_app_list()["apps"]] == [a["id"] for a in DEFAULT_APPS]
+    listing = engine.updates_app_list()
+    assert [a["id"] for a in listing["apps"]] == [a["id"] for a in DEFAULT_APPS]
+    assert listing["custom"] is False and listing["default_ids"] == [], "the defaults need no ids beside"
     saved = engine.updates_save_app_list(
-        [{"id": "Contoso.Browser", "name": "Browser", "category": "browsers"}]
+        [
+            {"id": "Contoso.Browser", "name": "Browser", "category": "browsers"},
+            {"id": "Contoso.Paint", "name": "Paint", "category": "creative"},
+            {"id": "Contoso.Vault", "name": "Vault", "category": "security"},
+        ]
     )
-    assert saved["custom"] is True and len(saved["apps"]) == 1
+    assert saved["custom"] is True and len(saved["apps"]) == 3
+    assert saved["default_ids"] == [a["id"] for a in DEFAULT_APPS], "an own list comes with the default ids"
     for bad in (
         [{"id": "nope", "name": "x", "category": "browsers"}],
         [{"id": "A.B", "name": "", "category": "browsers"}],
@@ -344,7 +352,8 @@ def test_fake_install_list_validates_and_restores_the_defaults() -> None:
     ):
         with pytest.raises(ValueError):
             engine.updates_save_app_list(bad)
-    assert engine.updates_save_app_list(None)["custom"] is False
+    restored = engine.updates_save_app_list(None)
+    assert restored["custom"] is False and restored["default_ids"] == []
 
 
 # -- the real module, read-only ------------------------------------------------------
@@ -366,10 +375,33 @@ def test_real_windows_update_state_and_catalog() -> None:
     assert catalog == FakeEngine().updates_wu_catalog(), "the fake's targets are the engine's"
 
 
-def test_real_install_list_reads_the_test_data_folder() -> None:
+def real_app_list() -> dict[str, Any]:
+    """The deployed engine's install list; skips while the deployed engine predates the list's
+    `default_ids`."""
     listing = real_module().updates_app_list()
-    assert set(listing) == {"apps", "custom", "path", "warnings"}
+    if "default_ids" not in listing:
+        pytest.skip("the deployed engine predates the 0.3 install list")
+    return listing
+
+
+def test_real_install_list_reads_the_test_data_folder() -> None:
+    listing = real_app_list()
+    assert set(listing) == {"apps", "custom", "path", "warnings", "default_ids"}
+    # The engine's dicts pass through serde_json's map, which orders keys by name, so only the
+    # names are compared.
+    assert set(listing) == set(FakeEngine().updates_app_list()), "the fake has the engine's keys"
     assert "cairn-pytest-" in listing["path"]
+    assert listing["custom"] is False and listing["default_ids"] == []
+
+
+def test_every_default_app_has_a_known_category_title() -> None:
+    listing = real_app_list()
+    apps = listing["apps"]
+    unknown = sorted({str(a["category"]) for a in apps} - set(view.CATEGORY_TITLES))
+    assert unknown == [], "no default app falls under Other"
+    assert {str(a["category"]) for a in apps} == set(view.CATEGORY_TITLES), "every category has an app"
+    assert [title for title, _ in view.group_apps(apps)] == list(view.CATEGORY_TITLES.values())
+    assert all(a["source"] == "winget" for a in apps)
 
 
 def test_real_dry_runs_change_nothing() -> None:

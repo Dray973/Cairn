@@ -536,7 +536,9 @@ void test_process_attribution() {
     }
     checkv(child != nullptr, "child pid appears in the top list", "pid=%lu", pi.dwProcessId);
     if (child != nullptr) {
-        checkv(child->cpu_percent > 0.25f * one_core && child->cpu_percent <= one_core + 1.0f,
+        // Process times advance in whole clock ticks, so one scan window can charge the child a
+        // tick more than the window lasted: about 4 % over one core's share on 4 processors.
+        checkv(child->cpu_percent > 0.25f * one_core && child->cpu_percent <= one_core * 1.1f + 1.0f,
                "child cpu_percent near one core's share", "%.2f%% (one core = %.2f%%)",
                child->cpu_percent, one_core);
     }

@@ -269,6 +269,43 @@ mod tests {
         )
     }
 
+    /// What [`presence`] reports for an object this process creates without a security
+    /// descriptor: such an object belongs to the token's default owner, which is
+    /// Administrators for a token elevated through UAC and may be the user for other tokens,
+    /// elevated ones included.
+    fn default_owner_presence() -> MutexPresence {
+        use std::ffi::c_void;
+        use windows::Win32::Security::{GetTokenInformation, TokenOwner, TOKEN_OWNER, TOKEN_QUERY};
+        use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+        let mut token = HANDLE::default();
+        // SAFETY: GetCurrentProcess returns a pseudo-handle; `token` is a valid out pointer and
+        // is closed by `Handle`.
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.unwrap();
+        let token = Handle(token);
+        // u64 storage keeps TOKEN_OWNER and the SID that follows it aligned.
+        let mut buffer = [0u64; 16];
+        let mut returned = 0u32;
+        // SAFETY: `buffer` is writable for the size passed; `returned` is a valid out pointer.
+        unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenOwner,
+                Some(buffer.as_mut_ptr() as *mut c_void),
+                std::mem::size_of_val(&buffer) as u32,
+                &mut returned,
+            )
+        }
+        .unwrap();
+        // SAFETY: GetTokenInformation filled `buffer` with a TOKEN_OWNER whose SID lies inside it.
+        let owner = unsafe { (*(buffer.as_ptr() as *const TOKEN_OWNER)).Owner };
+        if owner_is_admin(&sid_string(owner).unwrap()) {
+            MutexPresence::Admin
+        } else {
+            MutexPresence::Other
+        }
+    }
+
     fn acquire_elsewhere(name: &str, sddl: Option<&'static str>) -> &'static str {
         let name = name.to_string();
         std::thread::spawn(
@@ -295,12 +332,7 @@ mod tests {
         assert_eq!(acquire_elsewhere(&name, None), "busy");
         assert_ne!(presence(&name), MutexPresence::Absent);
         assert!(exists(&name));
-        let expected = if crate::is_elevated() {
-            MutexPresence::Admin
-        } else {
-            MutexPresence::Other
-        };
-        assert_eq!(presence(&name), expected);
+        assert_eq!(presence(&name), default_owner_presence());
         drop(held);
         assert_eq!(presence(&name), MutexPresence::Absent);
         // Released and closed: another thread can take it now.

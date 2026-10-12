@@ -8,25 +8,34 @@ use optimizer_core::health::{self, MAX_BOOT_LIMIT};
 use crate::{blocking, err, to_py};
 
 /// Security checkup; read-only, nothing is journaled and no elevation is needed (drive
-/// encryption is only checked when elevated). Runs without the GIL for up to about 8 s.
+/// encryption and the Secure Boot update task are only checked when elevated). Runs without
+/// the GIL for up to about 8 s.
 /// Returns `{"taken_at", "duration_ms", "elevated", "other_user", "home_edition", "score",
 /// "checks", "update_scan", "update_scan_due", "notes", "errors"}`:
 ///
 /// - `score`: `{"value" (0-100), "grade" ("good" | "fair" | "at_risk"), "to_fix",
 ///   "critical", "unknown", "checked"}`.
-/// - `checks`: 24 checks in a fixed order, each `{"id", "group", "title", "state"
+/// - `checks`: 25 checks in a fixed order, each `{"id", "group", "title", "state"
 ///   ("good" | "attention" | "checking" | "unknown" | "not_applicable"), "severity"
 ///   ("info" | "low" | "medium" | "high" | "critical"), "summary", "detail", "facts"
 ///   [{"label", "value"}], "fixes" [{"label", "note", "action"}], "needs_admin",
 ///   "per_user"}`; an action is `{"kind": "uri", "uri"}`, `{"kind": "windows_tool",
 ///   "tool", "requires_admin"}`, `{"kind": "tweak", "id"}`, `{"kind": "update_scan",
-///   "online"}` or `{"kind": "elevate"}`.
+///   "online"}`, `{"kind": "elevate"}` or `{"kind": "link", "url"}` (one of the Microsoft
+///   pages `health_microsoft_links` lists, opened in the web browser).
 /// - `update_scan`: the latest Windows Update search (see `health_update_scan`);
 ///   `update_scan_due` is true when none finished in the last 30 minutes and none runs.
 /// - `errors`: `[{"source", "message"}]` of the sources that could not be read.
 #[pyfunction]
 fn health_security_checkup(py: Python<'_>) -> PyResult<Py<PyAny>> {
     blocking(py, || Ok(health::security_checkup()))
+}
+
+/// The Microsoft web pages a checkup fix may open (`{"kind": "link", "url"}`), as a list of
+/// exact URLs; keeps the GIL and reads nothing.
+#[pyfunction]
+fn health_microsoft_links() -> Vec<&'static str> {
+    health::MICROSOFT_LINKS.to_vec()
 }
 
 /// Starts a search for updates that are waiting to install on an engine thread and returns
@@ -86,6 +95,7 @@ fn boot_limit(limit: i64) -> PyResult<usize> {
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(health_security_checkup, m)?)?;
+    m.add_function(wrap_pyfunction!(health_microsoft_links, m)?)?;
     m.add_function(wrap_pyfunction!(health_update_scan_start, m)?)?;
     m.add_function(wrap_pyfunction!(health_update_scan, m)?)?;
     m.add_function(wrap_pyfunction!(health_update_scan_cancel, m)?)?;

@@ -18,8 +18,10 @@ const ROOT_SDDL: &str =
                          (A;CI;FW;;;AU)(A;CI;FW;;;NS)(A;CI;FW;;;LS)(A;OICIIO;FA;;;CO)";
 
 struct Setup {
-    _dir: tempfile::TempDir,
     journal: Arc<Journal>,
+    /// Declared last because fields drop in declaration order: the folder can be removed only
+    /// after the journal in it is closed.
+    _dir: tempfile::TempDir,
 }
 
 fn setup() -> Setup {

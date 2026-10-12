@@ -4,6 +4,7 @@
 use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use super::adapters::{list_with, Adapter, DnsConfig, DnsMode};
 use super::{
@@ -266,7 +267,7 @@ pub enum ChangeOutcome {
     AlreadySet,
     /// Not changed, for the reason in `detail`.
     Skipped,
-    /// The change failed; see `detail`. A recorded baseline stays in the journal.
+    /// The change failed; see `detail`. The record it captured is withdrawn; an older one stays.
     Failed,
 }
 
@@ -446,6 +447,23 @@ pub(crate) fn run(
                     written = true;
                 }
                 Err(e) => {
+                    // The servers are as they were: the record this write captured is
+                    // withdrawn, so nothing claims a change that did not happen.
+                    if captured {
+                        match safety.journal().withdraw_dns(
+                            safety.session_id(),
+                            &adapter.id,
+                            family,
+                        ) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                warn!(target = %op_target, "no DNS record of this session to withdraw")
+                            }
+                            Err(e) => {
+                                warn!(target = %op_target, error = %e, "cannot withdraw the DNS record")
+                            }
+                        }
+                    }
                     let detail = e.to_string();
                     log("failed", Some(&detail))?;
                     change.outcome = ChangeOutcome::Failed;
@@ -516,6 +534,17 @@ pub(crate) fn restore_with(stack: &dyn NetStack, rec: &DnsRecord) -> Result<DnsR
     }
     stack.set_static_dns(&guid, rec.family, &rec.previous_servers)?;
     Ok(DnsRestore::Written)
+}
+
+/// Read-only. The static servers now set for the record's interface and family, in the
+/// journal's form (`""` when they are obtained automatically), or `None` when the adapter is
+/// not listed.
+pub(crate) fn now_with(stack: &dyn NetStack, rec: &DnsRecord) -> Result<Option<String>> {
+    let guid = canonical_guid(&rec.interface_guid);
+    if !stack.adapters()?.iter().any(|a| a.id == guid) {
+        return Ok(None);
+    }
+    Ok(Some(stack.static_dns(&guid, rec.family)?.servers))
 }
 
 /// Read-only. The servers now set for the record's interface and family, as text, when
@@ -1056,7 +1085,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_write_keeps_record_and_logs_failure() {
+    fn failed_write_withdraws_its_record_and_logs_failure() {
         let (_dir, journal) = journal();
         let mut stack = wifi_stack();
         stack.fail_set = Some(IpFamily::Ipv6);
@@ -1068,8 +1097,15 @@ mod tests {
             report.changes[1].detail.as_deref(),
             Some("Access is denied.")
         );
-        let records = journal.active_dns().unwrap();
-        assert_eq!(records.len(), 2, "the failed family keeps its baseline");
+        // The IPv6 servers are as they were, so the record captured for them is withdrawn:
+        // only the written family stays active, and the drift check and Undo see one record.
+        let active = journal.active_dns().unwrap();
+        assert_eq!(active.len(), 1, "{active:?}");
+        assert_eq!(active[0].family, IpFamily::Ipv4);
+        let all = journal.all_dns().unwrap();
+        assert_eq!(all.len(), 2);
+        let withdrawn = all.iter().find(|r| r.family == IpFamily::Ipv6).unwrap();
+        assert!(!withdrawn.active && withdrawn.reverted_at.is_some());
         let rows = ops_of(&journal, OP_SET_DNS);
         assert_eq!(
             rows[1],
@@ -1097,6 +1133,15 @@ mod tests {
             "nothing written, no flush"
         );
         assert!(report.warnings.is_empty());
+        assert!(
+            journal.active_dns().unwrap().is_empty(),
+            "nothing written, no active record"
+        );
+        let all = journal.all_dns().unwrap();
+        let [withdrawn] = all.as_slice() else {
+            panic!("one withdrawn record: {all:?}");
+        };
+        assert!(!withdrawn.active && withdrawn.reverted_at.is_some());
     }
 
     fn journal_pair() -> (tempfile::TempDir, Arc<Journal>) {
@@ -1299,6 +1344,69 @@ mod tests {
             "a read error is reported"
         );
         assert!(stack.calls().is_empty(), "read-only");
+    }
+
+    #[test]
+    fn dns_now_reads_the_static_servers_and_none_for_a_missing_adapter() {
+        let stack = wifi_stack();
+        let rec = record(IpFamily::Ipv4, "", "1.1.1.1,1.0.0.1");
+        assert_eq!(
+            now_with(&stack, &rec).unwrap().as_deref(),
+            Some(""),
+            "obtained automatically"
+        );
+        stack.set_static(&guid(1), IpFamily::Ipv4, "9.9.9.9 149.112.112.112");
+        assert_eq!(
+            now_with(&stack, &rec).unwrap().as_deref(),
+            Some("9.9.9.9 149.112.112.112"),
+            "the journal's form, as Windows stores it"
+        );
+        assert_eq!(
+            now_with(&stack, &record(IpFamily::Ipv6, "", "::1"))
+                .unwrap()
+                .as_deref(),
+            Some("")
+        );
+
+        let gone = DnsRecord {
+            interface_guid: guid(2),
+            ..rec.clone()
+        };
+        assert_eq!(now_with(&stack, &gone).unwrap(), None);
+        stack.adapters.borrow_mut().clear();
+        assert_eq!(now_with(&stack, &rec).unwrap(), None, "no longer listed");
+
+        let stack = wifi_stack();
+        stack.unreadable.borrow_mut().insert(guid(1));
+        assert!(now_with(&stack, &rec).is_err(), "a read error is reported");
+        *stack.fail_adapters.borrow_mut() = Some("the adapter list is unavailable".into());
+        assert!(now_with(&stack, &rec).is_err());
+        assert!(stack.calls().is_empty(), "read-only");
+    }
+
+    #[test]
+    fn dns_now_reads_every_listed_adapter_of_this_pc() {
+        // Read-only: lists the adapters and reads their DNS settings.
+        let report = crate::network::list(None).unwrap();
+        for adapter in &report.adapters {
+            for family in IpFamily::ALL {
+                let rec = DnsRecord {
+                    interface_guid: adapter.id.clone(),
+                    adapter_name: adapter.name.clone(),
+                    ..record(family, "", "")
+                };
+                let now = crate::network::dns_now(&rec);
+                assert!(
+                    matches!(now, Ok(Some(_)) | Err(_)),
+                    "{family:?}: a listed adapter is not reported gone"
+                );
+            }
+        }
+        let gone = DnsRecord {
+            interface_guid: "{00000000-0000-0000-0000-00000000c0de}".into(),
+            ..record(IpFamily::Ipv4, "", "")
+        };
+        assert_eq!(crate::network::dns_now(&gone).unwrap(), None);
     }
 
     #[test]

@@ -216,13 +216,13 @@ def test_a_standard_user_can_preview_but_not_apply(make_app: AppFactory) -> None
 
 
 def test_applying_passes_exactly_the_checked_keys(make_app: AppFactory) -> None:
-    app, engine = make_app(elevated=True, profile_fail=["tweak:privacy.cortana"])
+    app, engine = make_app(elevated=True, profile_fail=["tweak:privacy.advertising_id"])
     open_profiles(app)
     panel = preview(app, "privacy")
     sheet = panel.sheet
     assert sheet.selected_keys() == [
         "tweak:privacy.activity_history",
-        "tweak:privacy.cortana",
+        "tweak:privacy.advertising_id",
         "app:Microsoft.BingNews",
     ]
     sheet.row("app:Microsoft.BingNews").checkbox.toggle()
@@ -237,18 +237,17 @@ def test_applying_passes_exactly_the_checked_keys(make_app: AppFactory) -> None:
     assert dialog.title_text == "Apply 2 changes from “Privacy”?"
     assert RESTORE_POINT_NOTE in text
     assert APPS_NOTE not in text
-    assert "• Activity History" in text and "• Cortana" in text
+    assert "• Activity History" in text and "• Advertising Id" in text
     dialog.confirm_button.invoke()
     pump(app, 5.0, until=lambda: panel.mode == "result" and bool(dialogs(app)) and settled(app))
 
-    assert applies(engine) == [
-        (starter_text("privacy"), ["tweak:privacy.activity_history", "tweak:privacy.cortana"], "try", False)
-    ]
+    keys = ["tweak:privacy.activity_history", "tweak:privacy.advertising_id"]
+    assert applies(engine) == [(starter_text("privacy"), keys, "try", False)]
     assert engine.applied == {"privacy.activity_history"}
     result = next_dialog(app)
     assert result.title_text == "Some changes failed"
     assert "1 applied, 1 failed." in dialog_text(result)
-    assert "• Cortana (failed): Access is denied." in dialog_text(result)
+    assert "• Advertising Id (failed): Access is denied." in dialog_text(result)
     result.confirm_button.invoke()
     pump(app, 5.0, until=lambda: scanned(app))
     assert len(engine.calls_named("scan")) > scans
@@ -256,7 +255,7 @@ def test_applying_passes_exactly_the_checked_keys(make_app: AppFactory) -> None:
     assert ("Done: 1 applied, 1 failed.", theme.WARNING) in shown
 
     assert sheet.row("tweak:privacy.activity_history").status_label.cget("text") == "✓ Applied"
-    assert sheet.row("tweak:privacy.cortana").status_label.cget("text") == "⚠ Failed"
+    assert sheet.row("tweak:privacy.advertising_id").status_label.cget("text") == "⚠ Failed"
     assert sheet.row("app:Microsoft.BingNews").status_label.cget("text") == "○ Not selected"
     assert sheet.undo_button.winfo_ismapped() and sheet.again_button.winfo_ismapped()
     assert not sheet.apply_button.winfo_ismapped()
@@ -278,12 +277,12 @@ def test_unchecked_rows_stay_unchecked_when_the_plan_is_read_again(make_app: App
     app, engine = make_app(elevated=True)
     open_profiles(app)
     panel = preview(app, "privacy")
-    panel.sheet.row("tweak:privacy.cortana").checkbox.toggle()
+    panel.sheet.row("tweak:privacy.advertising_id").checkbox.toggle()
     before = len(plans(engine))
     app._profiles_after_mutation()
     pump(app, 5.0, until=lambda: len(plans(engine)) > before and panel.mode == "plan" and settled(app))
     assert panel.sheet.selected_keys() == ["tweak:privacy.activity_history", "app:Microsoft.BingNews"]
-    assert not panel.sheet.row("tweak:privacy.cortana").checked
+    assert not panel.sheet.row("tweak:privacy.advertising_id").checked
     assert not app._profile_stale
     assert app.errors == []
 
@@ -292,7 +291,7 @@ def test_a_stale_plan_is_read_again_instead_of_applied(make_app: AppFactory) -> 
     app, engine = make_app(elevated=True)
     open_profiles(app)
     panel = preview(app, "privacy")
-    panel.sheet.row("tweak:privacy.cortana").checkbox.toggle()
+    panel.sheet.row("tweak:privacy.advertising_id").checkbox.toggle()
     show_section(app, "Optimize", run_hook=False)
     app._profiles_after_mutation()
     assert app._profile_stale
@@ -304,7 +303,7 @@ def test_a_stale_plan_is_read_again_instead_of_applied(make_app: AppFactory) -> 
     assert applies(engine) == []
     assert STALE_TEXT in panel.sheet.warning_label.cget("text")
     assert status(app) == (STALE_TEXT, theme.WARNING)
-    assert not panel.sheet.row("tweak:privacy.cortana").checked
+    assert not panel.sheet.row("tweak:privacy.advertising_id").checked
     # The shown hook reads a stale plan again as well.
     show_section(app, "Optimize", run_hook=False)
     app._profiles_after_mutation()
@@ -490,13 +489,13 @@ def test_export_lists_candidates_checks_the_name_and_saves(
     make_app: AppFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     app, engine = make_app(elevated=False)
-    engine.applied.update({"gaming.game_mode", "privacy.cortana"})
+    engine.applied.update({"gaming.game_mode", "privacy.advertising_id"})
     engine._startup_disabled.add("user_run:Discord")
     panel = open_profiles(app)
     panel.export_button.invoke()
     pump(app, 5.0, until=lambda: panel.mode == "export" and settled(app))
     sheet = panel.sheet
-    keys = ["tweak:privacy.cortana", "tweak:gaming.game_mode", "startup:user_run:Discord"]
+    keys = ["tweak:privacy.advertising_id", "tweak:gaming.game_mode", "startup:user_run:Discord"]
     assert sheet.selected_keys() == keys
     assert sheet.title_label.cget("text") == "Export this PC's settings"
     assert sheet.save_button.cget("state") == "normal"
@@ -514,13 +513,13 @@ def test_export_lists_candidates_checks_the_name_and_saves(
     sheet.name_entry.insert(0, "  My setup ")
     sheet.description_entry.insert(0, "Desk")
     # A setting that changes after the list was read is left out of the file.
-    engine.applied.discard("privacy.cortana")
+    engine.applied.discard("privacy.advertising_id")
     sheet.save_button.invoke()
     pump(app, 5.0, until=lambda: bool(engine.calls_named("profile_export")) and settled(app))
     assert asked[0]["initialfile"] == "My setup.json"
     assert asked[0]["defaultextension"] == ".json"
     assert engine.calls_named("profile_export") == [
-        (saved, "My setup", "Desk", ["tweak:privacy.cortana", "tweak:gaming.game_mode"])
+        (saved, "My setup", "Desk", ["tweak:privacy.advertising_id", "tweak:gaming.game_mode"])
     ]
     assert json.loads(engine.exported[saved])["tweaks"] == ["gaming.game_mode"]
     text, color = status(app)
@@ -670,7 +669,7 @@ def test_rows_of_another_account_are_skipped_with_a_warning(make_app: AppFactory
     panel = preview(app, "privacy")
     sheet = panel.sheet
     assert OTHER_ACCOUNT in sheet.warning_label.cget("text")
-    assert sheet.selected_keys() == ["tweak:privacy.activity_history", "tweak:privacy.cortana"]
+    assert sheet.selected_keys() == ["tweak:privacy.activity_history", "tweak:privacy.advertising_id"]
     sheet.expand_all()
     assert sheet.row("app:Microsoft.BingNews").status_label.cget("text") == "– Belongs to another account"
     assert app.errors == []
@@ -831,7 +830,7 @@ def test_a_plan_and_a_result_shown_at_a_narrow_width_fit(
 
 def test_the_export_form_fits_the_window(make_app: AppFactory, monkeypatch: pytest.MonkeyPatch) -> None:
     app, engine, panel = big_app(make_app, monkeypatch)
-    engine.applied.update({"gaming.game_mode", "privacy.cortana"})
+    engine.applied.update({"gaming.game_mode", "privacy.advertising_id"})
     panel.export_button.invoke()
     pump(app, 5.0, until=lambda: panel.mode == "export" and settled(app))
     panel.sheet.save_button.invoke()

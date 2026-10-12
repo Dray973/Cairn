@@ -9,6 +9,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use optimizer_core::debloat::appx;
 use optimizer_core::debloat::RestartNeed;
@@ -19,7 +20,7 @@ use optimizer_core::safety::state_log::{
     NewScheduledTaskRecord, NewServiceRecord, NewTaskDefinitionRecord,
 };
 use optimizer_core::safety::{
-    rollback, MutationOutcome, RestorePointPolicy, Safety, SafetyOptions,
+    rollback, MutationOutcome, RestorePointPolicy, Safety, SafetyOptions, Written,
 };
 use optimizer_core::win::registry::{delete_key_if_empty, exists, read_value, Hive, Key, RegValue};
 use optimizer_core::win::scm::{Scm, StartType, READ_ACCESS};
@@ -1164,6 +1165,23 @@ fn report_names_the_restart_of_restored_tweaks() {
             created_root: None,
         };
         assert!(journal.record_registry(session, &rec).unwrap());
+        // The write each record stands for, as the safety layer logs it (a record without it
+        // stands for a write that failed, which needs no restart to undo).
+        let name = if value_name.is_empty() {
+            "(Default)"
+        } else {
+            value_name
+        };
+        let target = format!(r"{}\{key_path}\{name}", hive.short());
+        journal
+            .log_op(
+                Some(session),
+                "set_registry_value",
+                &target,
+                "applied",
+                None,
+            )
+            .unwrap();
     }
     journal.end_session(session).unwrap();
 
@@ -1259,6 +1277,147 @@ fn removed_package_installed_again_is_marked_restored() {
     assert!(ops
         .iter()
         .any(|o| o.op == "rollback_appx" && o.outcome == "already_installed"));
+}
+
+#[test]
+fn registry_round_trip_keeps_what_cairn_wrote() {
+    let path = format!(r"{ROOT}\WrittenRoundTrip");
+    clean(&path);
+    let (_dir, journal) = journal();
+    {
+        let safety = Safety::begin(journal.clone(), options("written")).unwrap();
+        for (name, value) in [("Probe", 1), ("Marker", 2)] {
+            safety
+                .set_registry_value(Hive::CurrentUser, &path, name, &RegValue::Dword(value))
+                .unwrap();
+        }
+        let outcome = safety
+            .delete_registry_value(Hive::CurrentUser, &path, "Marker")
+            .unwrap();
+        assert_eq!(outcome, MutationOutcome::Applied);
+    }
+    let written = |name: &str| {
+        journal
+            .active_registry()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.value_name == name)
+            .and_then(|r| r.written)
+    };
+    assert_eq!(
+        written("Probe"),
+        Some(Written::Value {
+            value: RegValue::Dword(1).to_raw()
+        })
+    );
+    assert_eq!(written("Marker"), Some(Written::Deleted));
+    let export: serde_json::Value = serde_json::from_str(&journal.export_json().unwrap()).unwrap();
+    let text = |name: &str| {
+        export["registry"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["value_name"] == name)
+            .map(|row| row["written"].clone())
+            .unwrap()
+    };
+    assert_eq!(text("Probe"), "0x00000001 (1)");
+    assert_eq!(text("Marker"), "not set");
+
+    let report = rollback::rollback_journal(&journal, false).unwrap();
+    assert!(
+        report.is_clean(),
+        "{:?} {:?}",
+        report.failures,
+        report.not_restored
+    );
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert_eq!(report.registry_deleted, 2);
+    assert!(
+        !exists(Hive::CurrentUser, &path).unwrap(),
+        "created key should be removed"
+    );
+    clean(&path);
+}
+
+#[test]
+fn a_value_changed_while_the_rollback_waits_is_not_restored() {
+    let path = format!(r"{ROOT}\NotRestored");
+    clean(&path);
+    let (key, _) = Key::create(Hive::CurrentUser, &path).unwrap();
+    key.set("Probe", &RegValue::Dword(1)).unwrap();
+    drop(key);
+    let (_dir, journal) = journal();
+    {
+        let safety = Safety::begin(journal.clone(), options("not-restored")).unwrap();
+        safety
+            .set_registry_value(Hive::CurrentUser, &path, "Probe", &RegValue::Dword(0))
+            .unwrap();
+    }
+
+    // Another program writes its own value as soon as the rollback has put the original back,
+    // while the rollback waits before it reads the value back.
+    let watched = path.clone();
+    let watcher = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if read_value(Hive::CurrentUser, &watched, "Probe").unwrap() == Some(RegValue::Dword(1))
+            {
+                let (key, _) = Key::create(Hive::CurrentUser, &watched).unwrap();
+                key.set("Probe", &RegValue::Dword(7)).unwrap();
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        false
+    });
+    let report = rollback::rollback_journal(&journal, false).unwrap();
+    assert!(watcher.join().unwrap(), "the restore was seen");
+
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert_eq!(report.registry_restored, 1, "the restore happened");
+    assert!(!report.is_clean());
+    let target = format!(r"HKCU\{path}\Probe");
+    let not_restored: Vec<(&str, &str, &str, Option<&str>)> = report
+        .not_restored
+        .iter()
+        .map(|m| {
+            (
+                m.target.as_str(),
+                m.expected.as_str(),
+                m.found.as_str(),
+                m.original.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        not_restored,
+        [(
+            target.as_str(),
+            "0x00000001 (1)",
+            "0x00000007 (7)",
+            Some("0x00000001 (1)")
+        )]
+    );
+    assert_eq!(
+        journal.summary().unwrap().registry_active,
+        0,
+        "the record stays reverted"
+    );
+    let ops = journal.ops(20).unwrap();
+    assert!(
+        ops.iter().any(|o| o.op == "verify_after_rollback"
+            && o.target == target
+            && o.outcome == "not_restored"
+            && o.detail.as_deref() == Some("found 0x00000007 (7); restored 0x00000001 (1)")),
+        "{ops:?}"
+    );
+    assert_eq!(
+        read_value(Hive::CurrentUser, &path, "Probe").unwrap(),
+        Some(RegValue::Dword(7)),
+        "Cairn does not write the original again"
+    );
+    clean(&path);
 }
 
 #[test]

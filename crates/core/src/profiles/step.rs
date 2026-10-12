@@ -5,6 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::maintenance::config::ScheduleDay;
+use crate::safety::verify::Mismatch;
 
 /// What applying a profile does to one setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,6 +27,10 @@ pub enum StepReason {
     Edition,
     NotOnThisPc,
     UnknownId,
+    /// This Windows build does not use the setting.
+    WindowsVersion,
+    /// The setting is no longer offered.
+    Retired,
 }
 
 /// One planned row of a profile preview.
@@ -55,6 +60,9 @@ pub struct StepResult {
     pub key: String,
     pub outcome: StepOutcome,
     pub details: Vec<String>,
+    /// Targets the step wrote that did not hold when read back.
+    #[serde(default)]
+    pub not_kept: Vec<Mismatch>,
 }
 
 /// Profile section "maintenance". enabled=false turns maintenance off; then no other field
@@ -156,10 +164,30 @@ mod tests {
     }
 
     #[test]
+    fn step_result_without_not_kept_deserializes() {
+        let old: StepResult = serde_json::from_str(
+            r#"{"key": "wu:restart_notify", "outcome": "applied", "details": []}"#,
+        )
+        .unwrap();
+        assert_eq!(old.outcome, StepOutcome::Applied);
+        assert!(old.not_kept.is_empty());
+        let json = serde_json::to_value(&old).unwrap();
+        assert_eq!(json["not_kept"], serde_json::json!([]));
+    }
+
+    #[test]
     fn enums_serialize_snake_case() {
         assert_eq!(
             serde_json::to_value(StepReason::NotOnThisPc).unwrap(),
             "not_on_this_pc"
+        );
+        assert_eq!(
+            serde_json::to_value(StepReason::WindowsVersion).unwrap(),
+            "windows_version"
+        );
+        assert_eq!(
+            serde_json::to_value(StepReason::Retired).unwrap(),
+            "retired"
         );
         assert_eq!(
             serde_json::to_value(StepOutcome::AlreadySet).unwrap(),

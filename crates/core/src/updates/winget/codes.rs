@@ -71,6 +71,10 @@ const RESTART_CODES: [i32; 2] = [3010, 1641];
 pub const ALREADY_CURRENT_TEXT: &str = "Already up to date.";
 pub const ALREADY_INSTALLED_TEXT: &str = "Already installed.";
 pub const RESTART_TEXT: &str = "Restart Windows to finish.";
+/// Added to a batch result when Windows' own pending-restart flags turned on during the
+/// batch, whether or not an app reported a restart code (winget's exit 0 does not carry it).
+pub const PENDING_RESTART_TEXT: &str =
+    "Windows reports a pending restart; restart Windows to finish.";
 
 /// The message of a failure code, when it has a specific one.
 fn failure_text(code: u32) -> Option<&'static str> {
@@ -107,6 +111,10 @@ fn failure_text(code: u32) -> Option<&'static str> {
         0x8A15_0014 | 0x8A15_0017 => "winget couldn't find this app. Check its id.",
         0x8A15_0016 => "More than one app matches this id.",
         0x8A15_010F | 0x8A15_003A | 0x8A15_001B | 0x8A15_001C => "A policy on this PC blocks it.",
+        0x8A15_005F => {
+            "This app's installer needs an install folder, which Cairn doesn't choose. Install it \
+             from its publisher's site."
+        }
         0x8A15_0068 => "It's pinned in winget; unpin it to update.",
         0x8A15_008E => {
             "winget can't update this copy because it was installed another way. It may update \
@@ -174,7 +182,7 @@ pub fn item_outcome(kind: UpdatesKind, code: i32) -> (ItemState, Option<String>)
 /// Failures that come from the installed copy, the app's installers or this PC's policies.
 /// They stay the same until something outside Cairn changes, so trying again from Cairn
 /// fails the same way.
-const LASTING_FAILURES: [u32; 15] = [
+const LASTING_FAILURES: [u32; 16] = [
     0x8A15_008E, // UPDATE_INSTALL_TECHNOLOGY_MISMATCH
     0x8A15_0114, // INSTALL_UPGRADE_NOT_SUPPORTED
     0x8A15_0056, // INSTALLER_PROHIBITS_ELEVATION
@@ -190,6 +198,7 @@ const LASTING_FAILURES: [u32; 15] = [
     0x8A15_003A, // BLOCKED_BY_POLICY
     0x8A15_001B, // MSSTORE_BLOCKED_BY_POLICY
     0x8A15_001C, // MSSTORE_APP_BLOCKED_BY_POLICY
+    0x8A15_005F, // INSTALL_LOCATION_REQUIRED: Cairn never passes --location
 ];
 
 /// Whether trying again can end differently for an app whose winget ended with `code`: false
@@ -362,6 +371,11 @@ mod tests {
                 &[0x8A15_010F, 0x8A15_003A, 0x8A15_001B, 0x8A15_001C],
                 "A policy on this PC blocks it.",
             ),
+            (
+                &[0x8A15_005F],
+                "This app's installer needs an install folder, which Cairn doesn't choose. \
+                 Install it from its publisher's site.",
+            ),
             (&[0x8A15_0068], "It's pinned in winget; unpin it to update."),
             (
                 &[0x8A15_008E],
@@ -449,6 +463,7 @@ mod tests {
             0x8A15_003A,
             0x8A15_001B,
             0x8A15_001C,
+            0x8A15_005F,
         ];
         for raw in lasting {
             assert!(!retry_may_help(hr(raw)), "{raw:#X}");

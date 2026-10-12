@@ -24,6 +24,11 @@ GLOBS = (
     "README.md",
     "requirements*.txt",
     "ui/pyproject.toml",
+    ".github/**/*.yml",
+    ".github/**/*.ps1",
+    "docs/*.md",
+    "SECURITY.md",
+    ".signpath/**/*.xml",
 )
 # The old name, also split across comment lines; built from parts so this file does not match.
 OLD_NAME = re.compile("PC" + r"[\s/!#;*]+" + "Optimizer")
@@ -38,7 +43,19 @@ def source_files() -> list[Path]:
 
 def test_the_scan_covers_the_sources() -> None:
     names = {p.relative_to(ROOT).as_posix() for p in source_files()}
-    for expected in ("ui/optimizer/app.py", "crates/core/src/lib.rs", "Cargo.toml", "ui/pyproject.toml"):
+    for expected in (
+        "ui/optimizer/app.py",
+        "crates/core/src/lib.rs",
+        "Cargo.toml",
+        "ui/pyproject.toml",
+        ".github/workflows/ci.yml",
+        ".github/workflows/release.yml",
+        ".github/scripts/install_smoke.ps1",
+        "docs/code-signing-policy.md",
+        "docs/privacy.md",
+        "SECURITY.md",
+        ".signpath/artifact-configurations/binaries.xml",
+    ):
         assert expected in names
     assert not any(n.startswith(("target/", "build/", ".venv/")) for n in names)
 

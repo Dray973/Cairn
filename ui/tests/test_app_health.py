@@ -1,11 +1,14 @@
 """Security and Boot history sections in the real window with a FakeEngine: when the checkup
-loads, the automatic and the online Windows Update search, every kind of fix, another account,
-a standard user, a copy that may not ask for administrator rights, "Turn off at startup", the tool
-buttons and the views of the boot history (what slowed starts and shutdowns), an outdated engine,
-closing while a search runs and the layout.
+loads, the automatic and the online Windows Update search, every kind of fix (web pages open
+through the engine, without administrator rights, while Cairn runs as administrator), the
+Secure Boot certificate check, another account, a standard user, a copy that may not ask for
+administrator rights, "Turn off at startup", the tool buttons and the views of the boot history
+(what slowed starts and shutdowns), an outdated engine, closing while a search runs and the
+layout.
 
 Nothing on this PC is read or changed: every call goes to the in-memory FakeEngine, and
-opening a page goes to a recorder that replaces `system.open_uri`.
+opening a page goes to a recorder that replaces `system.open_uri` (the FakeEngine records the
+pages its `open_url` would open).
 """
 
 from __future__ import annotations
@@ -15,11 +18,12 @@ from typing import Any
 
 import pytest
 
-from optimizer import system
+from optimizer import PROJECT_URL, system
 from optimizer.app import ADMIN_UNAVAILABLE_TITLE
 from optimizer.features.health import (
     BOOT_SECTION,
     CHECKUP_STALE_S,
+    OPEN_PAGE_YOURSELF_TEXT,
     SCAN_STATUS,
     SCAN_STATUS_ONLINE,
     SECURITY_SECTION,
@@ -27,14 +31,16 @@ from optimizer.features.health import (
     UPDATE_POLL_HIDDEN_S,
 )
 from optimizer.widgets.boot import ALREADY_OFF_TEXT, FAST_STARTUP_TEXT, NEEDS_ADMIN_TEXT, BootPanel
-from optimizer.widgets.security import PER_USER_NOTE, CheckRow, SecurityPanel
+from optimizer.widgets.security import LINK_NOTE, PER_USER_NOTE, CheckRow, SecurityPanel
 
 from .app_support import (
     ADMIN_DIALOG_TITLE,
+    FIT_SIZES,
     App,
     AppFactory,
     assert_section_fits,
     confirm_dialog_text,
+    ctk,
     dialogs,
     idle,
     next_dialog,
@@ -44,6 +50,7 @@ from .app_support import (
     show_section,
     theme,
 )
+from .fake_health import MICROSOFT_LINKS, link_fix, tool_fix, uri_fix
 
 FIREWALL_ATTENTION = {"state": "attention", "severity": "high", "summary": "Off for public networks"}
 UAC_ATTENTION = {"state": "attention", "severity": "low", "summary": "Notify without dimming the desktop"}
@@ -73,6 +80,90 @@ SLOW_BOTH_PHASES = (
 )
 START_TYPES_ERROR = "Could not read the start types: the System log could not be opened"
 SHUTDOWNS_ERROR = "Could not read the unexpected shutdowns: the System log could not be opened"
+GUIDANCE = MICROSOFT_LINKS[0]
+MANUFACTURERS = MICROSOFT_LINKS[2]
+# The certificate update blocked by the firmware, as the engine reports it.
+CERTIFICATES_BLOCKED = {
+    "state": "attention",
+    "severity": "medium",
+    "summary": "Needs a firmware update or help from the PC's manufacturer",
+    "facts": [
+        {"label": "Latest Secure Boot update event", "value": "2026-09-24  ·  not finished yet (event 1801)"},
+        {"label": "Firmware", "value": "Contoso 1.0.7, released 2025-01-15"},
+    ],
+    "fixes": [
+        link_fix("Manufacturer pages", MANUFACTURERS),
+        link_fix("Microsoft's guidance", MICROSOFT_LINKS[1]),
+        uri_fix("Open Device security", "windowsdefender://devicesecurity/"),
+    ],
+}
+# The certificates being installed: an informational finding.
+CERTIFICATES_INSTALLING = {
+    "state": "attention",
+    "severity": "info",
+    "summary": "Installing the 2023 certificates…",
+    "detail": "Windows is installing the 2023 certificates; nothing needs to be done.",
+    "facts": [
+        {
+            "label": "Latest Secure Boot update event",
+            "value": "2026-09-24  ·  KEK 2K CA 2023 added (event 1043)",
+        }
+    ],
+    "fixes": [
+        uri_fix("Open Windows Update", "ms-settings:windowsupdate"),
+        uri_fix("Open Device security", "windowsdefender://devicesecurity/"),
+        link_fix("Find the recovery key", MICROSOFT_LINKS[5]),
+    ],
+}
+# Waiting for a restart: the engine's longest informational summary, with the same three fixes.
+CERTIFICATES_RESTART = {
+    "state": "attention",
+    "severity": "info",
+    "summary": "Windows needs a restart to continue installing the 2023 certificates",
+    "detail": "Windows continues after the next restart; Microsoft estimates about 48 hours and one or "
+    "more restarts in all.",
+    "facts": [
+        {
+            "label": "Latest Secure Boot update event",
+            "value": "2026-09-24  ·  a restart is needed to continue (event 1800)",
+        },
+        {"label": "", "value": "Run Cairn as administrator to also check the update task."},
+    ],
+    "fixes": [
+        uri_fix("Open Windows Update", "ms-settings:windowsupdate"),
+        uri_fix("Open Device security", "windowsdefender://devicesecurity/"),
+        link_fix("Find the recovery key", MICROSOFT_LINKS[5]),
+    ],
+}
+# Paused by Microsoft while Windows Update is paused too: the pause puts "Open Windows Update"
+# before the three fixes of a pause, the most buttons an informational row carries.
+CERTIFICATES_PAUSED = {
+    "state": "attention",
+    "severity": "info",
+    "summary": "Paused by Microsoft for PCs like this one",
+    "detail": "Microsoft has paused the update for this group of PCs because of a known problem.",
+    "facts": [
+        {"label": "Firmware", "value": "Contoso 1.0.7, released 2025-01-15"},
+        {"label": "", "value": "Windows Update is paused until 2026-10-20"},
+    ],
+    "fixes": [
+        uri_fix("Open Windows Update", "ms-settings:windowsupdate"),
+        link_fix("Manufacturer pages", MANUFACTURERS),
+        link_fix("Microsoft's guidance", MICROSOFT_LINKS[1]),
+        uri_fix("Open Device security", "windowsdefender://devicesecurity/"),
+    ],
+}
+# The update task turned off, which only an administrator can see.
+CERTIFICATES_TASK_OFF = {
+    "state": "attention",
+    "severity": "medium",
+    "summary": "The task that installs the 2023 certificates is turned off",
+    "facts": [{"label": "Update task", "value": "turned off"}],
+    "fixes": [
+        tool_fix("Open Task Scheduler", "task_scheduler", True),
+        link_fix("Troubleshooting guide", MICROSOFT_LINKS[3]),
+    ],
+}
 
 
 def status(app: App) -> tuple[str, str]:
@@ -123,7 +214,7 @@ def test_security_loads_only_when_shown_and_once_until_stale(make_app: AppFactor
     assert engine.calls_named("health_security_checkup") == []
     panel = open_security(app)
     assert engine.calls_named("health_security_checkup") == [()]
-    assert len(panel.rows) == 24
+    assert len(panel.rows) == 25
     assert panel.value_label.cget("text") == "86"
     show_section(app, "Dashboard")
     show_section(app, SECURITY_SECTION)
@@ -155,12 +246,15 @@ def test_blocks_sort_and_the_passed_list_collapses(make_app: AppFactory) -> None
     panel = open_security(app)
     assert panel.fix_heading.cget("text") == "To fix (3)"
     assert panel.unknown_heading.cget("text") == "Could not check (1)"
-    assert panel.passed_heading.cget("text") == "Passed (20)"
+    assert panel.passed_heading.cget("text") == "Passed (21)"
     # Most severe first: encryption (medium) before the two low findings.
     fix_ids = [row.check_id for row in panel.fix_frame.winfo_children() if isinstance(row, CheckRow)]
     assert fix_ids == ["encryption", "remote_assistance", "file_extensions"]
     assert not panel.passed_frame.winfo_ismapped()
-    assert panel.passed_button.cget("text") == "Show 20 passed checks"
+    assert panel.passed_button.cget("text") == "Show 21 passed checks"
+    certificates = panel.rows["secure_boot_certificates"]
+    assert certificates.compact
+    assert certificates.summary_label.cget("text") == "The 2023 certificates are installed"
     panel.passed_button.invoke()
     pump(app, 0.3)
     assert panel.passed_frame.winfo_ismapped()
@@ -185,7 +279,7 @@ def test_an_informational_finding_keeps_its_chip_detail_and_fix(
     panel = open_security(app)
     # It costs no points, so it is listed with the passed checks and not under "To fix".
     assert panel.fix_heading.cget("text") == "To fix (3)"
-    assert panel.passed_heading.cget("text") == "Passed (20)"
+    assert panel.passed_heading.cget("text") == "Passed (21)"
     row = panel.rows["smart_app_control"]
     assert row.compact and row.informational
     panel.passed_button.invoke()
@@ -389,6 +483,264 @@ def test_a_uri_fix_opens_the_page(make_app: AppFactory, monkeypatch: pytest.Monk
     assert app.errors == []
 
 
+def dialog_button(widget: Any, text: str) -> Any:
+    """The one CTkButton labelled `text` under `widget`."""
+    found = []
+    stack = [widget]
+    while stack:
+        current = stack.pop()
+        for child in current.winfo_children():
+            if isinstance(child, ctk.CTkButton) and child.cget("text") == text:
+                found.append(child)
+            stack.append(child)
+    assert len(found) == 1, text
+    return found[0]
+
+
+def test_a_link_fix_opens_the_microsoft_page(make_app: AppFactory, monkeypatch: pytest.MonkeyPatch) -> None:
+    opened = fixes_recorder(monkeypatch)
+    app, engine = make_app(
+        elevated=False,
+        health_update_scan_due=False,
+        health_check_overrides={"secure_boot_certificates": CERTIFICATES_BLOCKED},
+    )
+    panel = open_security(app)
+    row = panel.rows["secure_boot_certificates"]
+    assert not row.compact
+    assert row.chip_label is not None and row.chip_label.cget("text") == "Recommended"
+    # The note under the buttons says where a link goes.
+    assert LINK_NOTE in row.notes
+    assert LINK_NOTE == "Opens a Microsoft page in your web browser."
+    button(row, "Manufacturer pages").invoke()
+    assert opened == [MANUFACTURERS]
+    # Without administrator rights the page opens with its registered handler.
+    pump(app, 0.3)
+    assert engine.calls_named("open_url") == []
+    assert app.errors == []
+
+
+@pytest.mark.parametrize("elevated", [False, True])
+def test_a_link_outside_the_allowlist_is_refused(
+    make_app: AppFactory, monkeypatch: pytest.MonkeyPatch, elevated: bool
+) -> None:
+    opened = fixes_recorder(monkeypatch)
+    app, engine = make_app(
+        elevated=elevated,
+        health_update_scan_due=False,
+        health_check_overrides={"secure_boot_certificates": CERTIFICATES_BLOCKED},
+    )
+    panel = open_security(app)
+    row = panel.rows["secure_boot_certificates"]
+    for url in ("https://example.com/", f"{GUIDANCE}/", "http://aka.ms/getsecureboot", ""):
+        app._on_security_fix(row.check, {"label": "Read more", "action": {"kind": "link", "url": url}})
+        assert status(app) == (f"Cairn does not open {url}.", theme.WARNING)
+    pump(app, 0.3)
+    assert opened == []
+    assert engine.calls_named("open_url") == []
+    assert app.errors == []
+
+
+def test_link_opens_through_the_engine_when_elevated(
+    make_app: AppFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    opened = fixes_recorder(monkeypatch)
+    app, engine = make_app(
+        elevated=True,
+        health_update_scan_due=False,
+        health_check_overrides={"secure_boot_certificates": CERTIFICATES_BLOCKED},
+    )
+    panel = open_security(app)
+    row = panel.rows["secure_boot_certificates"]
+    button(row, "Manufacturer pages").invoke()
+    pump(app, 5.0, until=lambda: bool(engine.calls_named("open_url")) and idle(app))
+    assert engine.calls_named("open_url") == [(MANUFACTURERS,)]
+    # The window never starts a browser itself while it runs as administrator.
+    assert opened == []
+    # A Windows Security page is no web page: it still opens directly.
+    button(row, "Open Device security").invoke()
+    assert opened == ["windowsdefender://devicesecurity/"]
+    assert app.errors == []
+
+
+def test_open_link_follows_elevation(make_app: AppFactory, monkeypatch: pytest.MonkeyPatch) -> None:
+    opened = fixes_recorder(monkeypatch)
+    app, engine = make_app(elevated=True, health_update_scan_due=False)
+    pump(app, 5.0, until=lambda: scanned(app))
+    # Any web page, the project page included: the allowlist is for the checkup's fixes.
+    app._open_link(PROJECT_URL)
+    pump(app, 5.0, until=lambda: bool(engine.calls_named("open_url")) and idle(app))
+    assert engine.calls_named("open_url") == [(PROJECT_URL,)]
+    assert opened == []
+    other, other_engine = make_app(elevated=False, health_update_scan_due=False)
+    pump(other, 5.0, until=lambda: scanned(other))
+    other._open_link(PROJECT_URL)
+    pump(other, 0.3)
+    assert opened == [PROJECT_URL]
+    assert other_engine.calls_named("open_url") == []
+    assert app.errors == [] and other.errors == []
+
+
+def test_an_engine_without_open_url_never_starts_a_browser_when_elevated(
+    make_app: AppFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    opened = fixes_recorder(monkeypatch)
+    app, _ = make_app(
+        elevated=True,
+        health_update_scan_due=False,
+        unsupported=["open_url"],
+        health_check_overrides={"secure_boot_certificates": CERTIFICATES_BLOCKED},
+    )
+    panel = open_security(app)
+    button(panel.rows["secure_boot_certificates"], "Manufacturer pages").invoke()
+    pump(app, 0.3)
+    assert status(app) == (OPEN_PAGE_YOURSELF_TEXT.format(url=MANUFACTURERS), theme.WARNING)
+    assert opened == []
+    assert app.errors == []
+
+
+def test_a_page_the_engine_cannot_open_is_reported(
+    make_app: AppFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    opened = fixes_recorder(monkeypatch)
+    app, engine = make_app(
+        elevated=True,
+        health_update_scan_due=False,
+        health_check_overrides={"secure_boot_certificates": CERTIFICATES_BLOCKED},
+    )
+
+    def no_desktop_shell(url: str) -> None:
+        engine._record("open_url", url)
+        raise RuntimeError("no desktop shell runs in this session")
+
+    engine.open_url = no_desktop_shell  # type: ignore[method-assign]
+    panel = open_security(app)
+    button(panel.rows["secure_boot_certificates"], "Manufacturer pages").invoke()
+    pump(app, 5.0, until=lambda: status(app)[0].startswith("Could not open"))
+    assert status(app) == (
+        f"Could not open {MANUFACTURERS}: no desktop shell runs in this session",
+        theme.WARNING,
+    )
+    assert opened == []
+    assert app.errors == []
+
+
+def test_the_certificate_check_while_installing_is_listed_with_the_passed_checks(
+    make_app: AppFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    opened = fixes_recorder(monkeypatch)
+    app, _ = make_app(
+        elevated=False,
+        health_update_scan_due=False,
+        health_check_overrides={"secure_boot_certificates": CERTIFICATES_INSTALLING},
+    )
+    panel = open_security(app)
+    # It costs no points, so it is not under "To fix".
+    fix_ids = [row.check_id for row in panel.fix_frame.winfo_children() if isinstance(row, CheckRow)]
+    assert fix_ids == ["remote_assistance", "file_extensions"]
+    row = panel.rows["secure_boot_certificates"]
+    assert row.compact and row.informational
+    panel.passed_button.invoke()
+    pump(app, 0.3)
+    assert row.chip_label is not None and row.chip_label.cget("text") == "Info"
+    assert row.detail_label is not None and row.detail_label.winfo_ismapped()
+    assert LINK_NOTE in row.notes
+    button(row, "Find the recovery key").invoke()
+    button(row, "Open Windows Update").invoke()
+    assert opened == [MICROSOFT_LINKS[5], "ms-settings:windowsupdate"]
+    assert app.errors == []
+
+
+@pytest.mark.parametrize(
+    "finding",
+    [CERTIFICATES_INSTALLING, CERTIFICATES_RESTART, CERTIFICATES_PAUSED],
+    ids=["installing", "restart", "paused"],
+)
+def test_an_informational_certificate_row_shows_its_whole_summary_and_every_fix(
+    make_app: AppFactory, finding: dict[str, Any]
+) -> None:
+    app, _ = make_app(
+        elevated=False,
+        health_update_scan_due=False,
+        health_check_overrides={"secure_boot_certificates": finding},
+    )
+    panel = open_security(app)
+    panel.passed_button.invoke()
+    row = panel.rows["secure_boot_certificates"]
+    assert row.compact and row.informational
+    assert [fix["label"] for fix, _ in row.fix_buttons] == [fix["label"] for fix in finding["fixes"]]
+    # The smallest window the sections are laid out for.
+    app.minsize(900, 560)
+    for width, height in FIT_SIZES:
+        resize_to(app, width, height)
+        pump(app, 0.3)
+        right = row.winfo_rootx() + row.winfo_width()
+        summary = row.summary_label
+        # The summary is one line that never wraps, so it must get the whole width it needs.
+        assert summary.winfo_width() >= summary.winfo_reqwidth(), (width, height)
+        assert summary.winfo_rootx() + summary.winfo_width() <= right, (width, height)
+        for fix, fix_button in row.fix_buttons:
+            assert fix_button.winfo_ismapped(), (fix["label"], width, height)
+            assert fix_button.winfo_rootx() + fix_button.winfo_width() <= right, (fix["label"], width, height)
+    assert app.errors == []
+
+
+def test_the_task_scheduler_fix_opens_the_tool(make_app: AppFactory) -> None:
+    app, engine = make_app(
+        elevated=True,
+        health_update_scan_due=False,
+        health_check_overrides={"secure_boot_certificates": CERTIFICATES_TASK_OFF},
+    )
+    # Task Scheduler is one of the engine's fix tools; this fake's tool list is shorter.
+    tools: list[str] = []
+    engine.tools_open_windows = tools.append  # type: ignore[method-assign]
+    panel = open_security(app)
+    row = panel.rows["secure_boot_certificates"]
+    assert [fix["label"] for fix, _ in row.fix_buttons] == ["Open Task Scheduler", "Troubleshooting guide"]
+    button(row, "Open Task Scheduler").invoke()
+    pump(app, 5.0, until=lambda: status(app)[0] == "Opened Task Scheduler.")
+    assert tools == ["task_scheduler"]
+    assert app.errors == []
+
+
+def test_remote_assistance_is_turned_off_through_the_journaled_flow(make_app: AppFactory) -> None:
+    app, engine = make_app(
+        elevated=True,
+        health_update_scan_due=False,
+        extra_tweaks=[("security.remote_assistance", "security", True)],
+    )
+    panel = open_security(app)
+    row = panel.rows["remote_assistance"]
+    assert [fix["label"] for fix, _ in row.fix_buttons] == [
+        "Turn off Remote Assistance",
+        "Open Remote settings",
+    ]
+    button(row, "Turn off Remote Assistance").invoke()
+    confirm_dialog_text(app)
+    pump(app, 5.0, until=lambda: bool(engine.calls_named("apply")))
+    assert engine.calls_named("apply") == [(["security.remote_assistance"], "try", False)]
+    # The change makes the checkup outdated; Security is visible, so it is read again.
+    pump(
+        app,
+        5.0,
+        until=lambda: len(engine.calls_named("health_security_checkup")) == 2 and checkup_loaded(app),
+    )
+    assert app.errors == []
+
+
+def test_about_project_page_uses_open_link(make_app: AppFactory, monkeypatch: pytest.MonkeyPatch) -> None:
+    opened = fixes_recorder(monkeypatch)
+    app, engine = make_app(elevated=True, health_update_scan_due=False)
+    pump(app, 5.0, until=lambda: scanned(app))
+    app.show_about()
+    dialog = next_dialog(app)
+    dialog_button(dialog, "Project page").invoke()
+    pump(app, 5.0, until=lambda: bool(engine.calls_named("open_url")) and idle(app))
+    assert engine.calls_named("open_url") == [(PROJECT_URL,)]
+    assert opened == []
+    dialog.confirm_button.invoke()
+    assert app.errors == []
+
+
 def test_tool_fixes(make_app: AppFactory) -> None:
     app, engine = make_app(
         elevated=False, health_update_scan_due=False, health_check_overrides={"uac": UAC_ATTENTION}
@@ -433,7 +785,10 @@ def test_the_tweak_fix_waits_for_a_scan(make_app: AppFactory) -> None:
     app._last_scan = None
     button(panel.rows["file_extensions"], "Show file extensions").invoke()
     pump(app, 0.3)
-    assert status(app) == ("Run a scan first: open Optimize to show file extensions.", theme.WARNING)
+    assert status(app) == (
+        "Run a scan first: open Optimize, then choose “Show file extensions” again.",
+        theme.WARNING,
+    )
     assert app.current_section == "Optimize"
     assert dialogs(app) == []
     assert engine.calls_named("apply") == []
@@ -762,6 +1117,18 @@ def test_polling_slows_down_while_security_is_hidden(make_app: AppFactory) -> No
 def test_security_fits_the_window(make_app: AppFactory) -> None:
     # A standard user: the header carries the notes and "Restart as administrator".
     app, _ = make_app(elevated=False, health_update_scan_due=False)
+    open_security(app)
+    assert_section_fits(app, SECURITY_SECTION)
+
+
+def test_security_fits_with_a_certificate_finding(make_app: AppFactory) -> None:
+    # A blocked certificate update under "To fix": the header still fits. The rows scroll, so
+    # assert_section_fits does not measure them; the informational rows have their own test.
+    app, _ = make_app(
+        elevated=True,
+        health_update_scan_due=False,
+        health_check_overrides={"secure_boot_certificates": CERTIFICATES_BLOCKED},
+    )
     open_security(app)
     assert_section_fits(app, SECURITY_SECTION)
 

@@ -18,9 +18,10 @@ use super::step::{
 use super::system::ProfileSystem;
 use super::OP_APPLY_PROFILE;
 use crate::debloat::catalog::{self, Action, RestartNeed, Tweak};
+use crate::debloat::requirements::Unavailable;
 use crate::debloat::{
     ActionState, ActionStatus, ApplyReport, Category, Engine, ItemKind, ItemOutcome, ItemResult,
-    ItemState, ScanItem, ScanReport,
+    ItemState, Mismatch, ScanItem, ScanReport,
 };
 use crate::network::{
     canonical_guid, Adapter, AdapterKind, ChangeOutcome, DnsChange, DnsConfig, DnsMode, DnsReport,
@@ -33,7 +34,6 @@ use crate::startup::{StartupEntry, StartupSource};
 use crate::{Error, Result};
 
 pub(crate) struct FakeProfiles {
-    _dir: tempfile::TempDir,
     pub journal: Arc<Journal>,
     engine: Engine,
     pub elevated: bool,
@@ -62,8 +62,13 @@ pub(crate) struct FakeProfiles {
     pub partial: HashSet<String>,
     /// Startup ids whose toggle reports this outcome instead of Applied.
     pub startup_outcomes: HashMap<String, MutationOutcome>,
+    /// Row keys of tweaks whose applied result reports these targets as not kept.
+    pub not_kept: HashMap<String, Vec<Mismatch>>,
     pub reads: RefCell<Vec<&'static str>>,
     pub calls: RefCell<Vec<String>>,
+    /// Declared last because fields drop in declaration order: the folder can be removed only
+    /// after the journal in it is closed.
+    _dir: tempfile::TempDir,
 }
 
 impl FakeProfiles {
@@ -94,6 +99,7 @@ impl FakeProfiles {
             fail: HashSet::new(),
             partial: HashSet::new(),
             startup_outcomes: HashMap::new(),
+            not_kept: HashMap::new(),
             reads: RefCell::new(Vec::new()),
             calls: RefCell::new(Vec::new()),
         }
@@ -204,6 +210,7 @@ impl ProfileSystem for FakeProfiles {
                     id: id.clone(),
                     outcome: ItemOutcome::Failed,
                     details: vec!["access denied".into()],
+                    not_kept: Vec::new(),
                 });
                 continue;
             }
@@ -232,12 +239,14 @@ impl ProfileSystem for FakeProfiles {
                         "first change: applied".into(),
                         "next change: failed (access denied)".into(),
                     ],
+                    not_kept: Vec::new(),
                 }
             } else {
                 ItemResult {
                     id: id.clone(),
                     outcome: ItemOutcome::Applied,
                     details: vec!["applied".into()],
+                    not_kept: self.not_kept.get(&key).cloned().unwrap_or_default(),
                 }
             });
         }
@@ -321,9 +330,9 @@ impl ProfileSystem for FakeProfiles {
     }
 }
 
-/// Records the baseline of the first registry value of `t` under `safety`'s session, as a
-/// write that went through before a later action of the tweak failed. Tweaks without a
-/// registry value record nothing.
+/// Records the baseline of the first registry value of `t` under `safety`'s session and logs
+/// its write, as the safety layer does for a write that went through before a later action of
+/// the tweak failed. Tweaks without a registry value record nothing.
 fn record_first_value(safety: &Safety, t: &Tweak) -> Result<()> {
     let first = t.actions.iter().find_map(|action| match action {
         Action::Registry(r) => Some(r),
@@ -342,6 +351,12 @@ fn record_first_value(safety: &Safety, t: &Tweak) -> Result<()> {
                 created_root: None,
             },
         )?;
+        safety.log_op(
+            "set_registry_value",
+            &crate::safety::registry_target(r.hive, r.path, r.name),
+            "applied",
+            None,
+        )?;
     }
     Ok(())
 }
@@ -357,13 +372,15 @@ impl FakeProfiles {
                 StepOutcome::Applied
             },
             details: vec![if failed { "access denied" } else { "set" }.to_string()],
+            not_kept: Vec::new(),
         }
     }
 }
 
 // ───────────────────────────── fixtures ─────────────────────────────
 
-/// Scan item of catalog tweak `id` in `state`.
+/// Scan item of catalog tweak `id` in `state`. A retired tweak carries its retired kind and
+/// reason, as the engine reports it.
 pub(crate) fn scan_item(id: &str, state: ItemState) -> ScanItem {
     let t = catalog::tweak(id).unwrap_or_else(|| panic!("{id} is not a catalog tweak"));
     let action = match state {
@@ -378,12 +395,18 @@ pub(crate) fn scan_item(id: &str, state: ItemState) -> ScanItem {
         title: t.title.to_string(),
         description: t.description.to_string(),
         risk: t.risk,
-        recommended: t.default_on,
+        recommended: t.default_on && t.retired.is_none(),
         state,
         restart: t.restart,
         actions: vec![ActionStatus::new(action, format!("{id} action"))],
         revertible: false,
-        note: None,
+        note: t.retired.map(str::to_string),
+        topic: Some(t.topic),
+        unavailable: t.retired.map(|_| Unavailable::Retired),
+        undo_limit: t.undo_limit.map(str::to_string),
+        former: Vec::new(),
+        mode_undo: t.default_on || catalog::FORMERLY_RECOMMENDED.contains(&t.id),
+        drift: Vec::new(),
     }
 }
 
@@ -411,6 +434,12 @@ pub(crate) fn appx_item(name: &str, state: ItemState) -> ScanItem {
         )],
         revertible: false,
         note: None,
+        topic: None,
+        unavailable: None,
+        undo_limit: None,
+        former: Vec::new(),
+        mode_undo: entry.default_on,
+        drift: Vec::new(),
     }
 }
 
@@ -423,6 +452,7 @@ pub(crate) fn scan_report(items: Vec<ScanItem>) -> ScanReport {
         warnings: Vec::new(),
         duration_ms: 1,
         appx_unavailable: None,
+        windows: None,
     }
 }
 

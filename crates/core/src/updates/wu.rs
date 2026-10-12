@@ -255,6 +255,12 @@ fn target_text(target: &RegistryTarget) -> String {
     format!("{}\\{}\\{}", target.hive.short(), target.key_path, name)
 }
 
+/// The six values of a pause on this PC. Windows itself rewrites and removes them as a pause
+/// runs out, so they are never read back or checked for drift.
+pub(crate) fn pause_targets() -> Vec<RegistryTarget> {
+    WuLayout::system().targets(WuSettingId::Pause)
+}
+
 // ───────────────────────────── Environment ─────────────────────────────
 
 /// Windows' edition and version.
@@ -1549,6 +1555,7 @@ pub(crate) fn profile_apply_in_with(
             key: key.clone(),
             outcome,
             details,
+            not_kept: Vec::new(),
         };
         let Some((_, _, change)) = changes.iter().find(|(k, _, _)| *k == key.as_str()) else {
             let known = [

@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use crate::safety::rollback::RegistryTarget;
 use crate::safety::{MutationOutcome, Safety};
 use crate::win::filetime::now as filetime_now;
-use crate::win::registry::{Hive, Key, RegValue};
+use crate::win::registry::{path_within, Hive, Key, RegValue};
 use crate::win::session;
 use crate::{Error, Result};
 
@@ -368,6 +368,73 @@ fn approved_disabled_value(filetime: u64) -> Vec<u8> {
     data
 }
 
+// ───────────────────────────── startup switches ─────────────────────────────
+
+/// The kind of registry value that turns a startup entry on or off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Switch {
+    /// The StartupApproved value of a Run key or Startup folder entry.
+    Approved,
+    /// The `State` value of a packaged app's startup task.
+    PackagedTask,
+}
+
+/// Whether a startup entry is on, as its switch value encodes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SwitchState {
+    On,
+    Off,
+    /// A packaged startup task without a `State` value.
+    Missing,
+}
+
+/// Whether `hive`, `key_path` and `value_name` name a startup switch: the StartupApproved
+/// value of a Run key or Startup folder entry, or the `State` value of a packaged app's startup
+/// task.
+pub(crate) fn is_switch(hive: Hive, key_path: &str, value_name: &str) -> bool {
+    SYSTEM.switch(hive, key_path, value_name).is_some()
+}
+
+/// The state a startup switch value encodes (`value` is `None` when the value is absent). A
+/// StartupApproved value is off when its first byte is odd and on otherwise, a missing value
+/// included, as Task Manager reads it, whatever time stamp follows the first byte. A packaged
+/// task's `State` is on while the task is enabled, by the user or by policy, and `Missing` when
+/// the value is gone. `None` for any other registry value.
+pub(crate) fn switch_state(
+    hive: Hive,
+    key_path: &str,
+    value_name: &str,
+    value: Option<&RegValue>,
+) -> Option<SwitchState> {
+    SYSTEM.switch_state(hive, key_path, value_name, value)
+}
+
+/// "on" or "off" for a startup switch value, as reports show it; `None` for any other
+/// registry value.
+pub(crate) fn describe_approved(
+    hive: Hive,
+    key_path: &str,
+    value_name: &str,
+    value: &RegValue,
+) -> Option<&'static str> {
+    match switch_state(hive, key_path, value_name, Some(value))? {
+        SwitchState::On => Some("on"),
+        SwitchState::Off => Some("off"),
+        SwitchState::Missing => None,
+    }
+}
+
+/// Whether `key_path` is a startup task key `<family>\<task>` directly below `root`.
+fn is_task_key(key_path: &str, root: &str) -> bool {
+    if !path_within(key_path, root) || key_path.len() <= root.len() {
+        return false;
+    }
+    match key_path[root.len() + 1..].split_once('\\') {
+        Some((family, task)) => !family.is_empty() && !task.is_empty() && !task.contains('\\'),
+        None => false,
+    }
+}
+
 // ───────────────────────────── layout ─────────────────────────────
 
 /// Registry locations the scan reads and `set_enabled` writes. [`SYSTEM`] is the real
@@ -454,6 +521,53 @@ impl Layout<'_> {
             hive: source.approved_hive(),
             key_path: self.approved_key(source)?,
             value_name: key.to_string(),
+        })
+    }
+
+    /// The kind of startup switch `hive`, `key_path` and `value_name` name in this layout,
+    /// if any; see [`is_switch`].
+    fn switch(&self, hive: Hive, key_path: &str, value_name: &str) -> Option<Switch> {
+        let approved = !value_name.is_empty()
+            && StartupSource::ALL.into_iter().any(|source| {
+                source.approved_hive() == hive
+                    && self
+                        .approved_key(source)
+                        .is_some_and(|key| key.eq_ignore_ascii_case(key_path))
+            });
+        if approved {
+            return Some(Switch::Approved);
+        }
+        let root = self.packaged_root?;
+        let task = hive == Hive::CurrentUser
+            && value_name.eq_ignore_ascii_case(packaged::STATE_VALUE)
+            && is_task_key(key_path, root);
+        task.then_some(Switch::PackagedTask)
+    }
+
+    /// The state a startup switch value of this layout encodes; see [`switch_state`].
+    fn switch_state(
+        &self,
+        hive: Hive,
+        key_path: &str,
+        value_name: &str,
+        value: Option<&RegValue>,
+    ) -> Option<SwitchState> {
+        Some(match self.switch(hive, key_path, value_name)? {
+            Switch::Approved => {
+                let data = value.map(RegValue::to_bytes);
+                if approved_is_enabled(data.as_deref()) {
+                    SwitchState::On
+                } else {
+                    SwitchState::Off
+                }
+            }
+            Switch::PackagedTask => match value {
+                None => SwitchState::Missing,
+                Some(RegValue::Dword(raw)) if TaskState::from_raw(*raw).is_enabled() => {
+                    SwitchState::On
+                }
+                Some(_) => SwitchState::Off,
+            },
         })
     }
 
@@ -666,4 +780,196 @@ impl Layout<'_> {
 
 fn path_exists(path: &str) -> bool {
     !path.is_empty() && Path::new(path).exists()
+}
+
+#[cfg(test)]
+mod switch_tests {
+    use super::*;
+
+    /// The per-user StartupApproved values of the Run key.
+    const USER_APPROVED_RUN: &str =
+        r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
+    const FAMILY: &str = "Contoso.App_0000000000000";
+
+    fn task_key() -> String {
+        packaged::task_key_path(packaged::TASKS_ROOT, FAMILY, "StartTask")
+    }
+
+    #[test]
+    fn startup_switches_are_approved_values_and_packaged_task_states() {
+        let approved =
+            |hive, subkey: &str| is_switch(hive, &format!(r"{APPROVED_ROOT}\{subkey}"), "Contoso");
+        assert!(approved(Hive::CurrentUser, "Run"));
+        assert!(approved(Hive::CurrentUser, "StartupFolder"));
+        assert!(approved(Hive::LocalMachine, "Run"));
+        assert!(approved(Hive::LocalMachine, "Run32"));
+        assert!(approved(Hive::LocalMachine, "StartupFolder"));
+        assert!(
+            !approved(Hive::CurrentUser, "Run32"),
+            "no per-user source uses Run32"
+        );
+        assert!(is_switch(
+            Hive::CurrentUser,
+            &USER_APPROVED_RUN.to_ascii_uppercase(),
+            "contoso"
+        ));
+        assert!(!is_switch(Hive::CurrentUser, USER_APPROVED_RUN, ""));
+        assert!(!is_switch(Hive::CurrentUser, USER_RUN_KEY, "Contoso"));
+        assert!(!is_switch(
+            Hive::CurrentUser,
+            &format!(r"{USER_APPROVED_RUN}\Deeper"),
+            "Contoso"
+        ));
+
+        let key = task_key();
+        assert!(is_switch(Hive::CurrentUser, &key, "State"));
+        assert!(is_switch(
+            Hive::CurrentUser,
+            &key.to_ascii_lowercase(),
+            "state"
+        ));
+        assert!(!is_switch(
+            Hive::CurrentUser,
+            &key,
+            "UserEnabledStartupOnce"
+        ));
+        assert!(!is_switch(Hive::LocalMachine, &key, "State"));
+        let family_key = format!(r"{}\{FAMILY}", packaged::TASKS_ROOT);
+        assert!(!is_switch(Hive::CurrentUser, &family_key, "State"));
+        assert!(!is_switch(
+            Hive::CurrentUser,
+            &format!(r"{key}\Deeper"),
+            "State"
+        ));
+        assert!(!is_switch(
+            Hive::LocalMachine,
+            r"SOFTWARE\Policies\Microsoft\Windows\DataCollection",
+            "AllowTelemetry"
+        ));
+    }
+
+    #[test]
+    fn switch_states_follow_the_first_byte_and_the_task_state() {
+        let approved = |value: Option<RegValue>| {
+            switch_state(
+                Hive::CurrentUser,
+                USER_APPROVED_RUN,
+                "Contoso",
+                value.as_ref(),
+            )
+        };
+        let binary = |data: &[u8]| Some(RegValue::Binary(data.to_vec()));
+        assert_eq!(
+            approved(Some(RegValue::Binary(approved_enabled_value()))),
+            Some(SwitchState::On)
+        );
+        let disabled = approved_disabled_value(0x01dc_0000_0000_0000);
+        assert_eq!(
+            approved(Some(RegValue::Binary(disabled))),
+            Some(SwitchState::Off)
+        );
+        assert_eq!(approved(binary(&[0x07, 0, 0, 0])), Some(SwitchState::Off));
+        assert_eq!(approved(binary(&[0x06, 0, 0, 0])), Some(SwitchState::On));
+        assert_eq!(approved(binary(&[])), Some(SwitchState::On));
+        assert_eq!(
+            approved(None),
+            Some(SwitchState::On),
+            "a missing value is on"
+        );
+
+        let key = task_key();
+        let task = |value: Option<RegValue>| {
+            switch_state(Hive::CurrentUser, &key, "State", value.as_ref())
+        };
+        assert_eq!(task(Some(RegValue::Dword(2))), Some(SwitchState::On));
+        assert_eq!(task(Some(RegValue::Dword(4))), Some(SwitchState::On));
+        assert_eq!(task(Some(RegValue::Dword(0))), Some(SwitchState::Off));
+        assert_eq!(task(Some(RegValue::Dword(1))), Some(SwitchState::Off));
+        assert_eq!(task(Some(RegValue::Dword(3))), Some(SwitchState::Off));
+        assert_eq!(task(Some(RegValue::Sz("2".into()))), Some(SwitchState::Off));
+        assert_eq!(task(None), Some(SwitchState::Missing));
+        assert_eq!(
+            switch_state(
+                Hive::CurrentUser,
+                r"Software\PCOptimizer\SelfTest\Example",
+                "Value",
+                Some(&RegValue::Dword(1))
+            ),
+            None
+        );
+
+        let describe = |key_path: &str, name: &str, value: RegValue| {
+            describe_approved(Hive::CurrentUser, key_path, name, &value)
+        };
+        assert_eq!(
+            describe(
+                USER_APPROVED_RUN,
+                "Contoso",
+                RegValue::Binary(approved_enabled_value())
+            ),
+            Some("on")
+        );
+        assert_eq!(
+            describe(
+                USER_APPROVED_RUN,
+                "Contoso",
+                RegValue::Binary(approved_disabled_value(1))
+            ),
+            Some("off")
+        );
+        assert_eq!(describe(&key, "State", RegValue::Dword(2)), Some("on"));
+        assert_eq!(describe(&key, "State", RegValue::Dword(1)), Some("off"));
+        assert_eq!(describe(USER_RUN_KEY, "Contoso", RegValue::Dword(1)), None);
+    }
+
+    fn no_packages(_family: &str) -> Option<Vec<Package>> {
+        None
+    }
+
+    #[test]
+    fn a_layout_finds_the_switches_below_its_own_keys() {
+        let root = r"Software\PCOptimizer\SelfTest\StartupSwitch";
+        let approved_root = format!(r"{root}\StartupApproved");
+        let packaged_root = format!(r"{root}\Packaged");
+        let layout = Layout {
+            run_keys: &[],
+            approved_root: &approved_root,
+            folders: false,
+            packaged_root: Some(&packaged_root),
+            packages: no_packages,
+        };
+        let run = format!(r"{approved_root}\Run");
+        let task = packaged::task_key_path(&packaged_root, FAMILY, "StartTask");
+        assert_eq!(
+            layout.switch(Hive::CurrentUser, &run, "Contoso"),
+            Some(Switch::Approved)
+        );
+        assert_eq!(
+            layout.switch(Hive::CurrentUser, &task, "State"),
+            Some(Switch::PackagedTask)
+        );
+        assert_eq!(
+            layout.switch(Hive::CurrentUser, USER_APPROVED_RUN, "Contoso"),
+            None
+        );
+        assert_eq!(
+            layout.switch_state(
+                Hive::CurrentUser,
+                &run,
+                "Contoso",
+                Some(&RegValue::Binary(approved_disabled_value(7)))
+            ),
+            Some(SwitchState::Off)
+        );
+        assert!(!is_switch(Hive::CurrentUser, &run, "Contoso"));
+
+        let without_tasks = Layout {
+            packaged_root: None,
+            ..layout
+        };
+        assert_eq!(
+            without_tasks.switch(Hive::CurrentUser, &task, "State"),
+            None
+        );
+    }
 }

@@ -13,7 +13,8 @@ use optimizer_core::safety::state_log::Journal;
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum HealthCmd {
-    /// Security checkup: antivirus, firewall, updates, encryption, accounts. Read-only.
+    /// Security checkup: antivirus, firewall, updates, encryption, Secure Boot and its
+    /// certificates, accounts. Read-only.
     Security {
         /// Print the checkup as JSON.
         #[arg(long)]

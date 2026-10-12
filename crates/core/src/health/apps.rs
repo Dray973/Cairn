@@ -1,5 +1,5 @@
 //! Apps and browser: SmartScreen for apps and in Microsoft Edge, Smart App Control and file
-//! name extensions; checks 21 to 24. Edge's SmartScreen switch and the extension setting are
+//! name extensions; checks 22 to 25. Edge's SmartScreen switch and the extension setting are
 //! the signed-in user's own and are read from their hive.
 
 use super::checkup::{unreadable, Check, CheckId, FixAction, Severity};
@@ -120,7 +120,7 @@ fn apps_raw<'a>(
         .map_err(|e| Box::new(unreadable(id, detail, "the app settings", e)))
 }
 
-/// Check 21: SmartScreen for apps and files.
+/// Check 22: SmartScreen for apps and files.
 pub(crate) fn smartscreen(raw: &CheckupRaw) -> Check {
     const DETAIL: &str = "SmartScreen warns you before you run downloaded apps and files that \
         are unknown or known to be malicious.";
@@ -155,7 +155,7 @@ pub(crate) fn smartscreen(raw: &CheckupRaw) -> Check {
     }
 }
 
-/// Check 22: SmartScreen in Microsoft Edge.
+/// Check 23: SmartScreen in Microsoft Edge.
 pub(crate) fn edge_smartscreen(raw: &CheckupRaw) -> Check {
     const DETAIL: &str = "Edge blocks known phishing and malware sites with SmartScreen.";
     let a = match apps_raw(raw, CheckId::EdgeSmartscreen, DETAIL) {
@@ -184,7 +184,7 @@ pub(crate) fn edge_smartscreen(raw: &CheckupRaw) -> Check {
     }
 }
 
-/// Check 23: Smart App Control (information only, never scored).
+/// Check 24: Smart App Control (information only, never scored).
 pub(crate) fn smart_app_control(raw: &CheckupRaw) -> Check {
     const DETAIL: &str = "Smart App Control blocks apps that are unknown or known to be malicious.";
     let a = match apps_raw(raw, CheckId::SmartAppControl, DETAIL) {
@@ -208,7 +208,7 @@ pub(crate) fn smart_app_control(raw: &CheckupRaw) -> Check {
     }
 }
 
-/// Check 24: File Explorer shows file name extensions.
+/// Check 25: File Explorer shows file name extensions.
 pub(crate) fn file_extensions(raw: &CheckupRaw) -> Check {
     const DETAIL: &str = "With extensions hidden, a program named “invoice.pdf.exe” looks like \
         “invoice.pdf”.";

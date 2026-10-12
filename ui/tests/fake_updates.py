@@ -16,17 +16,20 @@ started and nothing on the system is read or written. Options (`FakeEngine(**opt
   {"SetDisablePauseUXAccess": 1}.
 - `wu_service` ("manual") and `wu_restart_pending` (False): the Windows Update service and a
   pending restart.
-- `app_list` (None): the install list; None is the six generic defaults.
+- `app_list` (None): the account's own install list; None is the nine generic defaults, one per
+  category. An own list comes with the defaults' ids in `default_ids`, as the engine's does.
 - `now` ("2026-09-25T10:00:00Z"): the time the fake engine sees.
 - `wu_fail` (None): a setting id whose real change raises RuntimeError.
 
 Jobs start "running" with no result (revision 0) and change only when a test drives them:
 `updates_emit`, `updates_progress`, `updates_item`, `updates_finish`, `updates_finish_scan`
-and `updates_lose`. Snapshots and views are built with `fake_jobs.host_snapshot` and
-`fake_jobs.host_view`, so they have exactly the engine's keys; while an app of a batch runs,
-the snapshot's `detail` is `{"item": index, "progress": text or None}`, as the engine's. A
-batch item's `retry` is True unless `updates_item` says otherwise, as for a failure the engine
-knows a retry can't change.
+and `updates_lose`. `updates_finish(..., pending_restart=True)` ends a batch during which
+Windows' pending-restart flags turned on: its result says `pending_restart` and every app that
+succeeded carries the engine's note. Snapshots and views are built with
+`fake_jobs.host_snapshot` and `fake_jobs.host_view`, so they have exactly the engine's keys;
+while an app of a batch runs, the snapshot's `detail` is `{"item": index, "progress": text or
+None}`, as the engine's. A batch item's `retry` is True unless `updates_item` says otherwise,
+as for a failure the engine knows a retry can't change.
 Windows Update changes are journaled like the engine's registry records: the first change of
 a value keeps its original, and the journal hooks export, count and revert them. Pausing while
 a pause runs extends it as the engine does: only the end values move, to at most 35 days after
@@ -48,6 +51,12 @@ PACKAGE_FULL_NAME = "Microsoft.DesktopAppInstaller_1.29.380.0_x64__8wekyb3d8bbwe
 WINGET_PATH = f"C:\\Program Files\\WindowsApps\\{PACKAGE_FULL_NAME}\\winget.exe"
 STORE_URI = "ms-windows-store://pdp/?ProductId=9NBLGGH4NNS1"
 MIN_VERSION = "1.6.0"
+# The warning of a check that could not read winget's list of installed apps, worded like the
+# engine's.
+INVENTORY_UNREAD_WARNING = "winget's list of installed apps could not be read: invalid JSON"
+# The note the engine puts on every app of a batch that succeeded while Windows' pending-restart
+# flags turned on.
+PENDING_RESTART_TEXT = "Windows reports a pending restart; restart Windows to finish."
 NOW = "2026-09-25T10:00:00Z"
 UX_SETTINGS = "SOFTWARE\\Microsoft\\WindowsUpdate\\UX\\Settings"
 WU_POLICY = "SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate"
@@ -114,10 +123,23 @@ DEFAULT_APPS: tuple[dict[str, str], ...] = (
     {"id": "Fabrikam.Chat", "name": "Fabrikam Chat", "category": "chat", "source": "winget"},
     {"id": "Northwind.Game", "name": "Northwind Game", "category": "gaming", "source": "winget"},
     {"id": "Tailspin.Media", "name": "Tailspin Media", "category": "media", "source": "winget"},
+    {"id": "Wingtip.Studio", "name": "Wingtip Studio", "category": "creative", "source": "winget"},
     {"id": "Contoso.Editor", "name": "Contoso Editor", "category": "productivity", "source": "winget"},
+    {"id": "Adatum.Tools", "name": "Adatum Tools", "category": "utilities", "source": "winget"},
+    {"id": "Fabrikam.Vault", "name": "Fabrikam Vault", "category": "security", "source": "winget"},
     {"id": "Litware.Dev", "name": "Litware Dev", "category": "developer", "source": "winget"},
 )
-CATEGORIES = ("browsers", "chat", "gaming", "media", "productivity", "utilities", "developer")
+CATEGORIES = (
+    "browsers",
+    "chat",
+    "gaming",
+    "media",
+    "creative",
+    "productivity",
+    "utilities",
+    "security",
+    "developer",
+)
 KINDS = ("scan", "upgrade", "install")
 JOB_KINDS = {"scan": "winget_scan", "upgrade": "winget_upgrade", "install": "winget_install"}
 ALREADY_RUNNING = {
@@ -503,6 +525,7 @@ class FakeUpdates:
                 "total": len(job["items"]),
                 "stopping": False,
                 "restart_required": False,
+                "pending_restart": False,
             }
         return job["result"]
 
@@ -562,12 +585,26 @@ class FakeUpdates:
             job["snapshot"]["restart_required"] = result["restart_required"]
             self._publish(job, result)
 
-    def updates_finish(self, job_id: int, state: str = "succeeded", summary: str | None = None) -> None:
-        """Ends a job in `state`; a batch without a result publishes its queued items first."""
+    def updates_finish(
+        self,
+        job_id: int,
+        state: str = "succeeded",
+        summary: str | None = None,
+        pending_restart: bool = False,
+    ) -> None:
+        """Ends a job in `state`; a batch without a result publishes its queued items first.
+        `pending_restart` publishes a batch whose run turned on Windows' pending-restart flags,
+        as the engine does: the result says so and every app that succeeded carries the note."""
         with self._updates_lock:
             job = self._updates_jobs[job_id]
-            if job["kind"] != "scan" and job["result"] is None:
-                self._publish(job, self._batch_result(job))
+            if job["kind"] != "scan" and (job["result"] is None or pending_restart):
+                result = self._batch_result(job)
+                if pending_restart:
+                    result["pending_restart"] = True
+                    for item in result["items"]:
+                        if item["state"] == "succeeded":
+                            item["message"] = PENDING_RESTART_TEXT
+                self._publish(job, result)
             snapshot = job["snapshot"]
             snapshot["state"] = state
             snapshot["finished_at"] = self._updates_now
@@ -582,8 +619,11 @@ class FakeUpdates:
         error: dict[str, Any] | str | None = None,
         warnings: tuple[str, ...] | list[str] = (),
         unparsed_rows: int = 0,
+        inventory_complete: bool = True,
     ) -> None:
-        """Publishes a check's result (the options' rows and ids unless given) and ends it."""
+        """Publishes a check's result (the options' rows and ids unless given) and ends it.
+        `inventory_complete` False publishes what the engine does when winget's list of installed
+        apps could not be read: no installed ids, `inventory_complete` False and a warning."""
         if isinstance(error, str):
             error = {"code": None, "message": error, "availability": None, "outdated": False}
         if error is None and self._winget == "outdated":
@@ -600,10 +640,12 @@ class FakeUpdates:
             "winget_version": self._winget_version,
             "checked_at": self._updates_now,
             "upgrades": [] if error else copy.deepcopy(rows),
-            "installed": list(self._installed_ids if installed is None else installed),
-            "inventory_complete": True,
+            "installed": (
+                list(self._installed_ids if installed is None else installed) if inventory_complete else []
+            ),
+            "inventory_complete": inventory_complete,
             "unparsed_rows": unparsed_rows,
-            "warnings": list(warnings),
+            "warnings": list(warnings) + ([] if inventory_complete else [INVENTORY_UNREAD_WARNING]),
             "error": error,
         }
         with self._updates_lock:
@@ -925,6 +967,7 @@ class FakeUpdates:
             "custom": self._apps_custom,
             "path": APP_LIST_PATH,
             "warnings": [],
+            "default_ids": [a["id"] for a in DEFAULT_APPS] if self._apps_custom else [],
         }
 
     def updates_save_app_list(self, apps: list[dict[str, Any]] | None = None) -> dict[str, Any]:

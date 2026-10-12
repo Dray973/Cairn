@@ -98,6 +98,18 @@ def test_every_consent_store_records_its_own_value_and_time() -> None:
     assert snapshot()["ConsentStores"] == "$consentStores"
 
 
+def test_restore_points_are_not_read_without_elevation() -> None:
+    # Get-ComputerRestorePoint needs administrator rights; unelevated the script records
+    # "not read" instead of an empty list that would read as "no restore points".
+    script = text()
+    assert "$isElevated = " in script
+    assert "if ($isElevated) {" in script
+    assert "$restorePoints = 'not read'" in script
+    assert snapshot()["RestorePointSequenceNumbers"] == "$restorePoints"
+    # The Secure Boot task shares the one elevation check.
+    assert "if (-not $isElevated) {" in script
+
+
 def test_the_location_sensor_override_is_recorded() -> None:
     # A record of the location switch for the whole PC also names the location sensor's override.
     [sensor] = [r for r in recorded_rows() if r["value_name"] == SENSOR_VALUE]

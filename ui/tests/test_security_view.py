@@ -1,12 +1,15 @@
 """Pure helpers of the Security section: sorting, severity chips and colours, score texts,
-the Windows Update progress text, which fix buttons are enabled and the URI allowlist.
+the Windows Update progress text, which fix buttons are enabled, the URI allowlist and the
+allowlist of Microsoft web pages.
 
 Nothing here builds a window or calls the engine.
 """
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -17,9 +20,12 @@ from optimizer.widgets.security import (
     BITLOCKER_URI,
     BUSY_NOTE,
     LEFT_OUT_TEXT,
+    LINK_NOTE,
+    MICROSOFT_LINKS,
     PER_USER_NOTE,
     READ_ONLY_TEXT,
     SEVERITY_CHIPS,
+    allowed_link,
     allowed_uri,
     elapsed_text,
     fix_state,
@@ -31,7 +37,11 @@ from optimizer.widgets.security import (
     state_style,
 )
 
+from . import fake_health
 from .fake_health import CHECKS, check, score_of
+
+# The engine's checkup source, read for its allowlisted web pages (absent outside a checkout).
+CHECKUP_SOURCE = Path(__file__).resolve().parents[2] / "crates" / "core" / "src" / "health" / "checkup.rs"
 
 
 def fix(kind: str, **action: Any) -> dict[str, Any]:
@@ -164,6 +174,61 @@ def test_fix_state_of_tools_and_other_actions() -> None:
         assert fix_state(ra, other, elevated=False, other_user=None, busy=True) == (True, "")
 
 
+def test_fix_state_of_a_link() -> None:
+    certificates = check("secure_boot_certificates", "attention", "Not installed yet", "low")
+    link = fix("link", url="https://aka.ms/getsecureboot")
+    # Opening a web page changes nothing, so it never waits, and it says where it goes.
+    for elevated in (False, True):
+        for busy in (False, True):
+            assert fix_state(certificates, link, elevated=elevated, other_user=None, busy=busy) == (
+                True,
+                LINK_NOTE,
+            )
+    assert LINK_NOTE == "Opens a Microsoft page in your web browser."
+
+
+@pytest.mark.parametrize("url", MICROSOFT_LINKS)
+def test_allowed_links(url: str) -> None:
+    assert allowed_link(url)
+    # A web page is never a settings page.
+    assert not allowed_uri(url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://aka.ms/getsecureboot/",
+        "http://aka.ms/getsecureboot",
+        "https://support.microsoft.com/topic/00000000-0000-0000-0000-000000000000",
+        "https://aka.ms/getsecureboot?x=1",
+        "HTTPS://AKA.MS/GETSECUREBOOT",
+        " https://aka.ms/getsecureboot",
+        "https://github.com/Dray973/Cairn",
+        "ms-settings:windowsupdate",
+        "",
+    ],
+)
+def test_refused_links(url: str) -> None:
+    assert not allowed_link(url)
+
+
+def test_the_links_are_six_microsoft_pages_and_the_fake_agrees() -> None:
+    assert len(MICROSOFT_LINKS) == len(set(MICROSOFT_LINKS)) == 6
+    assert all(url.startswith("https://") for url in MICROSOFT_LINKS)
+    assert tuple(fake_health.MICROSOFT_LINKS) == tuple(MICROSOFT_LINKS)
+
+
+def test_the_links_match_the_engine_source() -> None:
+    """The web pages the engine's checkup source names are exactly this allowlist (the bridge
+    test compares the deployed engine's list)."""
+    if not CHECKUP_SOURCE.is_file():
+        pytest.skip(f"no engine source at {CHECKUP_SOURCE}")
+    source = CHECKUP_SOURCE.read_text(encoding="utf-8")
+    production = source.split("\n#[cfg(test)]", 1)[0]
+    named = re.findall(r'"(https://[^"]+)"', production)
+    assert sorted(named) == sorted(MICROSOFT_LINKS)
+
+
 @pytest.mark.parametrize(
     "uri",
     [
@@ -226,4 +291,11 @@ def test_fake_score_matches_the_engine_vectors() -> None:
     assert (two_high["value"], two_high["grade"]) == (60, "fair")
     unknown = score_of([check("tpm", "unknown", "x"), check("tpm", "checking", "x")])
     assert (unknown["value"], unknown["unknown"], unknown["checked"]) == (100, 2, 0)
-    assert len(CHECKS) == 24
+    assert len(CHECKS) == 25
+
+
+def test_the_fake_lists_the_certificate_check_after_secure_boot() -> None:
+    ids = [c[0] for c in CHECKS]
+    at = ids.index("secure_boot_certificates")
+    assert ids[at - 1] == "secure_boot"
+    assert CHECKS[at] == ("secure_boot_certificates", "device", "Secure Boot certificates", "medium")

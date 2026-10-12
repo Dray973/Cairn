@@ -6,24 +6,29 @@ search Windows Update online or install or upgrade apps (the engine refuses each
 folder: `OPTIMIZER_DATA_DIR` points at a throwaway folder before anything loads the engine,
 and `tmp_path` folders are created inside it unless `--basetemp` is given.
 No test may relaunch the process elevated, bring a window to the front, show a native message
-box, open File Explorer, a folder, a URI or a file dialog, or write the clipboard: those
-process helpers are replaced by stubs that fail the test that reaches them (a test that needs
-one replaces it with a recorder), and every window's Tk clipboard calls go to a list on the
-window (`app._test_clipboard`).
+box, open File Explorer, a folder, a URI, a web page or a file dialog, or write the clipboard:
+those process helpers, and the loaded engine module's `open_url`, are replaced by stubs that
+fail the test that reaches them (a test that needs one replaces it with a recorder), and every
+window's Tk clipboard calls go to a list on the window (`app._test_clipboard`).
 The windows of a run are created on a separate desktop that is never shown, so they neither
 appear on screen nor take the keyboard focus; `OPTIMIZER_SHOW_TEST_WINDOWS=1` keeps them on
 the user's desktop.
+With `CAIRN_REQUIRE_NATIVES=1` the run stops before collection, with exit code 3, when the
+engine module cannot be imported or the telemetry DLL is missing, so window and real-module
+tests cannot pass by being skipped. Unset, the natives are not even loaded here.
 """
 
 from __future__ import annotations
 
 import ctypes
+import functools
 import gc
 import importlib
 import os
 import shutil
+import sys
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Mapping
 from ctypes import wintypes
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -79,6 +84,42 @@ PROCESS_HELPERS = (
     "ask_save_path",
     "open_uri",
 )
+# Functions of the engine module that open something on the desktop.
+ENGINE_DESKTOP_FUNCTIONS = ("open_url",)
+
+# Set to "1" (CI) to stop the run when the natives cannot be loaded.
+REQUIRE_NATIVES = "CAIRN_REQUIRE_NATIVES"
+NATIVES_MISSING_EXIT = 3
+
+
+def missing_natives() -> list[str]:
+    """Why the natives cannot be used: the engine module's import error and a missing
+    telemetry DLL. Empty when both are there."""
+    from optimizer import NATIVE_DIR
+    from optimizer.bridge.engine import EngineUnavailable, load_engine_module
+
+    problems = []
+    try:
+        load_engine_module()
+    except EngineUnavailable as exc:
+        problems.append(str(exc))
+    dll = NATIVE_DIR / "optimizer_telemetry.dll"
+    if not dll.is_file():
+        problems.append(f"{dll} is missing")
+    return problems
+
+
+def natives_problem(
+    environ: Mapping[str, str], check: Callable[[], list[str]] = missing_natives
+) -> str | None:
+    """The reason to stop the run: only with `CAIRN_REQUIRE_NATIVES=1`, and only when `check`
+    finds a problem. Without the variable `check` is not called."""
+    if environ.get(REQUIRE_NATIVES) != "1":
+        return None
+    problems = check()
+    if not problems:
+        return None
+    return f"{REQUIRE_NATIVES}=1, but the natives cannot be used: {'; '.join(problems)}"
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -88,6 +129,11 @@ def pytest_configure(config: pytest.Config) -> None:
     # different integrity level.
     if not config.option.basetemp:
         config.option.basetemp = str(TEST_DATA_DIR / "pytest")
+    problem = natives_problem(os.environ)
+    if problem is not None:
+        # The session never starts, so its finish hook does not remove the folder.
+        shutil.rmtree(TEST_DATA_DIR, ignore_errors=True)
+        pytest.exit(problem, returncode=NATIVES_MISSING_EXIT)
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
@@ -106,14 +152,29 @@ def _failing_stub(name: str, reached: list[str]) -> Any:
     return stub
 
 
+def stub_engine_desktop_functions(
+    monkeypatch: pytest.MonkeyPatch, engine: object | None, reached: list[str]
+) -> None:
+    """Replaces the `ENGINE_DESKTOP_FUNCTIONS` of the engine module `engine` (None: not loaded)
+    with failing stubs. A stub keeps the real function's signature, which the signature tests
+    compare."""
+    for name in ENGINE_DESKTOP_FUNCTIONS:
+        real = getattr(engine, name, None)
+        if real is not None:
+            stub = functools.wraps(real)(_failing_stub(f"optimizer_engine.{name}", reached))
+            monkeypatch.setattr(engine, name, stub)
+
+
 @pytest.fixture(autouse=True)
 def _no_real_side_effects(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Fails any test that reaches one of the process helpers or the native clipboard."""
+    """Fails any test that reaches one of the process helpers, the native clipboard or, once a
+    test has loaded the engine module, its functions that open something on the desktop."""
     from optimizer import system
 
     reached: list[str] = []
     for name in PROCESS_HELPERS:
         monkeypatch.setattr(system, name, _failing_stub(name, reached))
+    stub_engine_desktop_functions(monkeypatch, sys.modules.get("optimizer_engine"), reached)
     try:
         system_info = importlib.import_module("optimizer.features.system_info")
     except ImportError:

@@ -2,8 +2,11 @@
 Windows starts and shutdowns.
 
 Both sections only read; nothing is journaled or logged. Fixes reuse the window's journaled
-flows ("Show file extensions" is the catalog tweak applied through `_on_item_action`, "Turn off
-at startup" is `_on_startup_toggle`) or open Windows' own settings pages and tools. The Windows
+flows ("Show file extensions" and "Turn off Remote Assistance" are catalog tweaks applied
+through `_on_item_action`, "Turn off at startup" is `_on_startup_toggle`), open Windows' own
+settings pages and tools, or open one of the allowlisted Microsoft web pages in the browser.
+`_open_link` is how the window opens a web page: while Cairn runs as administrator the engine
+hands it to the desktop shell, so the browser starts without administrator rights. The Windows
 Update search runs on an engine thread and is polled from the frame loop through the
 "security" job lane; closing the window asks it to stop and never waits for it.
 """
@@ -18,7 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 from .. import system, theme
 from ..widgets.dialogs import MessageDialog
-from ..widgets.security import allowed_uri
+from ..widgets.security import allowed_link, allowed_uri
 
 if TYPE_CHECKING:
     import customtkinter as ctk
@@ -51,7 +54,13 @@ SCAN_STATUS = "◐ Checking Windows Update…"
 SCAN_STATUS_ONLINE = "◐ Checking Windows Update online…"
 SCAN_RUNNING_TEXT = "Windows Update is already being checked."
 PER_USER_TEXT = "Your own settings can only be changed when Cairn runs as your account."
-NO_SCAN_TEXT = "Run a scan first: open Optimize to show file extensions."
+NO_SCAN_TEXT = "Run a scan first: open Optimize, then choose “{label}” again."
+REFUSED_PAGE_TEXT = "Cairn does not open {url}."
+OPEN_PAGE_FAILED_TEXT = "Could not open {url}: {error}"
+# While Cairn runs as administrator, a browser started by the window would run elevated too.
+OPEN_PAGE_YOURSELF_TEXT = (
+    "Open {url} in your browser: Cairn does not start a browser with administrator rights."
+)
 SECURITY_LANE = "security"
 
 
@@ -375,10 +384,12 @@ class HealthFeature:
         label = str(fix.get("label", ""))
         if kind == "uri":
             self._open_uri(str(action.get("uri", "")))
+        elif kind == "link":
+            self._open_link_fix(str(action.get("url", "")))
         elif kind == "windows_tool":
             self._open_fix_tool(str(action.get("tool", "")), label, bool(action.get("requires_admin")))
         elif kind == "tweak":
-            self._apply_fix_tweak(check, str(action.get("id", "")))
+            self._apply_fix_tweak(check, str(action.get("id", "")), label)
         elif kind == "update_scan":
             self._start_update_scan(bool(action.get("online")))
         elif kind == "elevate":
@@ -387,12 +398,43 @@ class HealthFeature:
     def _open_uri(self, uri: str) -> None:
         if not allowed_uri(uri):
             log.warning("refused to open %r: not an allowed settings page", uri)
-            self.set_status(f"Cairn does not open {uri}.", theme.WARNING)
+            self.set_status(REFUSED_PAGE_TEXT.format(url=uri), theme.WARNING)
             return
         try:
             system.open_uri(uri)
         except OSError as exc:
-            self.set_status(f"Could not open {uri}: {exc}", theme.WARNING)
+            self.set_status(OPEN_PAGE_FAILED_TEXT.format(url=uri, error=exc), theme.WARNING)
+
+    def _open_link_fix(self, url: str) -> None:
+        """Opens the Microsoft page of a link fix; any page outside the allowlist is refused."""
+        if not allowed_link(url):
+            log.warning("refused to open %r: not an allowed Microsoft page", url)
+            self.set_status(REFUSED_PAGE_TEXT.format(url=url), theme.WARNING)
+            return
+        self._open_link(url)
+
+    def _open_link(self, url: str) -> None:
+        """Opens the web page `url` in the browser. While Cairn runs as administrator the engine
+        hands the page to the desktop shell, which starts the browser without administrator
+        rights; the window itself never starts a browser then. Without administrator rights the
+        page opens with its registered handler."""
+        if not self.elevated:
+            try:
+                system.open_uri(url)
+            except OSError as exc:
+                self.set_status(OPEN_PAGE_FAILED_TEXT.format(url=url, error=exc), theme.WARNING)
+            return
+        if self.engine is None or not self.engine.supports("open_url"):
+            self.set_status(OPEN_PAGE_YOURSELF_TEXT.format(url=url), theme.WARNING)
+            return
+
+        def done(future: Future[Any]) -> None:
+            exc = future.exception()
+            if exc is not None:
+                log.warning("opening %r through the desktop shell failed: %s", url, exc)
+                self.set_status(OPEN_PAGE_FAILED_TEXT.format(url=url, error=exc), theme.WARNING)
+
+        self.engine.open_url(url, callback=done)
 
     def _open_fix_tool(self, tool: str, label: str, requires_admin: bool) -> None:
         if self.engine is None:
@@ -413,7 +455,7 @@ class HealthFeature:
 
         self.engine.open_windows_tool(tool, callback=done)
 
-    def _apply_fix_tweak(self, check: Mapping[str, Any], tweak_id: str) -> None:
+    def _apply_fix_tweak(self, check: Mapping[str, Any], tweak_id: str, label: str) -> None:
         other_user = (self.security_panel.checkup or {}).get("other_user", False)
         if check.get("per_user") and other_user is not False:
             self.set_status(PER_USER_TEXT, theme.WARNING)
@@ -421,7 +463,7 @@ class HealthFeature:
         items = (self._last_scan or {}).get("items") or []
         item = next((i for i in items if i.get("id") == tweak_id), None)
         if item is None:
-            self.set_status(NO_SCAN_TEXT, theme.WARNING)
+            self.set_status(NO_SCAN_TEXT.format(label=label), theme.WARNING)
             show = getattr(self, "show_section", None)
             if show is not None:
                 show(OPTIMIZE_SECTION)

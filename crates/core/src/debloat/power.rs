@@ -43,7 +43,7 @@ const BALANCED: GUID = GUID::from_u128(0x381b4222_f694_41f0_9685_ff5bb260df2e);
 const FRIENDLY_NAME_ATTEMPTS: usize = 3;
 
 /// Shown in place of a scheme name that cannot be read.
-const UNNAMED_SCHEME: &str = "(unnamed)";
+pub(crate) const UNNAMED_SCHEME: &str = "(unnamed)";
 
 const NO_PERFORMANCE_PLAN: &str =
     "this system offers no high-performance power plan (common on Modern Standby laptops)";
@@ -78,6 +78,15 @@ pub fn scheme_exists(guid: &str) -> Result<bool> {
     }
 }
 
+/// Friendly name of scheme `guid` (braces optional); `None` when the GUID does not parse, the
+/// scheme does not exist or its name is empty. Read-only.
+pub(crate) fn scheme_name(guid: &str) -> Option<String> {
+    let g = parse_guid(guid)?;
+    read_friendly_name(&g)
+        .ok()
+        .filter(|name| !name.trim().is_empty())
+}
+
 /// True when the system reports a battery (GetSystemPowerStatus, BatteryFlag != 128).
 /// False when the status cannot be read.
 pub fn has_system_battery() -> bool {
@@ -104,11 +113,60 @@ pub fn status(plan: PowerPlan) -> Result<ActionStatus> {
 /// the application-owned duplicate (created from Ultimate Performance and named
 /// [`APP_SCHEME_NAME`] if missing), else High Performance, else skipped because this
 /// system offers neither (common on Modern Standby laptops). The journal record is written
-/// before the duplicate is created.
+/// before the duplicate is created. When the activation fails, the duplicate this call
+/// created is deleted again and the record withdrawn.
 pub fn apply(safety: &Safety, plan: PowerPlan) -> Result<MutationOutcome> {
+    apply_with(safety, plan, &LivePower)
+}
+
+/// The power management calls [`apply`] makes, so tests can stand in for the system.
+trait PowerSystem {
+    fn active_scheme(&self) -> Result<GUID>;
+    fn scheme_exists(&self, scheme: &GUID) -> Result<bool>;
+    fn ultimate_available(&self) -> bool;
+    fn create_app_scheme(&self) -> Result<()>;
+    fn set_active(&self, scheme: &GUID) -> Result<()>;
+    fn delete_scheme(&self, scheme: &GUID) -> Result<()>;
+}
+
+/// The power management API of this PC.
+struct LivePower;
+
+impl PowerSystem for LivePower {
+    fn active_scheme(&self) -> Result<GUID> {
+        active_scheme_guid()
+    }
+
+    fn scheme_exists(&self, scheme: &GUID) -> Result<bool> {
+        scheme_exists_guid(scheme)
+    }
+
+    fn ultimate_available(&self) -> bool {
+        ultimate_is_available()
+    }
+
+    fn create_app_scheme(&self) -> Result<()> {
+        create_app_scheme()
+    }
+
+    fn set_active(&self, scheme: &GUID) -> Result<()> {
+        set_active_scheme(scheme)
+    }
+
+    fn delete_scheme(&self, scheme: &GUID) -> Result<()> {
+        // SAFETY: `scheme` is a valid GUID for the duration of the call.
+        check(unsafe { PowerDeleteScheme(None, scheme) })
+    }
+}
+
+fn apply_with(
+    safety: &Safety,
+    plan: PowerPlan,
+    power: &dyn PowerSystem,
+) -> Result<MutationOutcome> {
     safety.ensure_elevated()?;
 
-    let active = active_scheme_guid()?;
+    let active = power.active_scheme()?;
     let active_text = format_guid(&active);
     if satisfies(plan, &active) {
         safety.log_op(
@@ -120,7 +178,7 @@ pub fn apply(safety: &Safety, plan: PowerPlan) -> Result<MutationOutcome> {
         return Ok(MutationOutcome::AlreadyInDesiredState);
     }
 
-    let Some(target) = choose_target(plan)? else {
+    let Some(target) = choose_target(plan, power)? else {
         safety.log_op(
             OP_SET_SCHEME,
             &describe(plan),
@@ -134,14 +192,25 @@ pub fn apply(safety: &Safety, plan: PowerPlan) -> Result<MutationOutcome> {
         Target::Existing(g) => g,
         Target::DuplicateUltimate => APP_SCHEME,
     };
-    safety.record_power(&NewPowerRecord {
+    let captured = safety.record_power(&NewPowerRecord {
         previous_scheme: active_text.clone(),
         target_scheme: format_guid(&planned),
     })?;
+    // The active scheme is still the recorded one until the activation below succeeds; a
+    // step that ends before it withdraws the record this call captured.
+    let withdraw = || {
+        if captured {
+            match safety.journal().withdraw_power(safety.session_id()) {
+                Ok(true) => {}
+                Ok(false) => warn!("no power scheme record of this session to withdraw"),
+                Err(e) => warn!(error = %e, "cannot withdraw the power scheme record"),
+            }
+        }
+    };
 
     let scheme = match target {
         Target::Existing(g) => g,
-        Target::DuplicateUltimate => match create_app_scheme() {
+        Target::DuplicateUltimate => match power.create_app_scheme() {
             Ok(()) => {
                 safety.log_op(
                     OP_DUPLICATE_SCHEME,
@@ -160,9 +229,10 @@ pub fn apply(safety: &Safety, plan: PowerPlan) -> Result<MutationOutcome> {
                     "failed",
                     Some(&e.to_string()),
                 )?;
-                if scheme_exists_guid(&HIGH_PERFORMANCE)? {
+                if power.scheme_exists(&HIGH_PERFORMANCE)? {
                     HIGH_PERFORMANCE
                 } else {
+                    withdraw();
                     let reason = format!(
                         "Ultimate Performance could not be duplicated ({e}) and {NO_PERFORMANCE_PLAN}"
                     );
@@ -174,7 +244,23 @@ pub fn apply(safety: &Safety, plan: PowerPlan) -> Result<MutationOutcome> {
     };
 
     let scheme_text = format_guid(&scheme);
-    if let Err(e) = set_active_scheme(&scheme) {
+    if let Err(e) = power.set_active(&scheme) {
+        if target == Target::DuplicateUltimate && scheme == APP_SCHEME {
+            // The duplicate was created by this call for the activation that failed, and no
+            // record is left that would delete it.
+            match power.delete_scheme(&APP_SCHEME) {
+                Ok(()) => info!(
+                    scheme = APP_SCHEME_GUID,
+                    "power scheme created for a failed activation deleted"
+                ),
+                Err(del) => warn!(
+                    error = %del,
+                    scheme = APP_SCHEME_GUID,
+                    "cannot delete the power scheme created for a failed activation"
+                ),
+            }
+        }
+        withdraw();
         safety.log_op(OP_SET_SCHEME, &scheme_text, "failed", Some(&e.to_string()))?;
         return Err(e);
     }
@@ -235,14 +321,14 @@ enum Target {
 }
 
 /// Picks the scheme `apply` activates, or `None` when this system offers none.
-fn choose_target(plan: PowerPlan) -> Result<Option<Target>> {
+fn choose_target(plan: PowerPlan, power: &dyn PowerSystem) -> Result<Option<Target>> {
     match plan {
         PowerPlan::UltimatePerformance => {
-            if scheme_exists_guid(&APP_SCHEME)? {
+            if power.scheme_exists(&APP_SCHEME)? {
                 Ok(Some(Target::Existing(APP_SCHEME)))
-            } else if ultimate_is_available() {
+            } else if power.ultimate_available() {
                 Ok(Some(Target::DuplicateUltimate))
-            } else if scheme_exists_guid(&HIGH_PERFORMANCE)? {
+            } else if power.scheme_exists(&HIGH_PERFORMANCE)? {
                 Ok(Some(Target::Existing(HIGH_PERFORMANCE)))
             } else {
                 Ok(None)
@@ -492,7 +578,11 @@ fn format_guid(guid: &GUID) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
+    use std::sync::Arc;
+
     use super::*;
+    use crate::safety::{test_safety, Journal};
 
     const CONSTANTS: [(&str, GUID); 4] = [
         (APP_SCHEME_GUID, APP_SCHEME),
@@ -649,6 +739,21 @@ mod tests {
     }
 
     #[test]
+    fn scheme_name_reads_the_friendly_name() {
+        let active = active_scheme().expect("active scheme");
+        let name = scheme_name(&active.guid);
+        if active.name == UNNAMED_SCHEME {
+            assert_eq!(name, None);
+        } else {
+            assert_eq!(name.as_deref(), Some(active.name.as_str()));
+        }
+        let braced = format!("{{{}}}", active.guid.to_ascii_uppercase());
+        assert_eq!(scheme_name(&braced), name, "braces and case");
+        assert_eq!(scheme_name("00000000-0000-0000-0000-00000000c0de"), None);
+        assert_eq!(scheme_name("not-a-guid"), None);
+    }
+
+    #[test]
     fn status_names_active_scheme() {
         let active = active_scheme().expect("active scheme");
         let st = status(PowerPlan::UltimatePerformance).expect("status");
@@ -671,6 +776,114 @@ mod tests {
     fn read_only_probes_do_not_fail() {
         let _ = has_system_battery();
         let _ = ultimate_is_available();
-        let _ = choose_target(PowerPlan::UltimatePerformance).expect("choose target");
+        let _ = choose_target(PowerPlan::UltimatePerformance, &LivePower).expect("choose target");
+    }
+
+    // `apply` against a power configuration held in memory.
+
+    /// The schemes that exist and the active one; activation fails when `activation_fails`
+    /// is set, and every deleted scheme is kept in `deleted`.
+    struct FakePower {
+        active: Cell<GUID>,
+        schemes: RefCell<Vec<GUID>>,
+        ultimate: bool,
+        activation_fails: bool,
+        deleted: RefCell<Vec<GUID>>,
+    }
+
+    impl FakePower {
+        fn new(active: GUID, schemes: &[GUID], activation_fails: bool) -> FakePower {
+            FakePower {
+                active: Cell::new(active),
+                schemes: RefCell::new(schemes.to_vec()),
+                ultimate: true,
+                activation_fails,
+                deleted: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl PowerSystem for FakePower {
+        fn active_scheme(&self) -> Result<GUID> {
+            Ok(self.active.get())
+        }
+
+        fn scheme_exists(&self, scheme: &GUID) -> Result<bool> {
+            Ok(self.schemes.borrow().contains(scheme))
+        }
+
+        fn ultimate_available(&self) -> bool {
+            self.ultimate
+        }
+
+        fn create_app_scheme(&self) -> Result<()> {
+            self.schemes.borrow_mut().push(APP_SCHEME);
+            Ok(())
+        }
+
+        fn set_active(&self, scheme: &GUID) -> Result<()> {
+            if self.activation_fails {
+                return Err(Error::Other("a policy sets the active power plan".into()));
+            }
+            self.active.set(*scheme);
+            Ok(())
+        }
+
+        fn delete_scheme(&self, scheme: &GUID) -> Result<()> {
+            self.schemes.borrow_mut().retain(|s| s != scheme);
+            self.deleted.borrow_mut().push(*scheme);
+            Ok(())
+        }
+    }
+
+    fn power_session(dir: &std::path::Path) -> (Arc<Journal>, Safety) {
+        let journal = Arc::new(Journal::open(dir.join("journal.db")).unwrap());
+        let safety = test_safety(journal.clone(), "power unit", false);
+        (journal, safety)
+    }
+
+    #[test]
+    fn a_failed_activation_deletes_the_duplicate_it_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let (journal, safety) = power_session(dir.path());
+        let power = FakePower::new(BALANCED, &[BALANCED], true);
+        let err = apply_with(&safety, PowerPlan::UltimatePerformance, &power).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("a policy sets the active power plan"));
+        assert_eq!(*power.deleted.borrow(), [APP_SCHEME]);
+        assert!(!power.scheme_exists(&APP_SCHEME).unwrap());
+        assert_eq!(power.active.get(), BALANCED);
+        assert!(
+            journal.active_power().unwrap().is_empty(),
+            "no record claims the change"
+        );
+    }
+
+    #[test]
+    fn a_failed_activation_keeps_a_duplicate_that_existed_before() {
+        // An earlier apply created it; its own record deletes it on undo.
+        let dir = tempfile::tempdir().unwrap();
+        let (journal, safety) = power_session(dir.path());
+        let power = FakePower::new(BALANCED, &[BALANCED, APP_SCHEME], true);
+        apply_with(&safety, PowerPlan::UltimatePerformance, &power).unwrap_err();
+        assert!(power.deleted.borrow().is_empty());
+        assert!(power.scheme_exists(&APP_SCHEME).unwrap());
+        assert!(journal.active_power().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_activation_keeps_the_duplicate_and_its_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let (journal, safety) = power_session(dir.path());
+        let power = FakePower::new(BALANCED, &[BALANCED], false);
+        let outcome = apply_with(&safety, PowerPlan::UltimatePerformance, &power).unwrap();
+        assert_eq!(outcome, MutationOutcome::Applied);
+        assert_eq!(power.active.get(), APP_SCHEME);
+        assert!(power.deleted.borrow().is_empty());
+        let records = journal.active_power().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].previous_scheme, BALANCED_GUID);
+        assert_eq!(records[0].target_scheme, APP_SCHEME_GUID);
     }
 }

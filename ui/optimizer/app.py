@@ -69,7 +69,15 @@ from .widgets.brand import set_window_icon
 from .widgets.cleanup import CleanupPanel, fmt_size
 from .widgets.controls import CategoryToggle, ItemListPanel, recorded_recommended
 from .widgets.dialogs import MessageDialog
-from .widgets.history import ChangeGroup, HistoryPanel, packaged_task_names
+from .widgets.history import (
+    KEEP_FORMER,
+    ChangeGroup,
+    HistoryPanel,
+    drift_lines,
+    holds,
+    packaged_task_names,
+    selects_every_record,
+)
 from .widgets.monitor import HardwareMonitor, set_text
 from .widgets.sidebar import Sidebar, badge_fit, sidebar_mode
 from .widgets.startup import StartupPanel
@@ -80,7 +88,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 FRAME_HZ = 60.0
-TWEAK_CATEGORIES = ("privacy", "performance", "gaming", "interface")
+TWEAK_CATEGORIES = ("privacy", "performance", "gaming", "interface", "security")
 RESTART_TEXT = {
     "explorer": "File Explorer has to restart for some of these changes.",
     "sign_out": "Sign out and back in to finish applying these changes.",
@@ -114,6 +122,84 @@ JOURNAL_ACTIVE_COUNTS = (
 )
 # Longest status bar message, in characters.
 STATUS_LIMIT = 200
+
+# An apply's values are read once more this long after it ended (the settled check); while
+# another operation runs, the check waits the retry delay, up to the retry count.
+SETTLED_CHECK_MS = 5000
+SETTLED_RETRY_MS = 1000
+SETTLED_RETRIES = 5
+SETTLED_CHANGED_TEXT = "⚠ Checked again 5 seconds later: {settings} changed back ({titles}). See Optimize."
+SETTLED_KEPT_TEXT = "✓ Checked again 5 seconds later: every value Cairn just set is still set."
+# Apply results whose values did not hold when the engine read them back.
+NOT_KEPT_TITLE = "{changes} not kept"
+NOT_KEPT_TEXT = (
+    "Cairn set these values and read them back half a second later, but Windows or another program "
+    "had already changed them. Their originals stay recorded, so Undo restores them. Applying them "
+    "again may be undone the same way."
+)
+NOT_KEPT_LINE = "• {title}: {label} is {found}, not {expected}"
+# Added to an apply's result when it applied a tweak that requires Edge.
+EDGE_REQUIREMENT = "edge"
+EDGE_POLICY_TEXT = "Open edge://policy in Edge to see which policies it uses."
+# Undo results whose restored values did not hold when the engine read them back.
+NOT_RESTORED_TITLE = "Changes restored with issues"
+NOT_RESTORED_ONE = (
+    "Windows or another program changed 1 restored setting again right after Cairn put back the "
+    "original. Cairn does not write it again."
+)
+NOT_RESTORED_MANY = (
+    "Windows or another program changed {n} restored settings again right after Cairn put back the "
+    "original. Cairn does not write them again."
+)
+NOT_RESTORED_LINE = "• {label} is {found}, not the original {expected}"
+# A scan that found recorded values that no longer hold.
+SCAN_DRIFT_TEXT = "Scan complete: {items} items checked in {ms} ms. ⚠ {count} {holds}; see History."
+# A mode's confirmation when one of its changes cannot be fully undone.
+UNDO_LIMIT_LINE = "⚠ {title}: {limit}"
+# An Apply confirmation's line on a value an earlier version of Cairn set, which Apply restores.
+FORMER_RESTORE_LINE = "• restore {target} to {original} (no longer part of this tweak)"
+# History: Apply again and Keep as is.
+APPLY_AGAIN_TITLE = "Apply {title} again?"
+APPLY_AGAIN_TEXT = (
+    "Cairn sets these values again. The originals from before Cairn's first change stay recorded, so "
+    "Undo still restores them. If they change back again, Windows or another program may be managing "
+    "this setting."
+)
+KEEP_TITLE = "Keep {title} as it is?"
+KEEP_BACK_TEXT = (
+    "These settings are back to the values they had before Cairn changed them. Cairn stops listing "
+    "this change in History; nothing on this PC is changed."
+)
+KEEP_LOSES_TEXT = (
+    "The current values stay as they are, and Cairn stops tracking this change. Undo can then no "
+    "longer restore the values from before Cairn's change:"
+)
+# The same confirmations when the change has records the selection leaves out (Keep as is of
+# the values an earlier version set, or of the records that changed): Cairn keeps tracking those.
+KEEP_BACK_SOME_TEXT = (
+    "These settings are back to the values they had before Cairn changed them. Cairn stops tracking "
+    "them but still tracks the rest of this change, so History still lists it; nothing on this PC is "
+    "changed."
+)
+KEEP_LOSES_SOME_TEXT = (
+    "The current values stay as they are, and Cairn stops tracking them but still tracks the rest of "
+    "this change. Undo can then no longer restore the values they had before Cairn's change:"
+)
+KEEP_LOSES_LINE = "• {label}: original {original}, now {found}"
+KEEP_FORMER_LINE = "• {target}: original {original}"
+UNKNOWN_ORIGINAL = "unknown"
+KEEP_DONE_TEXT = "✓ {title}: no longer tracked. Nothing on this PC was changed."
+# Keep as is of only some records of a change: the values an earlier version set, or the ones
+# that changed.
+KEEP_DONE_SOME_TEXT = (
+    "✓ {title}: Cairn no longer tracks the values you kept and still tracks the rest of this change. "
+    "Nothing on this PC was changed."
+)
+KEEP_REFUSED_TITLE = "Some changes are still tracked"
+KEEP_REFUSED_TEXT = "Cairn still tracks these changes, so Undo can restore them:"
+KEEP_PARTLY_TEXT = "⚠ {title}: some changes are still tracked. Nothing on this PC was changed."
+# Sections whose search box Ctrl+F focuses, with the App method that focuses it.
+FIND_HANDLERS = {"Optimize": "_focus_tweak_search"}
 
 # What closing the window means for the operation that holds it busy (`App._set_busy`).
 # Closing never stops an engine call that is already running: it finishes in the background
@@ -383,6 +469,48 @@ def status_line(text: str, limit: int = STATUS_LIMIT) -> str:
     return first + " …" if len(lines) > 1 else first
 
 
+def apply_summary(kept: int, not_kept: int, skipped: int, failed: int) -> str:
+    """ "3 applied, 1 not kept, 1 skipped, 1 failed": the applied count always, the others when
+    they are not zero."""
+    summary = f"{kept} applied"
+    for count, text in ((not_kept, "not kept"), (skipped, "skipped"), (failed, "failed")):
+        if count:
+            summary += f", {count} {text}"
+    return summary
+
+
+def not_restored_text(count: int) -> str:
+    """The sentence on `count` restored settings that did not hold when read back."""
+    return NOT_RESTORED_ONE if count == 1 else NOT_RESTORED_MANY.format(n=count)
+
+
+def former_values(record: dict[str, Any]) -> dict[str, str]:
+    """The target and original of a scan item's `former` entry, for `FORMER_RESTORE_LINE`."""
+    return {"target": str(record.get("target", "")), "original": str(record.get("original", ""))}
+
+
+def apply_outcomes(
+    results: Iterable[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """An apply report's results as (kept, not kept, skipped, failed).
+
+    A result counts as applied only when every value it wrote held when the engine read it
+    back; one whose values did not hold (`not_kept`, an applied or already-applied result) is
+    counted as not kept."""
+    kept, not_kept, skipped, failed = [], [], [], []
+    for result in results:
+        outcome = result.get("outcome")
+        if outcome in ("applied", "already_applied") and result.get("not_kept"):
+            not_kept.append(result)
+        elif outcome == "applied":
+            kept.append(result)
+        elif outcome == "skipped":
+            skipped.append(result)
+        elif outcome == "failed":
+            failed.append(result)
+    return kept, not_kept, skipped, failed
+
+
 def _font(size: int, weight: str = "normal") -> ctk.CTkFont:
     return ctk.CTkFont(family=theme.FONT_FAMILY, size=size, weight=weight)
 
@@ -462,6 +590,34 @@ class App(
         self._job_texts: dict[str, str] = {}
         # Job lanes whose close dialog was confirmed during the current attempt to close.
         self._close_confirmed: set[str] = set()
+        # From the catalog: titles by tweak id, the tweaks that require Edge, retired tweaks,
+        # what Undo cannot bring back by tweak id, and the targets (lower case) of values
+        # earlier versions of Cairn set, with the tweaks they belong to.
+        self._item_titles: dict[str, str] = {}
+        self._edge_ids: set[str] = set()
+        self._retired_ids: set[str] = set()
+        self._catalog_undo_limits: dict[str, str] = {}
+        self._former_targets: set[str] = set()
+        self._former_ids: set[str] = set()
+        # From the last scan: the tweaks this PC cannot use (retired ones included), which an
+        # apply skips.
+        self._unavailable_ids: set[str] = set()
+        # Counts the status bar's messages, so a later message can tell whether an earlier
+        # one is still shown.
+        self._status_serial = 0
+        # A scan that refreshes the views after a change keeps the change's status message.
+        self._scan_refresh = False
+        # The settled check: its timer, the tweaks it reads, the busy retries so far, which
+        # apply it belongs to, the status message of that apply, and whether that apply
+        # restored values an earlier version of Cairn set, which the check cannot read.
+        self._settled_job: str | None = None
+        self._settled_ids: list[str] = []
+        self._settled_tries = 0
+        self._settled_serial = 0
+        self._settled_status = 0
+        self._settled_former = False
+        # Which History load a journal export or drift report belongs to.
+        self._history_serial = 0
 
         try:
             self.engine: EngineBridge | None = engine if engine is not None else EngineBridge()
@@ -578,6 +734,8 @@ class App(
             ("<Control-Prior>", -1),
         ):
             self.bind(sequence, lambda _event, step=step: self._on_step_key(step))
+        for sequence in ("<Control-f>", "<Control-F>"):
+            self.bind(sequence, self._on_find_key)
         self.bind("<Configure>", self._on_window_configure, add="+")
 
     def _build_status_bar(self) -> None:
@@ -769,6 +927,7 @@ class App(
             categories=TWEAK_CATEGORIES,
             on_scan=self.start_scan,
             on_action=self._on_item_action,
+            search=True,
         )
         self.optimize_list.grid(row=0, column=1, sticky="nsew", padx=(5, 4), pady=4)
 
@@ -796,7 +955,13 @@ class App(
         self.startup_panel.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
 
     def _build_history_tab(self, frame: ctk.CTkFrame) -> None:
-        self.history_panel = HistoryPanel(frame, on_refresh=self.load_history, on_undo=self._on_history_undo)
+        self.history_panel = HistoryPanel(
+            frame,
+            on_refresh=self.load_history,
+            on_undo=self._on_history_undo,
+            on_apply_again=self._on_history_apply_again,
+            on_keep=self._on_history_keep,
+        )
         self.history_panel.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
 
     @property
@@ -804,6 +969,7 @@ class App(
         return self.elevated and self.engine is not None
 
     def set_status(self, text: str, color: str = theme.INK_SECONDARY) -> None:
+        self._status_serial += 1
         self.status_message.configure(text=status_line(text), text_color=color)
 
     # -- navigation ------------------------------------------------------------------
@@ -856,6 +1022,18 @@ class App(
     def _on_step_key(self, step: int) -> str:
         self._step_section(step)
         return "break"
+
+    def _on_find_key(self, _event: Any = None) -> str | None:
+        """Ctrl+F: focuses the search box of the shown section, when it has one (see
+        `FIND_HANDLERS`); in every other section the key does nothing here."""
+        handler = FIND_HANDLERS.get(self._current_section)
+        if handler is None:
+            return None
+        getattr(self, handler)()
+        return "break"
+
+    def _focus_tweak_search(self) -> None:
+        self.optimize_list.focus_search()
 
     def _on_window_configure(self, event: Any) -> None:
         # The root's bindings also see every child's events.
@@ -918,10 +1096,8 @@ class App(
             self.set_status(f"The data folder could not be opened: {exc}", theme.WARNING)
 
     def _open_project_page(self) -> None:
-        try:
-            system.open_uri(PROJECT_URL)
-        except OSError as exc:
-            self.set_status(f"The project page could not be opened: {exc}", theme.WARNING)
+        # The link opener keeps the browser unelevated when Cairn runs as administrator.
+        self._open_link(PROJECT_URL)
 
     def _cleanup_tab_shown(self) -> None:
         # The measurement is read-only, so it queues behind a running operation on the worker.
@@ -940,8 +1116,21 @@ class App(
             return
         titles: dict[str, str] = {}
         for entry in future.result():
+            title = entry["title"]
             for target in entry["targets"]:
-                titles[target] = entry["title"]
+                titles[target] = title
+            # Values earlier versions of Cairn set for the tweak; their records are its own.
+            for target in entry.get("former_targets") or []:
+                titles[target] = title
+                self._former_targets.add(str(target).lower())
+                self._former_ids.add(entry["id"])
+            self._item_titles[entry["id"]] = title
+            if entry.get("requires") == EDGE_REQUIREMENT:
+                self._edge_ids.add(entry["id"])
+            if entry.get("retired"):
+                self._retired_ids.add(entry["id"])
+            if entry.get("undo_limit"):
+                self._catalog_undo_limits[entry["id"]] = str(entry["undo_limit"])
         for name in TITLE_PROVIDERS:
             try:
                 titles.update(getattr(self, name)())
@@ -1123,22 +1312,27 @@ class App(
 
     # -- scan ----------------------------------------------------------------------
 
-    def start_scan(self) -> None:
+    def start_scan(self, *, refresh: bool = False) -> None:
+        """Scans every tweak and Store app. A `refresh` (the rescan after a change or a check)
+        leaves the status bar's message as it is unless the scan fails or warns."""
         if self.engine is None or self._busy:
             return
         self._busy = True
         self._busy_close = BusyClose(CLOSE_READ)
+        self._scan_refresh = refresh
         for panel in (self.optimize_list, self.apps_list):
             panel.set_scanning()
         for toggle in self.toggles.values():
             toggle.set_enabled(False)
         self._run_hooks(BUSY_HOOKS)
-        self.set_status("Scanning…")
+        if not refresh:
+            self.set_status("Scanning…")
         self.engine.scan(callback=self._scan_done)
 
     def _scan_done(self, future: Future[Any]) -> None:
         self._busy = False
         self._busy_close = BusyClose()
+        refresh, self._scan_refresh = self._scan_refresh, False
         for toggle in self.toggles.values():
             toggle.set_enabled(self._mutations_enabled)
         self._run_hooks(BUSY_HOOKS)
@@ -1155,6 +1349,7 @@ class App(
             return
         report = future.result()
         self._last_scan = report
+        self._unavailable_ids = {str(i["id"]) for i in report["items"] if i.get("unavailable")}
         self._scan_failed = False
         when = datetime.now().strftime("Scanned at %H:%M:%S")
         for panel in (self.optimize_list, self.apps_list):
@@ -1169,10 +1364,22 @@ class App(
             self.set_status(
                 f"Scan complete with {plural(len(warnings), 'warning')}: {warnings[0]}", theme.WARNING
             )
-        else:
-            self.set_status(
-                f"Scan complete: {len(report['items'])} items checked in {report['duration_ms']} ms."
-            )
+        elif not refresh:
+            drifted = sum(len(i.get("drift") or []) for i in report["items"])
+            if drifted:
+                self.set_status(
+                    SCAN_DRIFT_TEXT.format(
+                        items=len(report["items"]),
+                        ms=report["duration_ms"],
+                        count=drifted,
+                        holds=holds(drifted),
+                    ),
+                    theme.WARNING,
+                )
+            else:
+                self.set_status(
+                    f"Scan complete: {len(report['items'])} items checked in {report['duration_ms']} ms."
+                )
         self._refresh_journal()
 
     def _refresh_journal(self) -> None:
@@ -1265,11 +1472,8 @@ class App(
             if future.exception() is not None:
                 self._show_error(f"Could not prepare {mode}", future.exception())
                 return
-            details = [
-                f"• {r['id']}: " + "; ".join(r["details"])
-                for r in future.result()["results"]
-                if r["outcome"] == "planned"
-            ]
+            planned_results = [r for r in future.result()["results"] if r["outcome"] == "planned"]
+            details = [f"• {r['id']}: " + "; ".join(r["details"]) for r in planned_results]
             if not details:
                 self.set_status(f"{mode}: every recommended change is already applied.")
                 return
@@ -1279,6 +1483,10 @@ class App(
             )
             if self.engine is not None and self.engine.next_mutation_creates_restore_point:
                 message += " A System Restore point is created first; this can take up to a minute."
+            # What Undo cannot bring back is said before anything is applied, as for one tweak.
+            limits = self._undo_limits(r["id"] for r in planned_results)
+            if limits:
+                message += "\n\n" + "\n".join(limits)
             MessageDialog(
                 self,
                 title=f"Apply the rest of {mode}?" if remaining else f"Turn on {mode}?",
@@ -1286,6 +1494,7 @@ class App(
                 details=details,
                 confirm_text="Apply remaining" if remaining else f"Turn on {mode}",
                 cancel_text="Cancel",
+                danger=bool(limits),
                 on_confirm=lambda: self._run_mode(category, f"Applying {mode}…", apply=True),
             )
 
@@ -1338,8 +1547,34 @@ class App(
         self.engine.plan_revert(ids, callback=planned)
 
     def _recommended_ids(self, category: str) -> list[str]:
+        """The items turning `category`'s mode off restores: its recommended items and the ones
+        the engine marks for it (`mode_undo`: tweaks earlier versions recommended)."""
         items = self._last_scan["items"] if self._last_scan else []
-        return [i["id"] for i in items if i["category"] == category and i["recommended"]]
+        return [i["id"] for i in items if i["category"] == category and i.get("mode_undo", i["recommended"])]
+
+    def _scan_item(self, item_id: str) -> dict[str, Any] | None:
+        """The last scan's item `item_id`, when a scan describes the system."""
+        items = self._last_scan["items"] if self._last_scan else []
+        return next((i for i in items if i["id"] == item_id), None)
+
+    def _undo_limits(self, ids: Iterable[str]) -> list[str]:
+        """One line per item of `ids` whose changes Undo cannot fully bring back, as the last scan
+        says or, for an item no scan describes (none ran, it failed, or a change dropped it),
+        as the catalog says."""
+        lines = []
+        for item_id in ids:
+            item = self._scan_item(item_id)
+            limit = item.get("undo_limit") if item is not None else self._catalog_undo_limits.get(item_id)
+            if limit:
+                lines.append(UNDO_LIMIT_LINE.format(title=self._item_title(item_id), limit=limit))
+        return lines
+
+    def _item_title(self, item_id: str) -> str:
+        """An item's title: from the catalog, else from the last scan, else its id."""
+        if item_id in self._item_titles:
+            return self._item_titles[item_id]
+        item = self._scan_item(item_id)
+        return str(item["title"]) if item is not None else item_id
 
     @staticmethod
     def _planned_restart(plan: dict[str, Any]) -> str:
@@ -1387,7 +1622,7 @@ class App(
             else:
                 self.engine.revert([item["id"]], callback=self._revert_done)
 
-        def confirm(message: str, details: list[str]) -> None:
+        def confirm(message: str, details: list[str], danger: bool = False) -> None:
             MessageDialog(
                 self,
                 title=f"{verb} {item['title']}?",
@@ -1395,11 +1630,19 @@ class App(
                 details=details,
                 confirm_text=verb,
                 cancel_text="Cancel",
+                danger=danger,
                 on_confirm=run,
             )
 
         if apply:
-            confirm(item["description"], [f"• {a['detail']}" for a in item["actions"]])
+            details = [FORMER_RESTORE_LINE.format(**former_values(r)) for r in item.get("former") or []]
+            details += [f"• {a['detail']}" for a in item["actions"]]
+            limit = item.get("undo_limit")
+            if limit:
+                # What Undo cannot bring back follows the description, in the danger style.
+                confirm(f"{item['description']}\n\n⚠ {limit}", details, danger=True)
+            else:
+                confirm(item["description"], details)
             return
 
         # Undo restores journal records, so the dialog lists those, and an item whose value
@@ -1500,33 +1743,154 @@ class App(
             self._after_mutation()
             return
         report = future.result()
-        results = report["results"]
-        applied = [r for r in results if r["outcome"] == "applied"]
-        failed = [r for r in results if r["outcome"] == "failed"]
-        skipped = [r for r in results if r["outcome"] == "skipped"]
-        summary = f"{len(applied)} applied"
-        if skipped:
-            summary += f", {len(skipped)} skipped"
-        if failed:
-            summary += f", {len(failed)} failed"
+        kept, not_kept, skipped, failed = apply_outcomes(report["results"])
+        applied = kept + [r for r in not_kept if r["outcome"] == "applied"]
+        summary = apply_summary(len(kept), len(not_kept), len(skipped), len(failed))
         restart = RESTART_TEXT.get(report["restart"], "")
         rp = report.get("restore_point")
         notes = [f"Restore point #{rp['sequence']} created."] if rp else []
         notes += report.get("warnings", [])
-        if failed or skipped or restart or notes:
-            details = [f"• {r['id']} ({r['outcome']}): " + "; ".join(r["details"]) for r in failed + skipped]
-            explorer = report["restart"] == "explorer" and applied
+        # A read-back cannot see which Edge policies Edge uses; Edge's own page can.
+        if any(r["id"] in self._edge_ids for r in applied):
+            notes.append(EDGE_POLICY_TEXT)
+        if not_kept or failed or skipped or restart or notes:
+            details = [
+                NOT_KEPT_LINE.format(
+                    title=self._item_title(r["id"]),
+                    label=mismatch.get("label", ""),
+                    found=mismatch.get("found", ""),
+                    expected=mismatch.get("expected", ""),
+                )
+                for r in not_kept
+                for mismatch in r["not_kept"]
+            ]
+            details += [f"• {r['id']} ({r['outcome']}): " + "; ".join(r["details"]) for r in failed + skipped]
+            explorer = report["restart"] == "explorer" and bool(applied)
+            if failed:
+                title = "Some changes failed"
+            elif not_kept:
+                title = NOT_KEPT_TITLE.format(changes=plural(len(not_kept), "change"))
+            else:
+                title = "Changes applied"
             MessageDialog(
                 self,
-                title="Changes applied" if not failed else "Some changes failed",
-                message=" ".join([summary + "."] + notes + ([restart] if restart else [])),
+                title=title,
+                message=" ".join(
+                    [summary + "."]
+                    + ([NOT_KEPT_TEXT] if not_kept else [])
+                    + notes
+                    + ([restart] if restart else [])
+                ),
                 details=details,
                 confirm_text="Restart Explorer now" if explorer else "OK",
                 cancel_text="Later" if explorer else None,
                 on_confirm=self._restart_explorer if explorer else None,
             )
-        self.set_status(f"Done: {summary}. {restart}".strip(), theme.GOOD if not failed else theme.WARNING)
+        if not_kept:
+            self.set_status(f"⚠ Done: {summary}. {restart}".strip(), theme.WARNING)
+        else:
+            self.set_status(
+                f"Done: {summary}. {restart}".strip(), theme.GOOD if not failed else theme.WARNING
+            )
+        self._schedule_settled_check([r["id"] for r in kept + not_kept])
         self._after_mutation()
+
+    # -- the settled check ----------------------------------------------------------
+
+    def _schedule_settled_check(self, ids: list[str]) -> None:
+        """Reads the tweaks `ids` an apply changed again `SETTLED_CHECK_MS` later, replacing a
+        check that is still pending. Store apps are not read back, and an engine without the
+        check gets none. The check reads the tweaks' recorded values only, so whether the
+        apply restored values an earlier version of Cairn set, whose records the restore ended,
+        is noted (`_restores_former`)."""
+        self._cancel_settled_check()
+        tweaks = [i for i in ids if not i.startswith("appx.")]
+        if not tweaks or self.engine is None or not self.engine.supports("verify"):
+            return
+        self._settled_ids = tweaks
+        self._settled_former = any(self._restores_former(i) for i in tweaks)
+        self._settled_tries = 0
+        self._settled_status = self._status_serial
+        self._settled_job = self.after(SETTLED_CHECK_MS, self._settled_check)
+
+    def _restores_former(self, item_id: str) -> bool:
+        """Whether applying `item_id` restored values an earlier version of Cairn set: the last
+        scan lists them for it or, when no scan describes it, the catalog names such values."""
+        item = self._scan_item(item_id)
+        if item is not None:
+            return bool(item.get("former"))
+        return item_id in self._former_ids
+
+    def _cancel_settled_check(self) -> None:
+        """Drops a pending settled check; a read already queued is ignored when it returns."""
+        self._settled_serial += 1
+        self._settled_ids = []
+        job, self._settled_job = self._settled_job, None
+        if job is not None:
+            try:
+                self.after_cancel(job)
+            except tk.TclError:
+                pass
+
+    def _settled_check(self) -> None:
+        """Reads the applied tweaks again once nothing else runs; while something does, retries
+        every `SETTLED_RETRY_MS`, at most `SETTLED_RETRIES` times, then gives up."""
+        self._settled_job = None
+        if not self._running or self.engine is None or not self._settled_ids:
+            return
+        if self._busy or self.engine.busy:
+            self._settled_tries += 1
+            if self._settled_tries > SETTLED_RETRIES:
+                log.info("the settled check was given up: another operation kept running")
+                self._settled_ids = []
+                return
+            self._settled_job = self.after(SETTLED_RETRY_MS, self._settled_check)
+            return
+        ids, self._settled_ids = self._settled_ids, []
+        serial = self._settled_serial
+        self.engine.verify(ids, callback=lambda future: self._settled_checked(future, serial))
+
+    def _settled_checked(self, future: Future[Any], serial: int) -> None:
+        if future.exception() is not None:
+            log.warning("the settled check failed: %s", future.exception())
+            return
+        if serial != self._settled_serial:
+            # A later change replaced or cancelled this check.
+            return
+        report = future.result()
+        entries = report.get("entries") or []
+        unread = report.get("warnings") or []
+        for warning in unread:
+            log.warning("the settled check: %s", warning)
+        # The tick needs every value the apply wrote read back: the check read some, left none
+        # unread, and the apply restored no value an earlier version set, which it cannot read.
+        read_all = (
+            bool(report.get("checked"))
+            and not unread
+            and not report.get("unchecked")
+            and not self._settled_former
+        )
+        if entries:
+            titles: list[str] = []
+            for entry in entries:
+                title = self._item_title(str(entry.get("item") or ""))
+                if title not in titles:
+                    titles.append(title)
+            self.set_status(
+                SETTLED_CHANGED_TEXT.format(
+                    settings=plural(len(entries), "setting"), titles=", ".join(titles)
+                ),
+                theme.WARNING,
+            )
+            # The rescan shows what changed back on the rows and keeps this message; while
+            # another operation runs, the rescan after it does the same.
+            self.start_scan(refresh=True)
+            if self.section_visible("History"):
+                self.load_history()
+        elif read_all and self._status_serial == self._settled_status:
+            # Only while the status bar still shows the apply's result; a value that was not
+            # read back is not said to be still set.
+            self.set_status(SETTLED_KEPT_TEXT, theme.GOOD)
 
     def _revert_done(self, future: Future[Any]) -> None:
         self._set_busy(False)
@@ -1536,9 +1900,13 @@ class App(
             self._after_mutation()
             return
         report = future.result()
+        # The values an apply just set are being undone, so its settled check is dropped.
+        self._cancel_settled_check()
         restored = sum(report.get(key, 0) for key in REVERT_COUNTS)
         failures = report.get("failures", [])
         store = report.get("appx_store_required", [])
+        not_restored = report.get("not_restored") or []
+        warnings = report.get("warnings") or []
         if not restored and not failures and not store:
             self.set_status("Nothing was recorded to undo, so nothing changed.", theme.INK_SECONDARY)
             self._after_mutation()
@@ -1547,9 +1915,11 @@ class App(
         restart = REVERT_RESTART_TEXT.get(need, "")
         explorer = need == "explorer"
         summary = f"{plural(restored, 'change')} restored"
+        if not_restored:
+            summary += f", {len(not_restored)} changed again"
         if failures:
             summary += f", {len(failures)} failed"
-        if failures or store or restart:
+        if failures or store or restart or not_restored or warnings:
             links = [
                 (
                     f"Open Store page: {s['package_family'].split('_')[0]}",
@@ -1558,6 +1928,8 @@ class App(
                 for s in store
             ]
             message = summary + "."
+            if not_restored:
+                message += " " + not_restored_text(len(not_restored))
             if store:
                 message += (
                     " Some removed apps no longer have their files on this PC; "
@@ -1565,17 +1937,36 @@ class App(
                 )
             if restart:
                 message += " " + restart
+            if failures or store:
+                title = "Revert finished with issues"
+            elif not_restored:
+                title = NOT_RESTORED_TITLE
+            else:
+                title = "Changes restored"
+            details = [f"• {f['target']}: {f['error']}" for f in failures]
+            details += [
+                NOT_RESTORED_LINE.format(
+                    label=m.get("label", ""), found=m.get("found", ""), expected=m.get("expected", "")
+                )
+                for m in not_restored
+            ]
+            details += [f"⚠ {w}" for w in warnings]
             MessageDialog(
                 self,
-                title="Revert finished with issues" if failures or store else "Changes restored",
+                title=title,
                 message=message,
-                details=[f"• {f['target']}: {f['error']}" for f in failures],
+                details=details,
                 links=links,
                 confirm_text="Restart Explorer now" if explorer else "OK",
                 cancel_text="Later" if explorer else None,
                 on_confirm=self._restart_explorer if explorer else None,
             )
-        self.set_status(f"Done: {summary}. {restart}".strip(), theme.GOOD if not failures else theme.WARNING)
+        if not_restored:
+            self.set_status(f"⚠ Done: {summary}. {restart}".strip(), theme.WARNING)
+        else:
+            self.set_status(
+                f"Done: {summary}. {restart}".strip(), theme.GOOD if not failures else theme.WARNING
+            )
         self._after_mutation()
 
     def _after_mutation(self) -> None:
@@ -1583,9 +1974,10 @@ class App(
 
         The last scan no longer describes the system, so it is dropped; if the rescan
         fails, the modes show their status as unknown instead of the state before the change.
+        The rescan keeps the change's status message unless it fails or warns.
         """
         self._last_scan = None
-        self.start_scan()
+        self.start_scan(refresh=True)
         if self.startup_panel.loaded:
             self.load_startup()
         if self.section_visible("History"):
@@ -1738,28 +2130,166 @@ class App(
     # -- history -------------------------------------------------------------------
 
     def load_history(self) -> None:
+        """Reads the journal export and, from an engine that has the check, which recorded
+        changes no longer hold, then shows both. A newer load replaces an older one."""
         if self.engine is None:
             return
         self.history_panel.set_loading()
         # Packaged-app startup records are titled with the task's display name, which only
         # the startup list has. Engine calls run and call back in order, so the list is
-        # read before the journal export is shown.
+        # read before the journal export is shown, and the export before the drift report.
         if not self.startup_panel.loaded:
             self.load_startup()
+        self._history_serial += 1
+        serial = self._history_serial
+        with_drift = self.engine.supports("drift")
+        loaded: dict[str, Any] = {}
 
-        def done(future: Future[Any]) -> None:
-            if future.exception() is not None:
-                self.history_panel.show_error(str(future.exception()))
-                return
+        def show(drift: dict[str, Any] | None = None, drift_error: str | None = None) -> None:
             self.history_panel.show(
-                future.result(),
+                loaded["export"],
                 self._titles,
                 self.engine is not None,
                 self.elevated,
                 self._startup_names,
+                drift=drift,
+                drift_error=drift_error,
+                former_targets=self._former_targets,
+                unavailable_ids=self._skipped_here(),
             )
 
-        self.engine.journal_export(callback=done)
+        def exported(future: Future[Any]) -> None:
+            if serial != self._history_serial:
+                return
+            if future.exception() is not None:
+                self.history_panel.show_error(str(future.exception()))
+                return
+            loaded["export"] = future.result()
+            if not with_drift:
+                show()
+
+        def drifted(future: Future[Any]) -> None:
+            if serial != self._history_serial or "export" not in loaded:
+                return
+            exc = future.exception()
+            if exc is not None:
+                log.warning("the drift check failed: %s", exc)
+                show(drift_error=str(exc))
+                return
+            report = future.result()
+            # Records it could not read are counted in the report; why goes to the log.
+            for warning in report.get("warnings") or []:
+                log.warning("the drift check: %s", warning)
+            show(drift=report)
+
+        self.engine.journal_export(callback=exported)
+        if with_drift:
+            self.engine.drift(callback=drifted)
+
+    def _skipped_here(self) -> set[str]:
+        """The tweaks an apply skips on this PC: retired ones and those the last scan found this
+        PC cannot use."""
+        return self._retired_ids | self._unavailable_ids
+
+    def _on_history_apply_again(self, change: ChangeGroup) -> None:
+        """Applies the tweaks of a change that no longer holds again, through the usual apply,
+        its read-back and its settled check; tweaks an apply skips on this PC are left out.
+        When Undo cannot fully bring back what one of them changes, the dialog says so first,
+        in the danger style."""
+        skipped = self._skipped_here()
+        ids = [i for i in change.item_ids if i not in skipped]
+        if not ids or not self._guard():
+            return
+        # What Undo cannot bring back is said before anything is applied, as for one tweak.
+        limits = self._undo_limits(ids)
+        message = APPLY_AGAIN_TEXT + ("\n\n" + "\n".join(limits) if limits else "")
+
+        def run() -> None:
+            assert self.engine is not None
+            self._set_busy(True, CLOSE_JOURNALED)
+            self.set_status(f"Applying {change.title} again…")
+            self.engine.apply(ids, callback=self._apply_done)
+
+        MessageDialog(
+            self,
+            title=APPLY_AGAIN_TITLE.format(title=change.title),
+            message=message,
+            details=drift_lines(change),
+            confirm_text="Apply again",
+            cancel_text="Cancel",
+            danger=bool(limits),
+            on_confirm=run,
+        )
+
+    def _on_history_keep(self, change: ChangeGroup, kind: str) -> None:
+        """Keep as is: stops tracking the records of `change` that no longer hold, or with
+        `kind` KEEP_FORMER its values an earlier version of Cairn set. Nothing on this PC is
+        written, so no administrator rights are needed. When an original would be lost, the
+        dialog says which and uses the danger style. The confirmation and the result say
+        whether Cairn still tracks other records of the change."""
+        if not self._guard(needs_admin=False):
+            return
+        selection = change.former_filter if kind == KEEP_FORMER else change.drift_filter
+        partial = not selects_every_record(change.filter, selection)
+        loses = KEEP_LOSES_SOME_TEXT if partial else KEEP_LOSES_TEXT
+        if kind == KEEP_FORMER:
+            message, danger = loses, True
+            details = [KEEP_FORMER_LINE.format(target=t, original=o) for t, o in change.former]
+        else:
+            danger = not all(m.get("back_to_original") for m in change.drift)
+            message = loses if danger else (KEEP_BACK_SOME_TEXT if partial else KEEP_BACK_TEXT)
+            details = []
+            if danger:
+                details = [
+                    KEEP_LOSES_LINE.format(
+                        label=m.get("label", ""),
+                        original=UNKNOWN_ORIGINAL if m.get("original") is None else m["original"],
+                        found=m.get("found", ""),
+                    )
+                    for m in change.drift
+                ]
+        target_filter = {
+            key: (list(value) if isinstance(value, list) else value) for key, value in selection.items()
+        }
+
+        def done(future: Future[Any]) -> None:
+            self._set_busy(False)
+            exc = future.exception()
+            if exc is not None:
+                self._show_error("The change could not be kept as it is", exc)
+            else:
+                report = future.result()
+                refused = report.get("refused") or []
+                if refused:
+                    lines = []
+                    for r in refused:
+                        target, error = str(r.get("target", "")), str(r.get("error", ""))
+                        lines.append(f"• {error}" if error.startswith(target) else f"• {target}: {error}")
+                    MessageDialog(self, title=KEEP_REFUSED_TITLE, message=KEEP_REFUSED_TEXT, details=lines)
+                    self.set_status(KEEP_PARTLY_TEXT.format(title=change.title), theme.WARNING)
+                else:
+                    # One record per detail line; those the selection left out are still tracked.
+                    rest = len(report.get("forgotten") or []) < len(change.details)
+                    done_text = KEEP_DONE_SOME_TEXT if rest else KEEP_DONE_TEXT
+                    self.set_status(done_text.format(title=change.title), theme.GOOD)
+            self._after_mutation()
+
+        def run() -> None:
+            assert self.engine is not None
+            self._set_busy(True, CLOSE_OTHER)
+            self.set_status(f"Keeping {change.title} as it is…")
+            self.engine.forget_targets(target_filter, callback=done)
+
+        MessageDialog(
+            self,
+            title=KEEP_TITLE.format(title=change.title),
+            message=message,
+            details=details,
+            confirm_text="Keep as is",
+            cancel_text="Cancel",
+            danger=danger,
+            on_confirm=run,
+        )
 
     def _on_history_undo(self, change: ChangeGroup) -> None:
         if not self._guard(needs_admin=change.needs_admin):
@@ -1860,6 +2390,7 @@ class App(
                 if lane.name not in confirmed and not getattr(self, lane.allow_close)():
                     return
         self._running = False
+        self._cancel_settled_check()
         instance = getattr(self, "instance", None)
         if instance is not None:
             try:

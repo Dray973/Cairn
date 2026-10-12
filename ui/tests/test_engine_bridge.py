@@ -11,10 +11,21 @@ from typing import Any
 
 import pytest
 
+from optimizer import PROJECT_URL
 from optimizer.bridge.engine import EngineBridge
 
 from .bridge_support import wait as _wait
 from .fake_engine import FakeEngine
+
+# A recorded Game Mode value that changed after Cairn set it.
+DRIFTED = {
+    "target": "HKLM\\Test\\gaming.game_mode",
+    "label": "gaming.game_mode",
+    "expected": "1",
+    "found": "0",
+    "original": "not set",
+    "back_to_original": False,
+}
 
 
 def test_calls_run_serially_on_one_worker_thread() -> None:
@@ -148,8 +159,8 @@ def test_restore_point_request_survives_an_apply_with_nothing_to_do() -> None:
         _wait(bridge, [empty])
         assert empty.result()["session_id"] is None
         assert bridge.next_mutation_creates_restore_point
-        _wait(bridge, [bridge.apply(["privacy.cortana"])])
-        assert engine.calls_named("apply")[-1] == (["privacy.cortana"], "try", False)
+        _wait(bridge, [bridge.apply(["privacy.advertising_id"])])
+        assert engine.calls_named("apply")[-1] == (["privacy.advertising_id"], "try", False)
         assert not bridge.next_mutation_creates_restore_point
     finally:
         bridge.shutdown()
@@ -157,16 +168,64 @@ def test_restore_point_request_survives_an_apply_with_nothing_to_do() -> None:
 
 def test_plan_revert_is_a_dry_run() -> None:
     engine = FakeEngine()
-    engine.applied.add("privacy.cortana")
+    engine.applied.add("privacy.advertising_id")
     bridge = EngineBridge(module=engine)  # type: ignore[arg-type]
     try:
-        plan = bridge.plan_revert(["privacy.cortana"])
+        plan = bridge.plan_revert(["privacy.advertising_id"])
         _wait(bridge, [plan])
-        assert engine.calls_named("revert")[-1] == (["privacy.cortana"], True)
-        assert plan.result()["actions"] == ["delete value: privacy.cortana"]
-        assert "privacy.cortana" in engine.applied
+        assert engine.calls_named("revert")[-1] == (["privacy.advertising_id"], True)
+        assert plan.result()["actions"] == ["delete value: privacy.advertising_id"]
+        assert "privacy.advertising_id" in engine.applied
     finally:
         bridge.shutdown()
+
+
+def test_drift_checks_and_keep_as_is_are_worker_calls_with_copied_arguments() -> None:
+    engine = FakeEngine(drift={"gaming.game_mode": [DRIFTED]})
+    engine.applied.add("gaming.game_mode")
+    bridge = EngineBridge(module=engine)  # type: ignore[arg-type]
+    ids = ["gaming.game_mode"]
+    record = {"hive": "HKLM", "key_path": "Test", "value_name": "gaming.game_mode"}
+    selection: dict[str, Any] = {"registry": [record]}
+    try:
+        futures = [bridge.drift(), bridge.verify(ids), bridge.forget_targets(selection)]
+        # Each call took a copy of its argument when it was queued.
+        ids.append("privacy.advertising_id")
+        selection["services"] = ["SysMain"]
+        _wait(bridge, futures)
+        drift, verify, forget = (f.result() for f in futures)
+        assert [(e["item"], e["mismatch"]) for e in drift["entries"]] == [("gaming.game_mode", DRIFTED)]
+        assert [e["item"] for e in verify["entries"]] == ["gaming.game_mode"]
+        assert engine.calls_named("verify") == [(["gaming.game_mode"],)]
+        assert engine.calls_named("forget_targets") == [({"registry": [record]},)]
+        assert forget == {"forgotten": [DRIFTED], "refused": []}
+        assert "gaming.game_mode" not in engine.applied
+        assert not bridge.busy
+    finally:
+        bridge.shutdown()
+
+
+def test_open_url_is_a_worker_call_and_supports_tells_what_an_older_engine_lacks() -> None:
+    newer = ("drift", "verify", "forget_targets", "open_url")
+    engine = FakeEngine()
+    bridge = EngineBridge(module=engine)  # type: ignore[arg-type]
+    try:
+        assert all(bridge.supports(name) for name in newer)
+        opened = bridge.open_url(PROJECT_URL)
+        refused = bridge.open_url("http://example.com/")
+        _wait(bridge, [opened, refused])
+        assert opened.result() is None
+        assert isinstance(refused.exception(), ValueError)
+        assert engine.calls_named("open_url") == [(PROJECT_URL,), ("http://example.com/",)]
+    finally:
+        bridge.shutdown()
+
+    older = EngineBridge(module=FakeEngine(unsupported=newer))  # type: ignore[arg-type]
+    try:
+        assert not any(older.supports(name) for name in newer)
+        assert older.supports("revert_targets")
+    finally:
+        older.shutdown()
 
 
 class _SettlingFuture:
@@ -262,6 +321,7 @@ def test_real_engine_module_scan_is_read_only() -> None:
             "gaming",
             "performance",
             "interface",
+            "security",
             "bloatware",
         }
         assert all(

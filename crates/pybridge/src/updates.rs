@@ -195,9 +195,11 @@ fn updates_jobs(py: Python<'_>) -> PyResult<Py<PyAny>> {
 /// "unparsed_rows", "warnings", "error" ({"code", "message", "availability", "outdated"} or
 /// None)}`; an update or install batch `{"kind", "items": [{"id", "name", "source", "from",
 /// "to", "state", "exit_code", "exit_code_hex", "message", "elapsed_ms", "detached",
-/// "retry"}], "current", "done", "total", "stopping", "restart_required"}`, where an item's
-/// `"retry"` is False when winget's answer can't change on a retry (an app installed in a way
-/// winget can't update, a policy, no installer for this PC). Keeps the GIL.
+/// "retry"}], "current", "done", "total", "stopping", "restart_required", "pending_restart"}`,
+/// where an item's `"retry"` is False when winget's answer can't change on a retry (an app
+/// installed in a way winget can't update, a policy, no installer for this PC), and
+/// `"pending_restart"` is True when one of Windows' pending-restart flags turned on while the
+/// batch ran. Keeps the GIL.
 #[pyfunction]
 #[pyo3(signature = (job_id, since = 0))]
 fn updates_result(py: Python<'_>, job_id: u64, since: u64) -> PyResult<Py<PyAny>> {
@@ -310,17 +312,21 @@ fn updates_wu_set(
 }
 
 /// The apps the Install apps view offers: `{"apps": [{"id", "name", "category"
-/// ("browsers" | "chat" | "gaming" | "media" | "productivity" | "utilities" |
-/// "developer"), "source"}], "custom" (the account's own list), "path", "warnings"}`.
-/// Reading changes nothing.
+/// ("browsers" | "chat" | "gaming" | "media" | "creative" | "productivity" | "utilities" |
+/// "security" | "developer"), "source"}], "custom" (the account's own list), "path",
+/// "warnings", "default_ids" (the built-in list's ids next to an account's own list, so the
+/// view can say which default apps it lacks; empty for the built-in list)}`. An entry of the
+/// account's file this version can't use, such as one with an unknown category, is left out
+/// and counted in `warnings`. Reading changes nothing.
 #[pyfunction]
 fn updates_app_list(py: Python<'_>) -> PyResult<Py<PyAny>> {
     blocking(py, || Ok(apps::app_list()))
 }
 
-/// Saves `apps` (a list of `{"id", "name", "category", "source" ("winget")}` dicts) as this
-/// account's list, or, with None, restores the built-in list. Returns the list as
-/// `updates_app_list` does. Invalid entries raise ValueError before anything is written.
+/// Saves `apps` (a list of `{"id", "name", "category", "source" ("winget")}` dicts, categories
+/// as `updates_app_list` lists them) as this account's list, or, with None, restores the
+/// built-in list. Returns the list as `updates_app_list` does. Invalid entries raise ValueError
+/// before anything is written.
 #[pyfunction]
 #[pyo3(signature = (apps = None))]
 fn updates_save_app_list(py: Python<'_>, apps: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {

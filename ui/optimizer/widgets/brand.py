@@ -12,6 +12,13 @@ Animation effects) the mark is drawn once and stays still. In the sidebar's rail
 cairn shows (`set_wordmark`), and the mark redraws itself when the window moves to a display
 with another scale.
 
+The renderer needs Pillow, which is imported only when something is drawn. When Pillow cannot
+be loaded, or only the Tk hook that shows its images in Tk cannot (Smart App Control, for one,
+judges each extension module that is not signed when it loads), the window still starts: the
+mark shows a still cairn and the windows get their icon from the prebuilt PNG images in
+`FALLBACK_DIR`, which Tk reads without Pillow. `write_fallback_images` draws those images with
+the same renderer.
+
 The same renderer draws the app icon (`write_icon`, with native high-contrast renders for the
 small sizes) and the README logo (`write_logo`); `scripts/make_icon.py` writes both. Windows
 get the icon through `set_window_icon`, which Tk releases with the window.
@@ -21,16 +28,20 @@ from __future__ import annotations
 
 import ctypes
 import functools
+import importlib
 import logging
 import math
 import tkinter as tk
 import tkinter.font as tkfont
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import customtkinter as ctk
-from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageTk
 
-from .. import APP_NAME, ICON_PATH, theme
+from .. import APP_NAME, ICON_PATH, PACKAGE_DIR, theme
+
+if TYPE_CHECKING:
+    from PIL import Image, ImageTk
 
 log = logging.getLogger(__name__)
 
@@ -71,8 +82,53 @@ LOGO_SIZE_PX = 224
 TEXT_BASE = theme.blend(theme.ACCENT, theme.INK, 0.28)
 TEXT_HIGHLIGHT = theme.INK
 EXTRUDE_COLORS = tuple(theme.blend(theme.ACCENT, theme.PAGE, a) for a in (0.16, 0.24, 0.34, 0.46))
+# The prebuilt images shown when Pillow cannot be loaded: `mark-<pixels>.png`, the mark's
+# cairn at each display scale of MARK_SCALES, and `icon-<pixels>.png`, every icon size.
+FALLBACK_DIR = PACKAGE_DIR / "assets" / "fallback"
+MARK_SCALES = (1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 3.0)
 
 _LIGHT = (-0.55, -0.62, 0.56)
+
+
+class Pillow(NamedTuple):
+    """The Pillow modules the renderer uses."""
+
+    Image: Any
+    ImageChops: Any
+    ImageDraw: Any
+    ImageFilter: Any
+    ImageTk: Any
+
+
+def pillow() -> Pillow | None:
+    """Pillow's modules, imported on first use; None when Pillow, or the Tk hook its photos
+    need, cannot be loaded."""
+    try:
+        from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageTk
+
+        # ImageTk loads its Tk hook, the extension module _imagingtk, only when it makes its
+        # first photo, which happens while a window is built. Loaded here, a hook that cannot
+        # be loaded (a file that Windows refuses, or Tcl and Tk functions it cannot find)
+        # selects the prebuilt images as well.
+        importlib.import_module("PIL._imagingtk")
+    except (ImportError, OSError, RuntimeError):
+        return None
+    return Pillow(Image, ImageChops, ImageDraw, ImageFilter, ImageTk)
+
+
+def _require_pillow() -> Pillow:
+    pil = pillow()
+    if pil is None:
+        raise RuntimeError("Pillow cannot be loaded, so the cairn cannot be rendered")
+    return pil
+
+
+@functools.cache
+def _log_fallback() -> None:
+    """Says once per process that the window shows the prebuilt images."""
+    log.warning(
+        "Pillow or its Tk hook cannot be loaded: the window shows prebuilt images and the cairn does not turn"
+    )
 
 
 def _rgb(color: str) -> tuple[int, int, int]:
@@ -88,6 +144,16 @@ def _normalized(v: tuple[float, float, float]) -> tuple[float, float, float]:
     return v[0] / n, v[1] / n, v[2] / n
 
 
+def mark_size(scale: float) -> int:
+    """The cairn's size in pixels in the mark at display scale `scale`."""
+    return max(16, round(LOGO_SIZE * scale))
+
+
+def fallback_mark_size(pixels: int) -> int:
+    """The size of the prebuilt cairn closest to `pixels` (the larger one of two as close)."""
+    return min((mark_size(scale) for scale in MARK_SCALES), key=lambda size: (abs(size - pixels), -size))
+
+
 def animations_enabled() -> bool:
     """Windows' "Animation effects" setting (SPI_GETCLIENTAREAANIMATION); True when unknown."""
     try:
@@ -101,9 +167,11 @@ def animations_enabled() -> bool:
 
 class CairnRenderer:
     """Renders the cairn at a fixed pixel size; `frame(turn)` gives the stones turned by
-    `turn` (0..1 of a revolution). Everything that does not move is computed once."""
+    `turn` (0..1 of a revolution). Everything that does not move is computed once. Needs
+    Pillow."""
 
     def __init__(self, size: int, background: str | None = theme.PAGE, *, contrast: bool = False) -> None:
+        self._pil = _require_pillow()
         self.size = size
         self.background = background
         self.contrast = contrast
@@ -165,17 +233,18 @@ class CairnRenderer:
     def _backdrop(self, s: int) -> bytes:
         """The background with the soft contact shadow under the bottom stone (none in a
         high-contrast render, where it would blur the outline)."""
+        image_module, draw, filters = self._pil.Image, self._pil.ImageDraw, self._pil.ImageFilter
         bg = (0, 0, 0, 0) if self.background is None else (*_rgb(self.background), 255)
-        img = Image.new("RGBA", (s, s), bg)
+        img = image_module.new("RGBA", (s, s), bg)
         if self.contrast:
             return img.tobytes()
-        shadow = Image.new("L", (s, s), 0)
+        shadow = image_module.new("L", (s, s), 0)
         cx, cy, a, b = STONES[0]
-        ImageDraw.Draw(shadow).ellipse(
+        draw.Draw(shadow).ellipse(
             ((cx - a * 1.02) * s, (cy + b * 0.35) * s, (cx + a * 1.02) * s, (cy + b * 1.55) * s), fill=150
         )
-        shadow = shadow.filter(ImageFilter.GaussianBlur(s * 0.035))
-        dark = Image.new("RGBA", (s, s), (0, 0, 0, 255))
+        shadow = shadow.filter(filters.GaussianBlur(s * 0.035))
+        dark = image_module.new("RGBA", (s, s), (0, 0, 0, 255))
         img.paste(dark, (0, 0), shadow)
         return img.tobytes()
 
@@ -192,23 +261,25 @@ class CairnRenderer:
             buf[offset + 1] = max(0, min(255, int(g + mg * m)))
             buf[offset + 2] = max(0, min(255, int(b + mb * m)))
             buf[offset + 3] = 255
-        big = Image.frombytes("RGBA", (self._s, self._s), bytes(buf))
-        image = big.resize((self.size, self.size), Image.Resampling.LANCZOS)
-        return _outlined(image) if self.contrast else image
+        image_module = self._pil.Image
+        big = image_module.frombytes("RGBA", (self._s, self._s), bytes(buf))
+        image = big.resize((self.size, self.size), image_module.Resampling.LANCZOS)
+        return _outlined(image, self._pil) if self.contrast else image
 
 
-def _outlined(image: Image.Image) -> Image.Image:
+def _outlined(image: Image.Image, pil: Pillow) -> Image.Image:
     """`image` over a light one-pixel outline of its silhouette."""
     mask = image.getchannel("A").point(lambda a: 255 if a >= 128 else 0)
-    ring = ImageChops.subtract(mask.filter(ImageFilter.MaxFilter(3)), mask)
-    outline = Image.new("RGBA", image.size, (*OUTLINE_COLOR, 0))
+    ring = pil.ImageChops.subtract(mask.filter(pil.ImageFilter.MaxFilter(3)), mask)
+    outline = pil.Image.new("RGBA", image.size, (*OUTLINE_COLOR, 0))
     outline.putalpha(ring.point(lambda a: OUTLINE_ALPHA if a else 0))
-    return Image.alpha_composite(outline, image)
+    return pil.Image.alpha_composite(outline, image)
 
 
 def icon_images() -> list[Image.Image]:
     """Every icon size, smallest first: sizes up to NATIVE_ICON_MAX rendered natively in high
     contrast, the others downsampled from the 256 px render."""
+    lanczos = _require_pillow().Image.Resampling.LANCZOS
     large = CairnRenderer(256, background=None).frame(ICON_TURN)
     images = []
     for size in ICON_SIZES:
@@ -217,7 +288,7 @@ def icon_images() -> list[Image.Image]:
         elif size == large.width:
             images.append(large)
         else:
-            images.append(large.resize((size, size), Image.Resampling.LANCZOS))
+            images.append(large.resize((size, size), lanczos))
     return images
 
 
@@ -238,12 +309,46 @@ def write_logo(path: str | Path, size: int = LOGO_SIZE_PX) -> None:
     CairnRenderer(size, background=None).frame(ICON_TURN).save(str(path), format="PNG")
 
 
+def fallback_images() -> dict[str, Image.Image]:
+    """The prebuilt images by file name: the mark's cairn in its first pose on the page colour,
+    at the size of each display scale of MARK_SCALES, and every icon size."""
+    images: dict[str, Image.Image] = {}
+    for scale in MARK_SCALES:
+        size = mark_size(scale)
+        images[f"mark-{size}.png"] = CairnRenderer(size).frame(0.0)
+    for image in icon_images():
+        images[f"icon-{image.width}.png"] = image
+    return images
+
+
+def write_fallback_images(folder: str | Path = FALLBACK_DIR) -> list[Path]:
+    """Writes `fallback_images` into `folder` as PNG files; their paths."""
+    target = Path(folder)
+    target.mkdir(parents=True, exist_ok=True)
+    written = []
+    for name, image in fallback_images().items():
+        path = target / name
+        image.save(str(path), format="PNG")
+        written.append(path)
+    return written
+
+
+def _fallback_photo(name: str, master: tk.Misc) -> tk.PhotoImage | None:
+    """The prebuilt image `name` of FALLBACK_DIR as a Tk photo; None when it cannot be read."""
+    try:
+        return tk.PhotoImage(file=str(FALLBACK_DIR / name), master=master)
+    except tk.TclError:
+        log.warning("the prebuilt image %s could not be read", name, exc_info=True)
+        return None
+
+
 @functools.cache
 def window_icon_images(path: Path = ICON_PATH) -> tuple[Image.Image, ...]:
     """Every size of the icon file at `path` as an RGBA image, smallest first; empty when the
-    file cannot be read."""
+    file cannot be read. Needs Pillow."""
+    pil = _require_pillow()
     try:
-        with Image.open(path) as icon:
+        with pil.Image.open(path) as icon:
             images = []
             for size in sorted(icon.info["sizes"]):
                 icon.size = size
@@ -254,9 +359,20 @@ def window_icon_images(path: Path = ICON_PATH) -> tuple[Image.Image, ...]:
     return tuple(images)
 
 
+def _icon_photos(root: tk.Misc) -> tuple[Any, ...]:
+    """Photos of every icon size for `root`'s interpreter: read from the icon file through
+    Pillow, or the prebuilt images when Pillow cannot be loaded."""
+    pil = pillow()
+    if pil is None:
+        _log_fallback()
+        photos = (_fallback_photo(f"icon-{size}.png", root) for size in ICON_SIZES)
+        return tuple(photo for photo in photos if photo is not None)
+    return tuple(pil.ImageTk.PhotoImage(image, master=root) for image in window_icon_images())
+
+
 def set_window_icon(window: tk.Tk | tk.Toplevel, *, default: bool = False) -> bool:
     """Gives `window` the Cairn icon: every size of `ICON_PATH` through `wm iconphoto`, from
-    photos made once per Tk interpreter.
+    photos made once per Tk interpreter (from the prebuilt images when Pillow cannot be loaded).
 
     Tk frees an icon made from photos when its window is destroyed, while an icon read from an
     .ico file with `wm iconbitmap` stays allocated until the process ends (27 GDI and 9 USER
@@ -268,9 +384,9 @@ def set_window_icon(window: tk.Tk | tk.Toplevel, *, default: bool = False) -> bo
     file cannot be read: the window keeps the icon it has.
     """
     root = window._root()
-    photos: tuple[ImageTk.PhotoImage, ...] | None = getattr(root, _ICON_PHOTOS, None)
+    photos: tuple[Any, ...] | None = getattr(root, _ICON_PHOTOS, None)
     if photos is None:
-        photos = tuple(ImageTk.PhotoImage(image, master=root) for image in window_icon_images())
+        photos = _icon_photos(root)
         setattr(root, _ICON_PHOTOS, photos)
     if not photos:
         return False
@@ -298,38 +414,53 @@ class BrandMark(tk.Canvas):
     """The sidebar's cairn and name. Call `tick(now)` once per frame.
 
     `set_wordmark(False)` shows the cairn alone (the sidebar's rail mode). The mark follows
-    the window's display scale: at a new scale its images and text are drawn again.
+    the window's display scale: at a new scale its images and text are drawn again. Without
+    Pillow the cairn is the prebuilt image closest to the scale's size and stays still.
     """
 
     def __init__(self, master: tk.Misc, *, animate: bool | None = None) -> None:
         super().__init__(master, width=1, height=1, bg=theme.PAGE, highlightthickness=0, bd=0)
         self.animate = animations_enabled() if animate is None else animate
         self._wordmark = True
+        self._alive = True
         self._draw(ctk.ScalingTracker.get_widget_scaling(master))
         ctk.ScalingTracker.add_widget(self._rescale, self)
 
     def _draw(self, scale: float) -> None:
         """Creates the images and canvas items for display scale `scale`."""
         self.delete("all")
-        self._logo_px = max(16, round(LOGO_SIZE * scale))
+        wanted = mark_size(scale)
+        # Rendered poses, shown one at a time through one photo: every photo that has been on
+        # screen holds a GDI bitmap for as long as it exists, so a photo per pose would hold
+        # TURN_FRAMES of them.
+        self._frames: list[Image.Image | None] = []
+        self._renderer: CairnRenderer | None = None
+        self._photo: ImageTk.PhotoImage | tk.PhotoImage | None
+        pil = pillow()
+        if pil is None:
+            _log_fallback()
+            self._photo = _fallback_photo(f"mark-{fallback_mark_size(wanted)}.png", self)
+            self._logo_px = self._photo.width() if self._photo is not None else wanted
+        else:
+            self._logo_px = wanted
+            renderer = CairnRenderer(self._logo_px)
+            self._renderer = renderer
+            first = renderer.frame(0.0)
+            self._frames = [None] * TURN_FRAMES
+            self._frames[0] = first
+            self._photo = pil.ImageTk.PhotoImage(first, master=self)
+        self._shown = 0
+        self._shimmer_step = -1
         font = tkfont.Font(root=self, family=theme.FONT_FAMILY, size=-round(NAME_SIZE * scale), weight="bold")
         depth = len(EXTRUDE_COLORS)
         gap = round(10 * scale)
         text_w = font.measure(NAME) + depth + 2
         height = max(self._logo_px, font.metrics("linespace") + depth)
         self._full_width = self._logo_px + gap + text_w
-        renderer = CairnRenderer(self._logo_px)
-        self._renderer: CairnRenderer | None = renderer
-        # Rendered poses, shown one at a time through one photo: every photo that has been on
-        # screen holds a GDI bitmap for as long as it exists, so a photo per pose would hold
-        # TURN_FRAMES of them.
-        first = renderer.frame(0.0)
-        self._frames: list[Image.Image | None] = [None] * TURN_FRAMES
-        self._frames[0] = first
-        self._shown = 0
-        self._shimmer_step = -1
-        self._photo: ImageTk.PhotoImage | None = ImageTk.PhotoImage(first, master=self)
-        self._logo = self.create_image(0, height // 2, image=self._photo, anchor="w")
+        if self._photo is not None:
+            self._logo = self.create_image(0, height // 2, image=self._photo, anchor="w")
+        else:
+            self._logo = self.create_image(0, height // 2, anchor="w")
         x0 = self._logo_px + gap
         y = height // 2 - depth // 2
         # Extrusion layers from the back to the front, then one item per letter on top.
@@ -372,6 +503,7 @@ class BrandMark(tk.Canvas):
         super().destroy()
         # CustomTkinter's trackers keep every root, and so the closed window's widgets, for
         # the life of the process: the mark lets go of its poses, photo and renderer here.
+        self._alive = False
         self._renderer = None
         self._photo = None
         self._frames = []
@@ -382,18 +514,19 @@ class BrandMark(tk.Canvas):
 
     def tick(self, now: float) -> None:
         """Advances the animation to `now` (seconds, any monotonic clock); nothing once the
-        mark is destroyed."""
-        renderer, photo = self._renderer, self._photo
-        if not self.animate or renderer is None or photo is None:
+        mark is destroyed. Without Pillow only the name's highlight moves."""
+        if not self.animate or not self._alive:
             return
-        index = int((now % TURN_SECONDS) / TURN_SECONDS * TURN_FRAMES) % TURN_FRAMES
-        if index != self._shown:
-            pose = self._frames[index]
-            if pose is None:
-                # Poses are rendered on first use, so a tick renders at most one.
-                pose = self._frames[index] = renderer.frame(index / TURN_FRAMES)
-            photo.paste(pose)
-            self._shown = index
+        renderer, photo = self._renderer, self._photo
+        if renderer is not None and photo is not None:
+            index = int((now % TURN_SECONDS) / TURN_SECONDS * TURN_FRAMES) % TURN_FRAMES
+            if index != self._shown:
+                pose = self._frames[index]
+                if pose is None:
+                    # Poses are rendered on first use, so a tick renders at most one.
+                    pose = self._frames[index] = renderer.frame(index / TURN_FRAMES)
+                photo.paste(pose)
+                self._shown = index
         if not self._wordmark:
             return
         step = int((now % SHIMMER_SECONDS) / SHIMMER_SECONDS * 120)

@@ -51,9 +51,9 @@
     // ───────────────────────────── C++ telemetry DLL ─────────────────────────────
     {
       "label": "cpp: configure",
-      "detail": "CMake configure with the Visual Studio 17 2022 x64 generator (auto-locates MSVC + Windows SDK).",
+      "detail": "CMake configure for x64 with CMake's default generator: the newest installed Visual Studio (2022 or later), which locates MSVC and the Windows SDK.",
       "type": "shell",
-      "command": "cmake -S '${workspaceFolder}' -B '${workspaceFolder}\\build\\cpp' -G 'Visual Studio 17 2022' -A x64 -DCMAKE_BUILD_TYPE=Release",
+      "command": "cmake -S '${workspaceFolder}' -B '${workspaceFolder}\\build\\cpp' -A x64",
       "problemMatcher": []
     },
     {

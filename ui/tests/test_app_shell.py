@@ -440,7 +440,10 @@ def test_f1_shows_about_with_every_part_and_its_links(
     assert "MIT License" in text
 
     button(dialog, "Project page").invoke()
-    assert opened_uris == [PROJECT_URL]
+    # Elevated, the page goes through the engine, which keeps the browser unelevated.
+    pump(app, 5.0, until=lambda: bool(engine.calls_named("open_url")))
+    assert engine.calls_named("open_url") == [(PROJECT_URL,)]
+    assert opened_uris == []
     button(dialog, "Open data folder").invoke()
     assert opened_folders == [], "the fake data folder does not exist"
     assert app.status_message.cget("text") == NO_DATA_YET_TEXT

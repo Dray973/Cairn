@@ -42,4 +42,7 @@ def test_the_deployed_engine_reports_the_app_version() -> None:
     except EngineUnavailable as exc:
         pytest.skip(str(exc))
     engine = str(module.version())
-    assert engine == __version__
+    assert engine == __version__, (
+        f"the deployed engine is {engine}: build this tree's engine and deploy it "
+        "(cargo build --release, then scripts\\deploy_natives.ps1 -Config Release)"
+    )

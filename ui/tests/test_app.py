@@ -11,7 +11,15 @@ import time
 import tkinter as tk
 from typing import Any
 
-from optimizer.app import BUSY_CLOSE_TITLE, CLOSE_IRREVERSIBLE, CLOSE_JOURNALED, CLOSE_READ, CLOSE_TEXTS
+from optimizer.app import (
+    BUSY_CLOSE_TITLE,
+    CLOSE_IRREVERSIBLE,
+    CLOSE_JOURNALED,
+    CLOSE_READ,
+    CLOSE_TEXTS,
+    NOT_RESTORED_ONE,
+    NOT_RESTORED_TITLE,
+)
 from optimizer.widgets.charts import TimeSeriesChart
 from optimizer.widgets.controls import PANEL_WRAP, ROW_WRAP
 from optimizer.widgets.monitor import TABLE_ROWS
@@ -242,7 +250,7 @@ def test_turning_a_mode_on_and_off_goes_through_confirmation(
     app.toggles["privacy"].switch.toggle()
     confirm_dialog(app)
     pump(app, 5.0, until=lambda: "Off" in app.toggles["privacy"].status.cget("text"))
-    assert engine.calls_named("revert")[-1] == (["privacy.activity_history", "privacy.cortana"], False)
+    assert engine.calls_named("revert")[-1] == (["privacy.activity_history", "privacy.advertising_id"], False)
     assert not app.toggles["privacy"].switch.get()
     assert app.errors == []
 
@@ -250,7 +258,7 @@ def test_turning_a_mode_on_and_off_goes_through_confirmation(
 def test_revert_all_requires_confirmation(make_app: AppFactory) -> None:
     app, engine = make_app(elevated=True)
     pump(app, 5.0, until=lambda: app.optimize_list.row_count > 0)
-    engine.applied.update({"privacy.cortana", "gaming.game_mode"})
+    engine.applied.update({"privacy.advertising_id", "gaming.game_mode"})
 
     app.revert_button.invoke()
     pump(app, 5.0, until=lambda: bool(dialogs(app)))
@@ -361,28 +369,28 @@ def test_history_tab_groups_changes_and_undoes_one(
     make_app: AppFactory,
 ) -> None:
     app, engine = make_app(elevated=True)
-    engine.applied.update({"privacy.cortana", "gaming.game_mode"})
+    engine.applied.update({"privacy.advertising_id", "gaming.game_mode"})
     pump(app, 5.0, until=lambda: app.optimize_list.row_count > 0 and bool(app._titles))
     show_section(app, "History")
     pump(app, 5.0, until=lambda: app.history_panel.row_count == 2)
     titles = {g.title for g in app.history_panel.groups}
-    assert titles == {"Cortana", "Game Mode"}
-    group = next(g for g in app.history_panel.groups if g.title == "Cortana")
+    assert titles == {"Advertising Id", "Game Mode"}
+    group = next(g for g in app.history_panel.groups if g.title == "Advertising Id")
     app._on_history_undo(group)
     confirm_dialog(app)
     pump(app, 5.0, until=lambda: bool(engine.calls_named("revert_targets")))
     sent = engine.calls_named("revert_targets")[-1][0]
-    assert sent["registry"] == [{"hive": "HKLM", "key_path": "Test", "value_name": "privacy.cortana"}]
-    pump(app, 5.0, until=lambda: "privacy.cortana" not in engine.applied)
+    assert sent["registry"] == [{"hive": "HKLM", "key_path": "Test", "value_name": "privacy.advertising_id"}]
+    pump(app, 5.0, until=lambda: "privacy.advertising_id" not in engine.applied)
     assert app.errors == []
 
 
 def test_undo_is_offered_only_for_changes_this_tool_recorded(
     make_app: AppFactory,
 ) -> None:
-    # File extensions were already shown before the tool ran; Cortana was changed by it.
+    # File extensions were already shown before the tool ran; the advertising ID was changed by it.
     app, engine = make_app(elevated=True, preset={"interface.file_extensions"})
-    engine.applied.add("privacy.cortana")
+    engine.applied.add("privacy.advertising_id")
     pump(app, 5.0, until=lambda: scanned(app))
     rows = rows_by_id(app)
 
@@ -393,7 +401,7 @@ def test_undo_is_offered_only_for_changes_this_tool_recorded(
     assert preset.tag_label.cget("text") == "Already set"
     assert preset.tag_label.cget("text_color") == theme.INK_MUTED
 
-    recorded = rows["privacy.cortana"]
+    recorded = rows["privacy.advertising_id"]
     assert recorded.action_button is not None
     assert recorded.action_button.cget("text") == "Undo"
     assert recorded.tag_label is None
@@ -408,17 +416,17 @@ def test_undo_is_offered_only_for_changes_this_tool_recorded(
     pump(app, 5.0, until=lambda: idle(app))
     app._on_item_action(recorded.item, "revert")
     text = confirm_dialog_text(app)
-    assert "delete value: privacy.cortana" in text
-    pump(app, 5.0, until=lambda: "privacy.cortana" not in engine.applied)
-    assert engine.calls_named("revert")[-1] == (["privacy.cortana"], False)
+    assert "delete value: privacy.advertising_id" in text
+    pump(app, 5.0, until=lambda: "privacy.advertising_id" not in engine.applied)
+    assert engine.calls_named("revert")[-1] == (["privacy.advertising_id"], False)
     assert app.errors == []
 
 
 def test_item_note_is_shown_as_a_warning(make_app: AppFactory) -> None:
-    app, _ = make_app(elevated=True, notes={"privacy.cortana": "Has no effect on this Windows build."})
+    app, _ = make_app(elevated=True, notes={"privacy.advertising_id": "Has no effect on this Windows build."})
     pump(app, 5.0, until=lambda: scanned(app))
     rows = rows_by_id(app)
-    note = rows["privacy.cortana"].note_label
+    note = rows["privacy.advertising_id"].note_label
     assert note is not None
     assert note.cget("text") == "⚠ Has no effect on this Windows build."
     assert note.cget("text_color") == theme.WARNING
@@ -439,11 +447,11 @@ LONG_NOTE = (
 
 
 def test_optimize_list_wraps_text_to_the_width_it_has(make_app: AppFactory) -> None:
-    long_ids = ("privacy.cortana", "gaming.game_mode")
+    long_ids = ("privacy.advertising_id", "gaming.game_mode")
     app, _ = make_app(
         elevated=True,
         descriptions=dict.fromkeys(long_ids, LONG_DESCRIPTION),
-        notes={"privacy.cortana": LONG_NOTE},
+        notes={"privacy.advertising_id": LONG_NOTE},
     )
     pump(app, 5.0, until=lambda: scanned(app))
     show_section(app, "Optimize")
@@ -453,7 +461,7 @@ def test_optimize_list_wraps_text_to_the_width_it_has(make_app: AppFactory) -> N
     assert panel.row_wrap < ROW_WRAP, "the text column is narrower than the usual line length"
     assert panel.summary.cget("wraplength") < PANEL_WRAP
     rows = rows_by_id(app)
-    assert rows["privacy.cortana"].note_label is not None
+    assert rows["privacy.advertising_id"].note_label is not None
     for item_id in long_ids:
         for label in rows[item_id].wrapped_labels:
             assert label.cget("wraplength") == panel.row_wrap
@@ -463,13 +471,13 @@ def test_optimize_list_wraps_text_to_the_width_it_has(make_app: AppFactory) -> N
     app.start_scan()
     pump(app, 5.0, until=lambda: scanned(app))
     rows = rows_by_id(app)
-    assert rows["privacy.cortana"].description_label.cget("wraplength") == panel.row_wrap
+    assert rows["privacy.advertising_id"].description_label.cget("wraplength") == panel.row_wrap
 
     # A wide window keeps the usual line length.
     resize(app, "1440x900")
     assert panel.row_wrap == ROW_WRAP
     assert panel.summary.cget("wraplength") == PANEL_WRAP
-    for label in rows["privacy.cortana"].wrapped_labels:
+    for label in rows["privacy.advertising_id"].wrapped_labels:
         assert label.cget("wraplength") == ROW_WRAP
         assert label.winfo_width() >= label.winfo_reqwidth()
     assert app.errors == []
@@ -525,6 +533,56 @@ def test_turn_off_and_revert_all_confirmations_name_the_restart(
     assert engine.applied == {"interface.file_extensions"}
     assert not [c for c in engine.calls_named("revert") if c[1] is False]
     assert (False,) not in engine.calls_named("revert_all")
+    assert app.errors == []
+
+
+def test_revert_dialog_lists_not_restored(make_app: AppFactory) -> None:
+    changed_again = {
+        "target": "HKLM\\Test\\gaming.game_mode",
+        "label": "AllowAutoGameMode",
+        "expected": "not set",
+        "found": "1",
+        "original": "not set",
+        "back_to_original": False,
+    }
+    app, engine = make_app(elevated=True, not_restored={"gaming.game_mode": [changed_again]})
+    engine.applied.update({"gaming.game_mode", "privacy.advertising_id"})
+    pump(app, 5.0, until=lambda: scanned(app))
+    statuses = record_statuses(app)
+    app._on_item_action(rows_by_id(app)["gaming.game_mode"].item, "revert")
+    confirm_dialog(app)
+    pump(app, 5.0, until=lambda: any(d.title_text == NOT_RESTORED_TITLE for d in dialogs(app)))
+    dialog = next(d for d in dialogs(app) if d.title_text == NOT_RESTORED_TITLE)
+    text = dialog_text(dialog)
+    assert "1 change restored, 1 changed again." in text
+    assert NOT_RESTORED_ONE in text
+    assert "• AllowAutoGameMode is 1, not the original not set" in text
+    assert "by Windows" not in text, "no cause is named"
+    assert "⚠ Done: 1 change restored, 1 changed again." in statuses
+    cancel_shown(app, dialog)
+    pump(app, 5.0, until=lambda: scanned(app))
+    assert app.status_message.cget("text") == "⚠ Done: 1 change restored, 1 changed again."
+    assert app.status_message.cget("text_color") == theme.WARNING
+    assert "gaming.game_mode" not in engine.applied, "the record stays reverted"
+
+    # Read errors of the read-back join the details, after a restore that held.
+    warning = "HKLM\\Test\\privacy.advertising_id: cannot be read back (access denied)"
+    revert = engine.revert
+
+    def with_warning(ids: list[str], dry_run: bool = False) -> dict[str, Any]:
+        report = revert(ids, dry_run=dry_run)
+        if not dry_run:
+            report["warnings"] = [warning]
+        return report
+
+    engine.revert = with_warning  # type: ignore[method-assign]
+    app._on_item_action(rows_by_id(app)["privacy.advertising_id"].item, "revert")
+    confirm_dialog(app)
+    pump(app, 5.0, until=lambda: any(d.title_text == "Changes restored" for d in dialogs(app)))
+    dialog = next(d for d in dialogs(app) if d.title_text == "Changes restored")
+    assert f"⚠ {warning}" in dialog_text(dialog)
+    cancel_shown(app, dialog)
+    pump(app, 5.0, until=lambda: scanned(app))
     assert app.errors == []
 
 
@@ -647,7 +705,7 @@ def test_turning_a_mode_off_keeps_tweaks_that_are_not_recommended(
     text = confirm_dialog_text(app)
     assert "privacy.location" not in text
     pump(app, 5.0, until=lambda: "Off" in toggle.status.cget("text") and idle(app))
-    assert engine.calls_named("revert")[-1] == (["privacy.activity_history", "privacy.cortana"], False)
+    assert engine.calls_named("revert")[-1] == (["privacy.activity_history", "privacy.advertising_id"], False)
     assert not engine.calls_named("revert_category")
     assert engine.applied == {"privacy.location"}
     assert app.errors == []
@@ -666,10 +724,10 @@ def test_partly_on_mode_can_apply_the_rest(make_app: AppFactory) -> None:
 
     toggle.remaining_button.invoke()
     text = confirm_dialog_text(app)
-    assert "privacy.cortana" in text
+    assert "privacy.advertising_id" in text
     pump(app, 5.0, until=lambda: "✓ On" in toggle.status.cget("text") and idle(app))
     assert engine.calls_named("apply_category")[-1] == ("privacy", "try", False)
-    assert engine.applied == {"privacy.activity_history", "privacy.cortana"}
+    assert engine.applied == {"privacy.activity_history", "privacy.advertising_id"}
     assert not toggle.remaining_button.grid_info()
     assert app.errors == []
 
@@ -677,8 +735,8 @@ def test_partly_on_mode_can_apply_the_rest(make_app: AppFactory) -> None:
 def test_values_already_in_place_do_not_turn_a_mode_on(
     make_app: AppFactory,
 ) -> None:
-    # Cortana and Game Mode were already set before the tool ran: nothing is recorded.
-    app, engine = make_app(elevated=True, preset={"privacy.cortana", "gaming.game_mode"})
+    # The advertising ID and Game Mode were already set before the tool ran: nothing is recorded.
+    app, engine = make_app(elevated=True, preset={"privacy.advertising_id", "gaming.game_mode"})
     pump(app, 5.0, until=lambda: scanned(app))
     privacy = app.toggles["privacy"]
     assert "Partly on" in privacy.status.cget("text")
@@ -700,7 +758,7 @@ def test_values_already_in_place_do_not_turn_a_mode_on(
     privacy.switch.toggle()
     text = confirm_dialog_text(app)
     assert "delete value: privacy.activity_history" in text
-    assert "delete value: privacy.cortana" not in text
+    assert "delete value: privacy.advertising_id" not in text
     pump(app, 5.0, until=lambda: "Partly on" in privacy.status.cget("text") and idle(app))
     assert not privacy.switch.get()
     assert not engine.applied
@@ -723,7 +781,7 @@ def test_partly_on_mode_can_be_turned_off(make_app: AppFactory) -> None:
     text = confirm_dialog_text(app)
     assert "Turn off Privacy Mode" in text
     pump(app, 5.0, until=lambda: "Off" in toggle.status.cget("text") and idle(app))
-    assert engine.calls_named("revert")[-1] == (["privacy.activity_history", "privacy.cortana"], False)
+    assert engine.calls_named("revert")[-1] == (["privacy.activity_history", "privacy.advertising_id"], False)
     assert not engine.applied
     assert not toggle.switch.get()
     assert app.errors == []
@@ -738,7 +796,7 @@ APPX_ERROR = (
 
 
 def test_scan_warnings_are_shown_in_both_lists(make_app: AppFactory) -> None:
-    app, _ = make_app(elevated=True, unreadable={"privacy.cortana"}, appx_inventory_error=APPX_ERROR)
+    app, _ = make_app(elevated=True, unreadable={"privacy.advertising_id"}, appx_inventory_error=APPX_ERROR)
     pump(app, 5.0, until=lambda: scanned(app))
 
     apps = app.apps_list
@@ -754,9 +812,9 @@ def test_scan_warnings_are_shown_in_both_lists(make_app: AppFactory) -> None:
     assert apps.empty_label.cget("text_color") == theme.WARNING
 
     optimize = app.optimize_list
-    assert optimize.warnings == ["privacy.cortana: cannot read registry value: access denied"]
+    assert optimize.warnings == ["privacy.advertising_id: cannot read registry value: access denied"]
     assert optimize.warning_label.grid_info()
-    row = rows_by_id(app)["privacy.cortana"]
+    row = rows_by_id(app)["privacy.advertising_id"]
     assert row.warning_labels
     assert row.warning_labels[0].cget("text") == "⚠ cannot read registry value: access denied"
     assert row.warning_labels[0].cget("text_color") == theme.WARNING
@@ -805,7 +863,7 @@ def test_failed_rescan_after_a_change_shows_the_mode_status_as_unknown(
     toggle.switch.toggle()
     confirm_dialog(app)
     pump(app, 5.0, until=lambda: "Scan failed" in app.status_message.cget("text") and idle(app))
-    assert engine.applied == {"privacy.activity_history", "privacy.cortana"}
+    assert engine.applied == {"privacy.activity_history", "privacy.advertising_id"}
     # The scan from before the change is out of date, so no state is shown.
     assert toggle.status.cget("text") == STATUS_UNKNOWN
     assert app.toggles["gaming"].status.cget("text") == STATUS_UNKNOWN
@@ -917,29 +975,43 @@ def test_busy_close_then_tools_check_order(make_app: AppFactory) -> None:
 
 
 def test_closing_during_a_read_says_it_is_safe(make_app: AppFactory) -> None:
-    app, engine = make_app(elevated=True, slow={"catalog": 1.0, "scan": 1.0})
-    assert app.engine is not None and app.engine.busy and not app._busy, "only the catalog read runs"
-    dialog = close_dialog(app)
-    text = dialog_text(dialog)
-    assert CLOSE_TEXTS[CLOSE_READ] in text
-    assert "recorded" not in text and "background" not in text
-    assert dialog.confirm_button.cget("text") == "Close"
-    assert dialog.confirm_button.cget("fg_color") != theme.CRITICAL
-    cancel_shown(app, dialog)
+    app, engine = make_app(elevated=True, slow={"catalog": 1.0})
+    # The scan runs until it is released, however long the machine takes to get there.
+    started = threading.Event()
+    release = threading.Event()
+    scan = engine.scan
 
-    # A scan holds the window busy, and it is a read as well; closing then closes.
-    pump(app, 5.0, until=lambda: app._busy and bool(engine.calls_named("scan")))
-    dialog = close_dialog(app)
-    assert CLOSE_TEXTS[CLOSE_READ] in dialog_text(dialog)
-    dialog.confirm_button.invoke()
-    assert not app._running
+    def held_scan() -> dict[str, Any]:
+        started.set()
+        release.wait(30)
+        return scan()
+
+    engine.scan = held_scan  # type: ignore[method-assign]
+    try:
+        assert app.engine is not None and app.engine.busy and not app._busy, "only the catalog read runs"
+        dialog = close_dialog(app)
+        text = dialog_text(dialog)
+        assert CLOSE_TEXTS[CLOSE_READ] in text
+        assert "recorded" not in text and "background" not in text
+        assert dialog.confirm_button.cget("text") == "Close"
+        assert dialog.confirm_button.cget("fg_color") != theme.CRITICAL
+        cancel_shown(app, dialog)
+
+        # A scan holds the window busy, and it is a read as well; closing then closes.
+        pump(app, 10.0, until=lambda: app._busy and started.is_set())
+        dialog = close_dialog(app)
+        assert CLOSE_TEXTS[CLOSE_READ] in dialog_text(dialog)
+        dialog.confirm_button.invoke()
+        assert not app._running
+    finally:
+        release.set()
     assert app.errors == []
 
 
 def test_closing_during_a_change_says_it_is_recorded(make_app: AppFactory) -> None:
     app, engine = make_app(elevated=True, slow={"apply": 1.5, "startup_set_enabled": 1.5})
     pump(app, 5.0, until=lambda: scanned(app))
-    app._on_item_action(rows_by_id(app)["privacy.cortana"].item, "apply")
+    app._on_item_action(rows_by_id(app)["privacy.advertising_id"].item, "apply")
     confirm_dialog(app)
     pump(app, 5.0, until=lambda: bool(engine.calls_named("apply")))
     dialog = close_dialog(app)
@@ -949,7 +1021,7 @@ def test_closing_during_a_change_says_it_is_recorded(make_app: AppFactory) -> No
     assert dialog.confirm_button.cget("text") == "Close anyway"
     assert dialog.confirm_button.cget("fg_color") == theme.CRITICAL
     cancel_shown(app, dialog)
-    pump(app, 5.0, until=lambda: "privacy.cortana" in engine.applied and scanned(app))
+    pump(app, 5.0, until=lambda: "privacy.advertising_id" in engine.applied and scanned(app))
 
     # A startup toggle is a recorded change too, and holds the window busy while it runs.
     show_section(app, "Startup")

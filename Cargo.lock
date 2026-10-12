@@ -108,12 +108,17 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
 name = "cairn"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
+ "cairn-winres",
  "embed-manifest",
  "optimizer_core",
  "windows",
 ]
+
+[[package]]
+name = "cairn-winres"
+version = "0.3.0"
 
 [[package]]
 name = "cc"
@@ -453,9 +458,10 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "optctl"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
+ "cairn-winres",
  "clap",
  "embed-manifest",
  "optimizer_core",
@@ -466,7 +472,7 @@ dependencies = [
 
 [[package]]
 name = "optimizer_core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -484,8 +490,9 @@ dependencies = [
 
 [[package]]
 name = "optimizer_engine"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
+ "cairn-winres",
  "optimizer_core",
  "pyo3",
  "serde",

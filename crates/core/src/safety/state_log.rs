@@ -14,6 +14,11 @@
 //! reverted. Records that fail to restore, and packages that need a Microsoft Store
 //! reinstall, stay active so a later rollback retries them.
 //!
+//! While a registry record is active, the journal also keeps what the engine last wrote to
+//! its target ([`Written`]), so a later read can tell whether the target still holds it. A
+//! setting the user keeps as it is after it changed (Keep as is) ends the record like a
+//! revert, with nothing written on the PC, and stamps `forgotten_at`.
+//!
 //! The journal also keeps the results of scheduled maintenance runs (`maintenance_runs`);
 //! they describe what happened and are never rolled back.
 //!
@@ -21,6 +26,7 @@
 //! by a newer schema is refused with [`Error::JournalTooNew`] and left unchanged, and the
 //! stored version is never lowered.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
@@ -63,7 +69,14 @@ CREATE TABLE IF NOT EXISTS registry_journal (
     reverted_at   TEXT,
     -- Shallowest key the write created when key_existed = 0 (the leaf or one of its
     -- ancestors); NULL when the key existed or for rows written before schema 3.
-    created_root  TEXT
+    created_root  TEXT,
+    -- What the engine last wrote while the record is active: written_existed = 1 with the
+    -- value's type and data, 0 for a deleted value; all NULL when unknown.
+    written_existed INTEGER,
+    written_type    INTEGER,
+    written_data    BLOB,
+    -- Set together with reverted_at when the user kept the changed target as it is.
+    forgotten_at  TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ux_registry_active
     ON registry_journal (hive, key_path COLLATE NOCASE, value_name COLLATE NOCASE)
@@ -79,7 +92,8 @@ CREATE TABLE IF NOT EXISTS service_journal (
     delayed_auto_start INTEGER NOT NULL,
     was_running        INTEGER NOT NULL,
     active             INTEGER NOT NULL DEFAULT 1,
-    reverted_at        TEXT
+    reverted_at        TEXT,
+    forgotten_at       TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ux_service_active
     ON service_journal (name COLLATE NOCASE)
@@ -109,7 +123,8 @@ CREATE TABLE IF NOT EXISTS power_journal (
     previous_scheme TEXT    NOT NULL,
     target_scheme   TEXT    NOT NULL,
     active          INTEGER NOT NULL DEFAULT 1,
-    reverted_at     TEXT
+    reverted_at     TEXT,
+    forgotten_at    TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ux_power_active
     ON power_journal (slot)
@@ -121,10 +136,11 @@ CREATE TABLE IF NOT EXISTS scheduled_task_journal (
     id          INTEGER PRIMARY KEY,
     session_id  INTEGER NOT NULL REFERENCES sessions(id),
     recorded_at TEXT    NOT NULL,
-    path        TEXT    NOT NULL,
-    was_enabled INTEGER NOT NULL,
-    active      INTEGER NOT NULL DEFAULT 1,
-    reverted_at TEXT
+    path         TEXT    NOT NULL,
+    was_enabled  INTEGER NOT NULL,
+    active       INTEGER NOT NULL DEFAULT 1,
+    reverted_at  TEXT,
+    forgotten_at TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ux_scheduled_task_active
     ON scheduled_task_journal (path COLLATE NOCASE) WHERE active = 1;
@@ -142,7 +158,8 @@ CREATE TABLE IF NOT EXISTS dns_journal (
     previous_servers TEXT    NOT NULL,
     target_servers   TEXT    NOT NULL,
     active           INTEGER NOT NULL DEFAULT 1,
-    reverted_at      TEXT
+    reverted_at      TEXT,
+    forgotten_at     TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ux_dns_active
     ON dns_journal (interface_guid COLLATE NOCASE, family) WHERE active = 1;
@@ -188,6 +205,21 @@ CREATE TABLE IF NOT EXISTS ops_log (
 );
 "#;
 
+/// The active registry records that hold no written value and for whose target neither their
+/// own session nor a later one logged a write that did not fail
+/// ([`Journal::unwritten_registry_ids`]); while a record is active, every later write of its
+/// target is made over it. `ops_log` names a registry target `<hive>\<key path>\<value name>`,
+/// with `(Default)` for the unnamed value.
+const UNWRITTEN_REGISTRY: &str = r"SELECT r.id FROM registry_journal r
+     WHERE r.active = 1 AND r.written_existed IS NULL
+       AND NOT EXISTS (
+           SELECT 1 FROM ops_log o
+           WHERE o.session_id >= r.session_id
+             AND o.op IN ('set_registry_value', 'delete_registry_value')
+             AND o.outcome <> 'failed'
+             AND o.target COLLATE NOCASE = r.hive || '\' || r.key_path || '\' ||
+                 CASE WHEN r.value_name = '' THEN '(Default)' ELSE r.value_name END)";
+
 /// Per-user data folder and parent of [`default_path`]: `%OPTIMIZER_DATA_DIR%`, else
 /// `%LOCALAPPDATA%\PCOptimizer`.
 pub fn data_dir() -> PathBuf {
@@ -211,8 +243,20 @@ fn now() -> String {
 
 /// Columns added after a table's first release, as `(table, column, definition)`.
 /// `CREATE TABLE IF NOT EXISTS` leaves an existing table unchanged, so a journal created
-/// by an older version gets them through `ALTER TABLE`.
-const ADDED_COLUMNS: &[(&str, &str, &str)] = &[("registry_journal", "created_root", "TEXT")];
+/// by an older version gets them through `ALTER TABLE`. Older versions name their columns
+/// in every statement, so they keep working on a journal with these columns and leave them
+/// NULL.
+const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
+    ("registry_journal", "created_root", "TEXT"),
+    ("registry_journal", "written_existed", "INTEGER"),
+    ("registry_journal", "written_type", "INTEGER"),
+    ("registry_journal", "written_data", "BLOB"),
+    ("registry_journal", "forgotten_at", "TEXT"),
+    ("service_journal", "forgotten_at", "TEXT"),
+    ("scheduled_task_journal", "forgotten_at", "TEXT"),
+    ("power_journal", "forgotten_at", "TEXT"),
+    ("dns_journal", "forgotten_at", "TEXT"),
+];
 
 fn has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
     conn.prepare("SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2 COLLATE NOCASE")?
@@ -300,6 +344,49 @@ pub struct RegistryRecord {
     /// the column existed; rollback then treats only `key_path` as created.
     #[serde(default)]
     pub created_root: Option<String>,
+    /// What the engine last wrote to the target while the record was active; `None` when
+    /// unknown (records written before the column existed, or with nothing stored yet).
+    #[serde(default)]
+    pub written: Option<Written>,
+}
+
+/// What the engine last wrote to a registry target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Written {
+    /// The value was set to this type and data.
+    Value { value: RawValue },
+    /// The value was deleted, or found already absent.
+    Deleted,
+}
+
+impl Written {
+    /// `(written_existed, written_type, written_data)` as `registry_journal` stores them.
+    fn columns(&self) -> (bool, Option<i64>, Option<Vec<u8>>) {
+        match self {
+            Written::Value { value } => {
+                (true, Some(i64::from(value.kind)), Some(value.data.clone()))
+            }
+            Written::Deleted => (false, None, None),
+        }
+    }
+
+    /// The inverse of [`Self::columns`]; `None` when `written_existed` is NULL.
+    fn from_columns(
+        existed: Option<bool>,
+        kind: Option<i64>,
+        data: Option<Vec<u8>>,
+    ) -> Option<Written> {
+        Some(match existed? {
+            true => Written::Value {
+                value: RawValue {
+                    kind: kind.unwrap_or(0) as u32,
+                    data: data.unwrap_or_default(),
+                },
+            },
+            false => Written::Deleted,
+        })
+    }
 }
 
 impl RegistryRecord {
@@ -421,6 +508,9 @@ pub struct ScheduledTaskExportEntry {
     pub was_enabled: bool,
     pub active: bool,
     pub reverted_at: Option<String>,
+    /// See [`RegistryExportEntry::forgotten`].
+    #[serde(default)]
+    pub forgotten: bool,
 }
 
 /// Static DNS servers of one interface and address family before the engine changed them,
@@ -478,6 +568,9 @@ pub struct DnsExportEntry {
     pub target_servers: Vec<String>,
     pub active: bool,
     pub reverted_at: Option<String>,
+    /// See [`RegistryExportEntry::forgotten`].
+    #[serde(default)]
+    pub forgotten: bool,
 }
 
 /// Target string of a task definition in actions, logs and History: `task <path>`.
@@ -579,6 +672,12 @@ impl JournalTable {
             JournalTable::TaskDefinition => "task_definition_journal",
         }
     }
+
+    /// Whether the table records a setting a user may keep as it is, and so has a
+    /// `forgotten_at` column. Appx packages and task definitions do not.
+    fn has_forgotten_at(self) -> bool {
+        !matches!(self, JournalTable::Appx | JournalTable::TaskDefinition)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -650,6 +749,46 @@ pub struct RegistryExportEntry {
     pub original: Option<RegValue>,
     pub active: bool,
     pub reverted_at: Option<String>,
+    /// What the engine last wrote, as reports show a value; `None` when unknown.
+    #[serde(default)]
+    pub written: Option<String>,
+    /// The user kept the changed target as it is (Keep as is): the record ended without a
+    /// restore, so `reverted_at` is when Cairn stopped tracking it.
+    #[serde(default)]
+    pub forgotten: bool,
+}
+
+/// A [`ServiceRecord`] in the export, with its Keep as is flag.
+#[derive(Debug, Clone, Serialize)]
+pub struct ServiceExportEntry {
+    pub id: i64,
+    pub session_id: i64,
+    pub recorded_at: String,
+    pub name: String,
+    pub display_name: String,
+    pub start_type: StartType,
+    pub delayed_auto_start: bool,
+    pub was_running: bool,
+    pub active: bool,
+    pub reverted_at: Option<String>,
+    /// See [`RegistryExportEntry::forgotten`].
+    #[serde(default)]
+    pub forgotten: bool,
+}
+
+/// A [`PowerRecord`] in the export, with its Keep as is flag.
+#[derive(Debug, Clone, Serialize)]
+pub struct PowerExportEntry {
+    pub id: i64,
+    pub session_id: i64,
+    pub recorded_at: String,
+    pub previous_scheme: String,
+    pub target_scheme: String,
+    pub active: bool,
+    pub reverted_at: Option<String>,
+    /// See [`RegistryExportEntry::forgotten`].
+    #[serde(default)]
+    pub forgotten: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -658,10 +797,10 @@ pub struct JournalExport {
     pub summary: JournalSummary,
     pub sessions: Vec<SessionInfo>,
     pub registry: Vec<RegistryExportEntry>,
-    pub services: Vec<ServiceRecord>,
+    pub services: Vec<ServiceExportEntry>,
     pub scheduled_tasks: Vec<ScheduledTaskExportEntry>,
     pub appx: Vec<AppxRecord>,
-    pub power: Vec<PowerRecord>,
+    pub power: Vec<PowerExportEntry>,
     pub dns: Vec<DnsExportEntry>,
     pub task_definitions: Vec<TaskDefinitionExportEntry>,
     pub ops: Vec<OpLogEntry>,
@@ -872,6 +1011,28 @@ impl Journal {
         Ok(n == 1)
     }
 
+    /// Stores what the engine last wrote to the target of the active registry record of
+    /// `hive`, `key_path` and `value_name` (compared ignoring ASCII case, as the active-record
+    /// index does), replacing what was stored before. Returns `false` when the target has no
+    /// active record; reverted records keep what they hold.
+    pub fn set_registry_written(
+        &self,
+        hive: Hive,
+        key_path: &str,
+        value_name: &str,
+        written: &Written,
+    ) -> Result<bool> {
+        let (existed, kind, data) = written.columns();
+        let n = self.conn.lock().execute(
+            "UPDATE registry_journal
+             SET written_existed = ?4, written_type = ?5, written_data = ?6
+             WHERE active = 1 AND hive = ?1 AND key_path = ?2 COLLATE NOCASE
+               AND value_name = ?3 COLLATE NOCASE",
+            params![hive.short(), key_path, value_name, existed, kind, data],
+        )?;
+        Ok(n > 0)
+    }
+
     pub fn record_service(&self, session_id: i64, rec: &NewServiceRecord) -> Result<bool> {
         let conn = self.conn.lock();
         let n = conn.execute(
@@ -1016,6 +1177,26 @@ impl Journal {
         self.registry_where("WHERE active = 1")
     }
 
+    /// Ids of the active registry records whose write never happened: the record holds no
+    /// written value, and no write of its target that did not fail was logged by its session
+    /// or a later one. An earlier version of Cairn recorded the baseline, then returned the
+    /// error of a write that failed (on a policy key Windows protects against programs, for
+    /// example) without logging it or ending the record, so such a record claims a change that
+    /// was never made. Writes store what they wrote on the record, so a record of an earlier
+    /// version that a later apply wrote again is not listed.
+    pub fn unwritten_registry_ids(&self) -> Result<HashSet<i64>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(UNWRITTEN_REGISTRY)?;
+        let ids = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+        Ok(ids.collect::<rusqlite::Result<HashSet<_>>>()?)
+    }
+
+    /// Whether active registry record `id` is one of [`Self::unwritten_registry_ids`].
+    pub fn registry_record_unwritten(&self, id: i64) -> Result<bool> {
+        let sql = format!("{UNWRITTEN_REGISTRY} AND r.id = ?1");
+        Ok(self.conn.lock().prepare(&sql)?.exists(params![id])?)
+    }
+
     pub fn all_registry(&self) -> Result<Vec<RegistryRecord>> {
         self.registry_where("")
     }
@@ -1024,7 +1205,8 @@ impl Journal {
         let conn = self.conn.lock();
         let sql = format!(
             "SELECT id, session_id, recorded_at, hive, key_path, value_name, key_existed,
-                    value_existed, value_type, value_data, active, reverted_at, created_root
+                    value_existed, value_type, value_data, active, reverted_at, created_root,
+                    written_existed, written_type, written_data
              FROM registry_journal {filter} ORDER BY id DESC"
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -1064,6 +1246,7 @@ impl Journal {
                 active: r.get(10)?,
                 reverted_at: r.get(11)?,
                 created_root: r.get(12)?,
+                written: Written::from_columns(r.get(13)?, r.get(14)?, r.get(15)?),
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1501,6 +1684,115 @@ impl Journal {
         Ok(())
     }
 
+    /// Ends active record `id` without restoring it, because the user keeps its changed
+    /// target as it is: `active` = 0, `reverted_at` = now (the end of Cairn's control, as
+    /// every reader of `reverted_at` expects) and `forgotten_at` = the same time. Returns
+    /// `Ok(false)` when the record is not active. Appx packages and task definitions are
+    /// not settings that can be kept and are refused.
+    pub fn mark_forgotten(&self, table: JournalTable, id: i64) -> Result<bool> {
+        if !table.has_forgotten_at() {
+            return Err(Error::Other(format!(
+                "records of {} cannot be kept as they are",
+                table.name()
+            )));
+        }
+        let sql = format!(
+            "UPDATE {} SET active = 0, reverted_at = ?1, forgotten_at = ?1
+             WHERE id = ?2 AND active = 1",
+            table.name()
+        );
+        let n = self.conn.lock().execute(&sql, params![now(), id])?;
+        Ok(n > 0)
+    }
+
+    // ── withdrawing (a write that failed right after its baseline was captured) ──
+
+    /// Ends the active registry record `session_id` captured for the target, because the
+    /// write that followed failed and left the target as it was: `active` = 0 and
+    /// `reverted_at` = now, the end of the engine's control. Records of other sessions are
+    /// kept (their write did happen). Returns whether a record was ended.
+    pub fn withdraw_registry(
+        &self,
+        session_id: i64,
+        hive: Hive,
+        key_path: &str,
+        value_name: &str,
+    ) -> Result<bool> {
+        let n = self.conn.lock().execute(
+            "UPDATE registry_journal SET active = 0, reverted_at = ?1
+             WHERE active = 1 AND session_id = ?2 AND hive = ?3 AND key_path = ?4 COLLATE NOCASE
+               AND value_name = ?5 COLLATE NOCASE",
+            params![now(), session_id, hive.short(), key_path, value_name],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// [`Self::withdraw_registry`] for the service record of `name`.
+    pub fn withdraw_service(&self, session_id: i64, name: &str) -> Result<bool> {
+        let n = self.conn.lock().execute(
+            "UPDATE service_journal SET active = 0, reverted_at = ?1
+             WHERE active = 1 AND session_id = ?2 AND name = ?3 COLLATE NOCASE",
+            params![now(), session_id, name],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// [`Self::withdraw_registry`] for the scheduled task record of `path`.
+    pub fn withdraw_scheduled_task(&self, session_id: i64, path: &str) -> Result<bool> {
+        let n = self.conn.lock().execute(
+            "UPDATE scheduled_task_journal SET active = 0, reverted_at = ?1
+             WHERE active = 1 AND session_id = ?2 AND path = ?3 COLLATE NOCASE",
+            params![now(), session_id, path],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// [`Self::withdraw_registry`] for the power scheme record.
+    pub fn withdraw_power(&self, session_id: i64) -> Result<bool> {
+        let n = self.conn.lock().execute(
+            "UPDATE power_journal SET active = 0, reverted_at = ?1
+             WHERE active = 1 AND session_id = ?2",
+            params![now(), session_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// [`Self::withdraw_registry`] for the DNS record of `interface_guid` (any spelling) and
+    /// `family`.
+    pub fn withdraw_dns(
+        &self,
+        session_id: i64,
+        interface_guid: &str,
+        family: IpFamily,
+    ) -> Result<bool> {
+        let n = self.conn.lock().execute(
+            "UPDATE dns_journal SET active = 0, reverted_at = ?1
+             WHERE active = 1 AND session_id = ?2 AND interface_guid = ?3 COLLATE NOCASE
+               AND family = ?4",
+            params![
+                now(),
+                session_id,
+                network::canonical_guid(interface_guid),
+                family.as_str()
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Ids of the records of `table` that ended through [`Self::mark_forgotten`].
+    fn forgotten_ids(&self, table: JournalTable) -> Result<HashSet<i64>> {
+        if !table.has_forgotten_at() {
+            return Ok(HashSet::new());
+        }
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id FROM {} WHERE forgotten_at IS NOT NULL",
+            table.name()
+        ))?;
+        let ids = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+        Ok(ids.collect::<rusqlite::Result<HashSet<_>>>()?)
+    }
+
     pub fn log_op(
         &self,
         session_id: Option<i64>,
@@ -1566,6 +1858,7 @@ impl Journal {
     }
 
     pub fn export(&self) -> Result<JournalExport> {
+        let forgotten = self.forgotten_ids(JournalTable::Registry)?;
         let registry = self
             .all_registry()?
             .into_iter()
@@ -1582,8 +1875,29 @@ impl Journal {
                 original: r.original_decoded(),
                 active: r.active,
                 reverted_at: r.reverted_at.clone(),
+                written: r.written.as_ref().map(|w| written_text(&r, w)),
+                forgotten: forgotten.contains(&r.id),
             })
             .collect();
+        let forgotten = self.forgotten_ids(JournalTable::Service)?;
+        let services = self
+            .all_services()?
+            .into_iter()
+            .map(|r| ServiceExportEntry {
+                forgotten: forgotten.contains(&r.id),
+                id: r.id,
+                session_id: r.session_id,
+                recorded_at: r.recorded_at,
+                name: r.name,
+                display_name: r.display_name,
+                start_type: r.start_type,
+                delayed_auto_start: r.delayed_auto_start,
+                was_running: r.was_running,
+                active: r.active,
+                reverted_at: r.reverted_at,
+            })
+            .collect();
+        let forgotten = self.forgotten_ids(JournalTable::ScheduledTask)?;
         let scheduled_tasks = self
             .all_scheduled_tasks()?
             .into_iter()
@@ -1596,12 +1910,30 @@ impl Journal {
                 was_enabled: r.was_enabled,
                 active: r.active,
                 reverted_at: r.reverted_at.clone(),
+                forgotten: forgotten.contains(&r.id),
             })
             .collect();
+        let forgotten = self.forgotten_ids(JournalTable::Power)?;
+        let power = self
+            .all_power()?
+            .into_iter()
+            .map(|r| PowerExportEntry {
+                forgotten: forgotten.contains(&r.id),
+                id: r.id,
+                session_id: r.session_id,
+                recorded_at: r.recorded_at,
+                previous_scheme: r.previous_scheme,
+                target_scheme: r.target_scheme,
+                active: r.active,
+                reverted_at: r.reverted_at,
+            })
+            .collect();
+        let forgotten = self.forgotten_ids(JournalTable::Dns)?;
         let dns = self
             .all_dns()?
             .into_iter()
             .map(|r| DnsExportEntry {
+                forgotten: forgotten.contains(&r.id),
                 id: r.id,
                 session_id: r.session_id,
                 recorded_at: r.recorded_at.clone(),
@@ -1635,10 +1967,10 @@ impl Journal {
             summary: self.summary()?,
             sessions: self.sessions()?,
             registry,
-            services: self.all_services()?,
+            services,
             scheduled_tasks,
             appx: self.all_appx()?,
-            power: self.all_power()?,
+            power,
             dns,
             task_definitions,
             ops: self.ops(500)?,
@@ -1648,6 +1980,15 @@ impl Journal {
     pub fn export_json(&self) -> Result<String> {
         serde_json::to_string_pretty(&self.export()?).map_err(Error::from)
     }
+}
+
+/// What the engine last wrote to `rec`'s target, as reports show a value.
+fn written_text(rec: &RegistryRecord, written: &Written) -> String {
+    let value = match written {
+        Written::Value { value } => Some(value.decode()),
+        Written::Deleted => None,
+    };
+    super::verify::value_text(rec.hive, &rec.key_path, &rec.value_name, value.as_ref())
 }
 
 #[cfg(test)]
@@ -1722,6 +2063,7 @@ mod tests {
             active: true,
             reverted_at: None,
             created_root: None,
+            written: None,
         }
     }
 
@@ -2629,6 +2971,664 @@ mod tests {
                 .created_keys_before(&latest(&journal, r"R\X\Leaf", "V"))
                 .unwrap(),
             claims(&[("R", "R")])
+        );
+    }
+
+    /// A schema 5 journal as earlier versions created it: the tables of the settings Keep as
+    /// is can end, without `written_*` and `forgotten_at`, with one row each.
+    const JOURNAL_BEFORE_WRITTEN: &str = r#"
+        CREATE TABLE sessions (
+            id                INTEGER PRIMARY KEY,
+            started_at        TEXT    NOT NULL,
+            ended_at          TEXT,
+            label             TEXT    NOT NULL,
+            tool_version      TEXT    NOT NULL,
+            restore_point_seq INTEGER
+        );
+        CREATE TABLE registry_journal (
+            id            INTEGER PRIMARY KEY,
+            session_id    INTEGER NOT NULL REFERENCES sessions(id),
+            recorded_at   TEXT    NOT NULL,
+            hive          TEXT    NOT NULL,
+            key_path      TEXT    NOT NULL,
+            value_name    TEXT    NOT NULL,
+            key_existed   INTEGER NOT NULL,
+            value_existed INTEGER NOT NULL,
+            value_type    INTEGER,
+            value_data    BLOB,
+            active        INTEGER NOT NULL DEFAULT 1,
+            reverted_at   TEXT,
+            created_root  TEXT
+        );
+        CREATE TABLE service_journal (
+            id                 INTEGER PRIMARY KEY,
+            session_id         INTEGER NOT NULL REFERENCES sessions(id),
+            recorded_at        TEXT    NOT NULL,
+            name               TEXT    NOT NULL,
+            display_name       TEXT    NOT NULL,
+            start_type         TEXT    NOT NULL,
+            delayed_auto_start INTEGER NOT NULL,
+            was_running        INTEGER NOT NULL,
+            active             INTEGER NOT NULL DEFAULT 1,
+            reverted_at        TEXT
+        );
+        CREATE TABLE power_journal (
+            id              INTEGER PRIMARY KEY,
+            session_id      INTEGER NOT NULL REFERENCES sessions(id),
+            recorded_at     TEXT    NOT NULL,
+            slot            INTEGER NOT NULL DEFAULT 0,
+            previous_scheme TEXT    NOT NULL,
+            target_scheme   TEXT    NOT NULL,
+            active          INTEGER NOT NULL DEFAULT 1,
+            reverted_at     TEXT
+        );
+        CREATE TABLE scheduled_task_journal (
+            id          INTEGER PRIMARY KEY,
+            session_id  INTEGER NOT NULL REFERENCES sessions(id),
+            recorded_at TEXT    NOT NULL,
+            path        TEXT    NOT NULL,
+            was_enabled INTEGER NOT NULL,
+            active      INTEGER NOT NULL DEFAULT 1,
+            reverted_at TEXT
+        );
+        CREATE TABLE dns_journal (
+            id               INTEGER PRIMARY KEY,
+            session_id       INTEGER NOT NULL REFERENCES sessions(id),
+            recorded_at      TEXT    NOT NULL,
+            interface_guid   TEXT    NOT NULL,
+            family           TEXT    NOT NULL,
+            adapter_name     TEXT    NOT NULL,
+            previous_servers TEXT    NOT NULL,
+            target_servers   TEXT    NOT NULL,
+            active           INTEGER NOT NULL DEFAULT 1,
+            reverted_at      TEXT
+        );
+        INSERT INTO sessions (id, started_at, label, tool_version)
+            VALUES (1, '2026-01-01T00:00:00Z', 'old', '0.2.0');
+        INSERT INTO registry_journal
+            (session_id, recorded_at, hive, key_path, value_name, key_existed, value_existed,
+             value_type, value_data)
+            VALUES (1, '2026-01-01T00:00:00Z', 'HKCU', 'Software\Old\Leaf', 'V', 1, 1, 4,
+                    X'01000000');
+        INSERT INTO service_journal
+            (session_id, recorded_at, name, display_name, start_type, delayed_auto_start,
+             was_running)
+            VALUES (1, '2026-01-01T00:00:00Z', 'ExampleService', 'Example', 'manual', 0, 1);
+        INSERT INTO power_journal (session_id, recorded_at, previous_scheme, target_scheme)
+            VALUES (1, '2026-01-01T00:00:00Z', 'aaaa', 'bbbb');
+        INSERT INTO scheduled_task_journal (session_id, recorded_at, path, was_enabled)
+            VALUES (1, '2026-01-01T00:00:00Z', '\Example\Task', 1);
+        INSERT INTO dns_journal
+            (session_id, recorded_at, interface_guid, family, adapter_name, previous_servers,
+             target_servers)
+            VALUES (1, '2026-01-01T00:00:00Z', '{aaaaaaaa-0000-0000-0000-000000000001}', 'ipv4',
+                    'Wi-Fi', '', '1.1.1.1');
+        PRAGMA user_version = 5;
+    "#;
+
+    const EXPECTED_ADDED_COLUMNS: [(&str, &str, &str); 9] = [
+        ("registry_journal", "created_root", "TEXT"),
+        ("registry_journal", "written_existed", "INTEGER"),
+        ("registry_journal", "written_type", "INTEGER"),
+        ("registry_journal", "written_data", "BLOB"),
+        ("registry_journal", "forgotten_at", "TEXT"),
+        ("service_journal", "forgotten_at", "TEXT"),
+        ("scheduled_task_journal", "forgotten_at", "TEXT"),
+        ("power_journal", "forgotten_at", "TEXT"),
+        ("dns_journal", "forgotten_at", "TEXT"),
+    ];
+
+    fn missing_columns(journal: &Journal) -> Vec<String> {
+        let conn = journal.conn.lock();
+        ADDED_COLUMNS
+            .iter()
+            .filter(|(table, column, _)| !has_column(&conn, table, column).unwrap())
+            .map(|(table, column, _)| format!("{table}.{column}"))
+            .collect()
+    }
+
+    fn dword(value: u32) -> RawValue {
+        RegValue::Dword(value).to_raw()
+    }
+
+    /// `written` of the newest record of `key_path` and `value_name`.
+    fn written_of(journal: &Journal, key_path: &str, value_name: &str) -> Option<Written> {
+        latest(journal, key_path, value_name).written
+    }
+
+    /// `(reverted_at, forgotten_at)` of row `id` of `table`.
+    fn end_times(
+        journal: &Journal,
+        table: JournalTable,
+        id: i64,
+    ) -> (Option<String>, Option<String>) {
+        journal
+            .conn
+            .lock()
+            .query_row(
+                &format!(
+                    "SELECT reverted_at, forgotten_at FROM {} WHERE id = ?1",
+                    table.name()
+                ),
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn schema_version_stays_five() {
+        assert_eq!(SCHEMA_VERSION, 5);
+        assert_eq!(ADDED_COLUMNS, EXPECTED_ADDED_COLUMNS.as_slice());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.db");
+        let journal = Journal::open(&path).unwrap();
+        assert!(
+            missing_columns(&journal).is_empty(),
+            "a new journal creates every added column"
+        );
+        drop(journal);
+        assert_eq!(user_version(&path), 5);
+
+        let old = dir.path().join("old.db");
+        Connection::open(&old)
+            .unwrap()
+            .execute_batch(JOURNAL_BEFORE_WRITTEN)
+            .unwrap();
+        drop(Journal::open(&old).unwrap());
+        assert_eq!(user_version(&old), 5, "the new columns need no new version");
+    }
+
+    #[test]
+    fn written_columns_are_added_to_an_old_journal_and_keep_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.db");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(JOURNAL_BEFORE_WRITTEN)
+            .unwrap();
+
+        let journal = Journal::open(&path).unwrap();
+        assert!(missing_columns(&journal).is_empty());
+        let registry = journal.active_registry().unwrap();
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry[0].original, Some(dword(1)));
+        assert_eq!(registry[0].written, None, "unknown for an old row");
+        assert_eq!(journal.active_services().unwrap().len(), 1);
+        assert_eq!(journal.active_power().unwrap().len(), 1);
+        assert_eq!(journal.active_scheduled_tasks().unwrap().len(), 1);
+        assert_eq!(journal.active_dns().unwrap().len(), 1);
+        assert_eq!(journal.summary().unwrap().pending_count(), 5);
+
+        // An old row can be ended and exported like any other.
+        let export: serde_json::Value =
+            serde_json::from_str(&journal.export_json().unwrap()).unwrap();
+        assert_eq!(export["registry"][0]["written"], serde_json::Value::Null);
+        for kind in ["registry", "services", "scheduled_tasks", "power", "dns"] {
+            assert_eq!(export[kind][0]["forgotten"], false, "{kind}");
+        }
+        assert!(journal
+            .mark_forgotten(
+                JournalTable::Service,
+                journal.active_services().unwrap()[0].id
+            )
+            .unwrap());
+
+        // A statement that names its columns, as earlier versions write, still works.
+        journal
+            .conn
+            .lock()
+            .execute(
+                r"INSERT INTO registry_journal
+                  (session_id, recorded_at, hive, key_path, value_name, key_existed,
+                   value_existed, value_type, value_data, created_root)
+                  VALUES (1, ?1, 'HKCU', 'Software\Old\Other', 'V', 1, 0, NULL, NULL, NULL)",
+                params![now()],
+            )
+            .unwrap();
+        assert_eq!(written_of(&journal, r"Software\Old\Other", "V"), None);
+        drop(journal);
+        assert_eq!(user_version(&path), 5);
+
+        // Opening again finds every column and keeps every row.
+        let journal = Journal::open(&path).unwrap();
+        assert!(missing_columns(&journal).is_empty());
+        assert_eq!(journal.all_registry().unwrap().len(), 2);
+        assert_eq!(journal.active_services().unwrap().len(), 0);
+        assert_eq!(journal.all_services().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn set_registry_written_updates_only_the_active_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(dir.path().join("journal.db")).unwrap();
+        let session = journal.begin_session("test", "0").unwrap();
+        let key = r"Software\Example\Written";
+        journal
+            .record_registry(session, &named_record(key, "A", true, None))
+            .unwrap();
+        let reverted = latest(&journal, key, "A").id;
+        journal
+            .mark_reverted(JournalTable::Registry, reverted)
+            .unwrap();
+        journal
+            .record_registry(session, &named_record(key, "A", true, None))
+            .unwrap();
+        journal
+            .record_registry(session, &named_record(key, "B", true, None))
+            .unwrap();
+
+        let value = Written::Value { value: dword(0) };
+        assert!(journal
+            .set_registry_written(Hive::CurrentUser, &key.to_uppercase(), "a", &value)
+            .unwrap());
+        let rows = journal.all_registry().unwrap();
+        let by_id = |id: i64| rows.iter().find(|r| r.id == id).unwrap();
+        let active_a = latest(&journal, key, "A");
+        assert_ne!(active_a.id, reverted);
+        assert_eq!(active_a.written, Some(value.clone()));
+        assert_eq!(
+            by_id(reverted).written,
+            None,
+            "a reverted record keeps none"
+        );
+        assert_eq!(
+            written_of(&journal, key, "B"),
+            None,
+            "another value is untouched"
+        );
+
+        assert!(
+            !journal
+                .set_registry_written(Hive::LocalMachine, key, "A", &value)
+                .unwrap(),
+            "another hive has no active record"
+        );
+        assert!(!journal
+            .set_registry_written(Hive::CurrentUser, key, "Missing", &Written::Deleted)
+            .unwrap());
+
+        journal
+            .mark_reverted(JournalTable::Registry, active_a.id)
+            .unwrap();
+        assert!(
+            !journal
+                .set_registry_written(Hive::CurrentUser, key, "A", &Written::Deleted)
+                .unwrap(),
+            "nothing is stored once the record ended"
+        );
+        assert_eq!(written_of(&journal, key, "A"), Some(value));
+    }
+
+    #[test]
+    fn unwritten_registry_ids_are_the_records_whose_write_never_happened() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(dir.path().join("journal.db")).unwrap();
+        let key = r"Software\Example\Unwritten";
+        // Each value is recorded in a session of its own; `op` is what that session logged
+        // for it (`None`: nothing, as an earlier version did for a write that failed).
+        let record = |name: &str, op: Option<(&str, &str)>| -> i64 {
+            let session = journal.begin_session("test", "0").unwrap();
+            journal
+                .record_registry(session, &named_record(key, name, true, None))
+                .unwrap();
+            let rec = latest(&journal, key, name);
+            if let Some((op, outcome)) = op {
+                let target = rec.target().to_uppercase();
+                journal
+                    .log_op(Some(session), op, &target, outcome, None)
+                    .unwrap();
+            }
+            journal.end_session(session).unwrap();
+            rec.id
+        };
+        let failed_silently = record("Silent", None);
+        let failed_logged = record("Failed", Some(("set_registry_value", "failed")));
+        let set = record("Set", Some(("set_registry_value", "applied")));
+        let in_place = record(
+            "InPlace",
+            Some(("set_registry_value", "already_in_desired_state")),
+        );
+        let deleted = record("Deleted", Some(("delete_registry_value", "applied")));
+        let default_value = record("", Some(("set_registry_value", "applied")));
+        let other_op = record("Other", Some(("rollback_registry", "restored")));
+        // A write a later session logged was made over the record, which was active then.
+        let written_later = record("Later", None);
+        let log_write = |name: &str| {
+            let session = journal.begin_session("test", "0").unwrap();
+            let target = format!(r"HKCU\{key}\{name}");
+            journal
+                .log_op(
+                    Some(session),
+                    "set_registry_value",
+                    &target,
+                    "applied",
+                    None,
+                )
+                .unwrap();
+            journal.end_session(session).unwrap();
+        };
+        log_write("Later");
+        // A write an earlier session logged belonged to an earlier record.
+        log_write("Earlier");
+        let written_earlier = record("Earlier", None);
+        // A record that holds what a later apply wrote over it.
+        let rewritten = record("Rewritten", None);
+        assert!(journal
+            .set_registry_written(
+                Hive::CurrentUser,
+                key,
+                "Rewritten",
+                &Written::Value { value: dword(1) }
+            )
+            .unwrap());
+
+        let expected: HashSet<i64> = [failed_silently, failed_logged, other_op, written_earlier]
+            .into_iter()
+            .collect();
+        assert_eq!(journal.unwritten_registry_ids().unwrap(), expected);
+        for id in [
+            set,
+            in_place,
+            deleted,
+            default_value,
+            written_later,
+            rewritten,
+        ] {
+            assert!(!journal.registry_record_unwritten(id).unwrap(), "{id}");
+        }
+        for id in &expected {
+            assert!(journal.registry_record_unwritten(*id).unwrap(), "{id}");
+        }
+
+        // Only active records are listed.
+        journal
+            .mark_reverted(JournalTable::Registry, failed_silently)
+            .unwrap();
+        assert!(!journal.registry_record_unwritten(failed_silently).unwrap());
+        assert!(!journal
+            .unwritten_registry_ids()
+            .unwrap()
+            .contains(&failed_silently));
+    }
+
+    #[test]
+    fn written_round_trips_a_value_and_a_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(dir.path().join("journal.db")).unwrap();
+        let session = journal.begin_session("test", "0").unwrap();
+        let key = r"Software\Example\RoundTrip";
+        journal
+            .record_registry(session, &named_record(key, "V", true, None))
+            .unwrap();
+
+        let values = [
+            Written::Value { value: dword(0) },
+            Written::Value {
+                value: RegValue::Sz("text".into()).to_raw(),
+            },
+            Written::Value {
+                value: RawValue {
+                    kind: 0,
+                    data: Vec::new(),
+                },
+            },
+            Written::Deleted,
+            Written::Value { value: dword(7) },
+        ];
+        for written in &values {
+            assert!(journal
+                .set_registry_written(Hive::CurrentUser, key, "V", written)
+                .unwrap());
+            assert_eq!(written_of(&journal, key, "V").as_ref(), Some(written));
+        }
+
+        assert_eq!(
+            serde_json::to_value(Written::Value { value: dword(1) }).unwrap(),
+            serde_json::json!({"kind": "value", "value": {"kind": 4, "data": "01000000"}})
+        );
+        assert_eq!(
+            serde_json::to_value(Written::Deleted).unwrap(),
+            serde_json::json!({"kind": "deleted"})
+        );
+        let record = latest(&journal, key, "V");
+        let json = serde_json::to_value(&record).unwrap();
+        let round: RegistryRecord = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(round.written, record.written);
+        let mut old = json;
+        old.as_object_mut().unwrap().remove("written");
+        let old: RegistryRecord = serde_json::from_value(old).unwrap();
+        assert_eq!(old.written, None, "a record without the field deserializes");
+    }
+
+    #[test]
+    fn export_carries_the_written_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(dir.path().join("journal.db")).unwrap();
+        let session = journal.begin_session("test", "0").unwrap();
+        let key = r"Software\Example\Export";
+        for name in ["Set", "Deleted", "Unknown"] {
+            journal
+                .record_registry(session, &named_record(key, name, true, None))
+                .unwrap();
+        }
+        let set = Written::Value { value: dword(0) };
+        assert!(journal
+            .set_registry_written(Hive::CurrentUser, key, "Set", &set)
+            .unwrap());
+        assert!(journal
+            .set_registry_written(Hive::CurrentUser, key, "Deleted", &Written::Deleted)
+            .unwrap());
+
+        let export: serde_json::Value =
+            serde_json::from_str(&journal.export_json().unwrap()).unwrap();
+        let row = |name: &str| {
+            export["registry"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["value_name"] == name)
+                .unwrap()
+                .clone()
+        };
+        let text = |name: &str, value: Option<&RegValue>| {
+            super::super::verify::value_text(Hive::CurrentUser, key, name, value)
+        };
+        assert_eq!(
+            row("Set")["written"],
+            text("Set", Some(&RegValue::Dword(0)))
+        );
+        assert_eq!(row("Deleted")["written"], text("Deleted", None));
+        assert_eq!(row("Unknown")["written"], serde_json::Value::Null);
+        for name in ["Set", "Deleted", "Unknown"] {
+            assert_eq!(row(name)["forgotten"], false);
+        }
+    }
+
+    #[test]
+    fn forgotten_records_export_as_forgotten() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(dir.path().join("journal.db")).unwrap();
+        let session = journal.begin_session("test", "0").unwrap();
+        let key = r"Software\Example\Forgotten";
+        for name in ["Kept", "Reverted", "Active"] {
+            journal
+                .record_registry(session, &named_record(key, name, true, None))
+                .unwrap();
+        }
+        journal
+            .record_service(
+                session,
+                &NewServiceRecord {
+                    name: "ExampleService".into(),
+                    display_name: "Example".into(),
+                    start_type: StartType::Manual,
+                    delayed_auto_start: false,
+                    was_running: true,
+                },
+            )
+            .unwrap();
+        journal
+            .record_scheduled_task(
+                session,
+                &NewScheduledTaskRecord {
+                    path: r"\Example\Task".into(),
+                    was_enabled: true,
+                },
+            )
+            .unwrap();
+        journal
+            .record_power(
+                session,
+                &NewPowerRecord {
+                    previous_scheme: "aaaa".into(),
+                    target_scheme: "bbbb".into(),
+                },
+            )
+            .unwrap();
+        journal
+            .record_dns(
+                session,
+                &NewDnsRecord {
+                    interface_guid: "{aaaaaaaa-0000-0000-0000-000000000001}".into(),
+                    family: IpFamily::Ipv4,
+                    adapter_name: "Wi-Fi".into(),
+                    previous_servers: String::new(),
+                    target_servers: "1.1.1.1".into(),
+                },
+            )
+            .unwrap();
+        journal
+            .record_appx(
+                session,
+                &NewAppxRecord {
+                    package_full_name: "Example.App_1.0.0.0_x64__0000000000000".into(),
+                    package_family: "Example.App_0000000000000".into(),
+                    install_location: r"C:\Example".into(),
+                    all_users: false,
+                },
+            )
+            .unwrap();
+        journal
+            .record_task_definition(session, &new_definition(r"\Example\Definition", false))
+            .unwrap();
+
+        let kept = latest(&journal, key, "Kept").id;
+        let ids = [
+            (JournalTable::Registry, kept),
+            (
+                JournalTable::Service,
+                journal.active_services().unwrap()[0].id,
+            ),
+            (
+                JournalTable::ScheduledTask,
+                journal.active_scheduled_tasks().unwrap()[0].id,
+            ),
+            (JournalTable::Power, journal.active_power().unwrap()[0].id),
+            (JournalTable::Dns, journal.active_dns().unwrap()[0].id),
+        ];
+        for (table, id) in ids {
+            assert!(journal.mark_forgotten(table, id).unwrap(), "{table:?}");
+            assert!(
+                !journal.mark_forgotten(table, id).unwrap(),
+                "{table:?}: a record ends once"
+            );
+            let (reverted_at, forgotten_at) = end_times(&journal, table, id);
+            assert!(reverted_at.is_some(), "{table:?}");
+            assert_eq!(reverted_at, forgotten_at, "{table:?}");
+        }
+        journal
+            .mark_reverted(JournalTable::Registry, latest(&journal, key, "Reverted").id)
+            .unwrap();
+        assert!(!journal
+            .mark_forgotten(JournalTable::Registry, latest(&journal, key, "Reverted").id)
+            .unwrap());
+        for table in [JournalTable::Appx, JournalTable::TaskDefinition] {
+            let id = match table {
+                JournalTable::Appx => journal.active_appx().unwrap()[0].id,
+                _ => journal.active_task_definitions().unwrap()[0].id,
+            };
+            assert!(journal.mark_forgotten(table, id).is_err(), "{table:?}");
+        }
+        assert_eq!(journal.active_appx().unwrap().len(), 1, "nothing changed");
+        assert_eq!(journal.active_task_definitions().unwrap().len(), 1);
+
+        let summary = journal.summary().unwrap();
+        assert_eq!(summary.registry_active, 1);
+        assert_eq!(
+            summary.pending_count(),
+            3,
+            "Active, the package and the task"
+        );
+
+        let export: serde_json::Value =
+            serde_json::from_str(&journal.export_json().unwrap()).unwrap();
+        let registry = export["registry"].as_array().unwrap();
+        let flag = |name: &str| {
+            let row = registry.iter().find(|r| r["value_name"] == name).unwrap();
+            (row["active"].as_bool(), row["forgotten"].as_bool())
+        };
+        assert_eq!(flag("Kept"), (Some(false), Some(true)));
+        assert_eq!(flag("Reverted"), (Some(false), Some(false)));
+        assert_eq!(flag("Active"), (Some(true), Some(false)));
+        for kind in ["services", "scheduled_tasks", "power", "dns"] {
+            let rows = export[kind].as_array().unwrap();
+            assert_eq!(rows.len(), 1, "{kind}");
+            assert_eq!(rows[0]["forgotten"], true, "{kind}");
+            assert_eq!(rows[0]["active"], false, "{kind}");
+            assert!(rows[0]["reverted_at"].is_string(), "{kind}");
+        }
+        let service = &export["services"][0];
+        assert_eq!(service["name"], "ExampleService");
+        assert_eq!(service["start_type"], "manual");
+        assert_eq!(service["was_running"], true);
+        assert_eq!(export["power"][0]["previous_scheme"], "aaaa");
+        assert!(export["appx"][0].get("forgotten").is_none());
+        assert!(export["task_definitions"][0].get("forgotten").is_none());
+    }
+
+    #[test]
+    fn mark_forgotten_keeps_reverted_semantics_for_created_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(dir.path().join("journal.db")).unwrap();
+        let session = journal.begin_session("test", "0").unwrap();
+        let find = |path: &str| latest(&journal, path, "V");
+
+        // Created A and was kept as is before B was written: B's baseline had A.
+        journal
+            .record_registry(session, &new_record(r"A\Old", false, Some("A")))
+            .unwrap();
+        assert!(journal
+            .mark_forgotten(JournalTable::Registry, find(r"A\Old").id)
+            .unwrap());
+        // Created S and is kept as is only after C was written: C still relies on it.
+        journal
+            .record_registry(session, &new_record(r"S\X", false, Some("S")))
+            .unwrap();
+        journal
+            .record_registry(session, &new_record(r"A\B", false, Some(r"A\B")))
+            .unwrap();
+        journal
+            .record_registry(session, &new_record(r"S\Y", false, Some(r"S\Y")))
+            .unwrap();
+        assert!(journal
+            .mark_forgotten(JournalTable::Registry, find(r"S\X").id)
+            .unwrap());
+
+        assert!(journal
+            .created_keys_before(&find(r"A\B"))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            journal.created_keys_before(&find(r"S\Y")).unwrap(),
+            claims(&[(r"S\X", "S")])
+        );
+        let forgotten = find(r"S\X");
+        assert!(!forgotten.active);
+        assert_eq!(
+            end_times(&journal, JournalTable::Registry, forgotten.id).0,
+            forgotten.reverted_at
         );
     }
 }

@@ -1,7 +1,7 @@
 """Network part of FakeEngine: the `network_*` functions and the DNS journal records.
 
 Mixed into `FakeEngine`, which calls `_init_network` from its constructor and the DNS
-journal hooks from its summary, export and revert functions.
+journal hooks from its summary, export, revert and Keep as is functions.
 
 Five adapters (`ADAPTERS`) are listed with the engine's result shapes. Static DNS servers
 live in `_static_dns` per (interface GUID, family); a change records the servers it
@@ -10,7 +10,8 @@ successful write only updates the record's target), and reverting writes the bas
 Options (`FakeEngine(**options)`):
 
 - `network_error`: `network_list` raises RuntimeError with this text;
-- `dns_fail`: families ("ipv4", "ipv6") whose DNS write fails (the record is kept);
+- `dns_fail`: families ("ipv4", "ipv6") whose DNS write fails; as in the engine, the record that
+  write captured is withdrawn (inactive, with a revert time), and an older active record stays;
 - `reset_fail` / `reset_partial`: reset step ids ("winsock", "ipv4", "ipv6") that end
   failed / completed with errors, both with exit code 1;
 - `vpn_connected`: ProtonVPN is connected, which pauses DNS changes on every adapter;
@@ -186,7 +187,7 @@ ADAPTERS: tuple[dict[str, Any], ...] = (
         if_index=7,
         mac="00-00-5E-00-53-02",
         # Without a link Windows keeps tentative link-local addresses it cannot use.
-        ipv4=[{"address": "169.254.81.150", "prefix_length": 16, "origin": "link_local", "preferred": False}],
+        ipv4=[{"address": "169.254.33.2", "prefix_length": 16, "origin": "link_local", "preferred": False}],
         ipv6=[{"address": "fe80::b03b:2", "prefix_length": 64, "origin": "link_local", "preferred": False}],
         ipv4_metric=25,
     ),
@@ -485,6 +486,14 @@ class FakeNetwork:
             if record["active"] and record["interface_guid"] == guid and record["family"] == family:
                 record["target_servers"] = list(target)
 
+    def _withdraw_dns(self, guid: str, family: str) -> None:
+        """Ends the record a failed write captured, as the engine does: the servers are as they were."""
+        self._dns_baseline.pop((guid, family), None)
+        for record in self._dns_records:
+            if record["active"] and record["interface_guid"] == guid and record["family"] == family:
+                record["active"] = False
+                record["reverted_at"] = RECORDED_AT
+
     def network_set_dns(
         self,
         adapter_id: str,
@@ -532,6 +541,8 @@ class FakeNetwork:
             elif not dry_run:
                 captured = self._record_dns(adapter, family, current, target)
                 if family in self.dns_fail:
+                    if captured:
+                        self._withdraw_dns(adapter["id"], family)
                     change.update(
                         outcome="failed",
                         detail=f"cannot set the {FAMILY_LABELS[family]} DNS servers of {adapter['name']}: "
@@ -695,3 +706,19 @@ class FakeNetwork:
             record["active"] = False
             record["reverted_at"] = RECORDED_AT
         return actions, 0 if dry_run else len(records)
+
+    def _dns_active_targets(self, guids: Iterable[str]) -> list[str]:
+        """Targets of the active DNS records of the adapters `guids`."""
+        wanted = {canonical_guid(g) for g in guids}
+        return [r["target"] for r in self._dns_records if r["active"] and r["interface_guid"] in wanted]
+
+    def _dns_forget(self, guids: Iterable[str]) -> None:
+        """Keep as is: the active DNS records of the adapters `guids` are no longer tracked.
+        The servers stay as they are; the export lists the records as forgotten."""
+        wanted = {canonical_guid(g) for g in guids}
+        for record in self._dns_records:
+            if record["active"] and record["interface_guid"] in wanted:
+                self._dns_baseline.pop((record["interface_guid"], record["family"]), None)
+                record["active"] = False
+                record["reverted_at"] = RECORDED_AT
+                record["forgotten"] = True

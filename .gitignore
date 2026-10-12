@@ -25,6 +25,9 @@ __pycache__/
 # Setup program compiled into Inno Setup's default output folder
 /installer/Output/
 
+# Screenshots of the real-PC checks never belong next to the verification records
+/docs/verification/*.png
+
 # IDE and tools
 .vs/
 *.user

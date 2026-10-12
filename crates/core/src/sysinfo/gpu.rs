@@ -228,7 +228,7 @@ mod tests {
 
     fn nvidia() -> AdapterDesc {
         AdapterDesc {
-            name: "NVIDIA GeForce RTX 5060 Ti".into(),
+            name: "NVIDIA GeForce RTX 4060 Ti".into(),
             vendor_id: 0x10DE,
             device_id: 0x2D04,
             dedicated_bytes: 16 * 1024 * 1024 * 1024,
@@ -297,7 +297,7 @@ mod tests {
         assert_eq!(gpu_from(warp), None);
         assert_eq!(gpu_from(remote), None);
         let gpu = gpu_from(nvidia()).unwrap();
-        assert_eq!(gpu.name, "NVIDIA GeForce RTX 5060 Ti");
+        assert_eq!(gpu.name, "NVIDIA GeForce RTX 4060 Ti");
         assert_eq!(gpu.vendor, "NVIDIA");
         assert!(!gpu.basic_driver);
         assert_eq!(gpu.luid, 60570);

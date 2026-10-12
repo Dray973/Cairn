@@ -17,8 +17,9 @@ use super::step::{
 };
 use super::system::ProfileSystem;
 use super::OP_APPLY_PROFILE;
-use crate::debloat::catalog::RestartNeed;
-use crate::debloat::ItemState;
+use crate::debloat::catalog::{self, RestartNeed};
+use crate::debloat::requirements::Unavailable;
+use crate::debloat::{ItemState, Mismatch, ScanItem};
 use crate::maintenance::config::ScheduleDay;
 use crate::network::{AdapterKind, ChangeOutcome, DnsConfig, DnsMode, IpFamily, LinkStatus};
 use crate::safety::rollback::{
@@ -231,9 +232,9 @@ fn tweak_states_map_to_rows() {
     unavailable.note = Some("Microsoft Edge is not installed.".into());
     fake.scan = Ok(scan_report(vec![
         revertible(scan_item("gaming.game_mode", ItemState::Applied)),
-        scan_item("privacy.cortana", ItemState::Applied),
+        scan_item("privacy.diagnostic_data", ItemState::Applied),
         scan_item("performance.sysmain", ItemState::NotApplied),
-        scan_item("privacy.activity_history", ItemState::Partial),
+        scan_item("privacy.typing_data", ItemState::Partial),
         unavailable,
         scan_item("performance.power_plan", ItemState::NotApplied),
         scan_item("interface.file_extensions", ItemState::NotApplied),
@@ -241,9 +242,9 @@ fn tweak_states_map_to_rows() {
     let p = plan(
         &fake,
         &profile(
-            json!({"tweaks": ["gaming.game_mode", "privacy.cortana", "performance.sysmain",
-            "privacy.activity_history", "performance.edge_background", "performance.power_plan",
-            "interface.file_extensions"]}),
+            json!({"tweaks": ["gaming.game_mode", "privacy.diagnostic_data",
+            "performance.sysmain", "privacy.typing_data", "performance.edge_background",
+            "performance.power_plan", "interface.file_extensions"]}),
         ),
     );
     let r = row(&p, "tweak:gaming.game_mode");
@@ -252,7 +253,7 @@ fn tweak_states_map_to_rows() {
         (StepStatus::Already, "Already applied")
     );
     assert!(r.per_user && !r.selected);
-    let r = row(&p, "tweak:privacy.cortana");
+    let r = row(&p, "tweak:privacy.diagnostic_data");
     assert_eq!(r.detail, "Already set on this PC");
     let r = row(&p, "tweak:performance.sysmain");
     assert_eq!(r.status, StepStatus::Change);
@@ -264,7 +265,7 @@ fn tweak_states_map_to_rows() {
             .unwrap()
             .title
     );
-    let r = row(&p, "tweak:privacy.activity_history");
+    let r = row(&p, "tweak:privacy.typing_data");
     assert_eq!(
         r.detail,
         "Privacy · partly applied · takes effect after signing out"
@@ -283,6 +284,253 @@ fn tweak_states_map_to_rows() {
     assert_eq!((p.changes, p.already, p.skipped), (4, 2, 1));
     assert_eq!(p.restart, RestartNeed::SignOut);
     assert!(p.dry_run && p.elevated && p.other_account.is_none());
+}
+
+#[test]
+fn profiles_label_the_security_category() {
+    let mut fake = FakeProfiles::new();
+    fake.scan = Ok(scan_report(vec![scan_item(
+        "security.remote_assistance",
+        ItemState::NotApplied,
+    )]));
+    let p = plan(
+        &fake,
+        &profile(json!({"tweaks": ["security.remote_assistance"]})),
+    );
+    let r = row(&p, "tweak:security.remote_assistance");
+    assert_eq!(r.status, StepStatus::Change);
+    assert_eq!(r.detail, "Security · not applied");
+    assert!(r.selected && !r.per_user);
+}
+
+#[test]
+fn new_skip_reasons_have_their_texts() {
+    assert_eq!(
+        super::reason_text(StepReason::WindowsVersion),
+        "Not on this version of Windows"
+    );
+    assert_eq!(super::reason_text(StepReason::Retired), "Retired");
+}
+
+const RETIRED_NOTE: &str =
+    "Cairn found no effect of this policy on Windows 11. Undo removes the settings Cairn stored.";
+
+/// `item` as the engine scans a tweak that is not offered on this PC, with `note`.
+fn not_offered(mut item: ScanItem, kind: Unavailable, note: &str) -> ScanItem {
+    item.unavailable = Some(kind);
+    item.note = Some(note.to_string());
+    item
+}
+
+#[test]
+fn unavailable_kinds_map_to_step_reasons() {
+    let version = "Windows 11 24H2 and later no longer use this setting; this PC runs Windows 11 \
+                   Home 26H2 (build 26300.9457).";
+    let recorded = format!("{version} Undo removes the settings Cairn stored.");
+    let edition = "Needs Windows 11 Pro, Enterprise or Education; this PC runs Windows 11 Home.";
+    let mut fake = FakeProfiles::new();
+    fake.scan = Ok(scan_report(vec![
+        not_offered(
+            scan_item("performance.edge_background", ItemState::Unavailable),
+            Unavailable::NotOnThisPc,
+            "Microsoft Edge is not installed.",
+        ),
+        not_offered(
+            scan_item("privacy.advertising_id", ItemState::Unavailable),
+            Unavailable::WindowsVersion,
+            version,
+        ),
+        // Recorded tweaks are read normally, yet a profile still skips them.
+        revertible(not_offered(
+            scan_item("gaming.game_mode", ItemState::Applied),
+            Unavailable::WindowsVersion,
+            &recorded,
+        )),
+        revertible(not_offered(
+            scan_item("performance.sysmain", ItemState::NotApplied),
+            Unavailable::Edition,
+            edition,
+        )),
+        revertible(not_offered(
+            scan_item("interface.file_extensions", ItemState::NotApplied),
+            Unavailable::Retired,
+            RETIRED_NOTE,
+        )),
+    ]));
+    let p = plan(
+        &fake,
+        &profile(
+            json!({"tweaks": ["performance.edge_background", "privacy.advertising_id",
+            "gaming.game_mode", "performance.sysmain", "interface.file_extensions"]}),
+        ),
+    );
+    for (key, reason, detail) in [
+        (
+            "tweak:performance.edge_background",
+            StepReason::NotOnThisPc,
+            "Microsoft Edge is not installed.",
+        ),
+        (
+            "tweak:privacy.advertising_id",
+            StepReason::WindowsVersion,
+            version,
+        ),
+        (
+            "tweak:gaming.game_mode",
+            StepReason::WindowsVersion,
+            &recorded,
+        ),
+        ("tweak:performance.sysmain", StepReason::Edition, edition),
+        (
+            "tweak:interface.file_extensions",
+            StepReason::Retired,
+            RETIRED_NOTE,
+        ),
+    ] {
+        let r = row(&p, key);
+        assert_eq!(skipped(r), reason, "{key}");
+        assert_eq!(r.detail, detail, "{key}");
+        assert!(!r.selected && r.caution.is_none(), "{key}");
+    }
+    assert!(row(&p, "tweak:interface.file_extensions").per_user);
+    assert_eq!((p.changes, p.already, p.skipped), (0, 0, 5));
+    assert_eq!(p.restart, RestartNeed::None);
+    for (reason, label) in [
+        (StepReason::NotOnThisPc, "Not on this PC"),
+        (StepReason::WindowsVersion, "Not on this version of Windows"),
+        (StepReason::Edition, "Not on this edition of Windows"),
+        (StepReason::Retired, "Retired"),
+    ] {
+        assert_eq!(super::reason_text(reason), label);
+    }
+}
+
+#[test]
+fn undo_limit_is_the_row_caution() {
+    let limit = "Windows clears the list of recent files when this is turned off. Undo turns the \
+                 list back on, but it starts empty.";
+    let mut fake = FakeProfiles::new();
+    let limited = |id: &str, state: ItemState| {
+        let mut item = scan_item(id, state);
+        item.undo_limit = Some(limit.to_string());
+        item
+    };
+    fake.scan = Ok(scan_report(vec![
+        limited("performance.sysmain", ItemState::NotApplied),
+        limited("performance.search_indexer", ItemState::NotApplied),
+        limited("gaming.game_mode", ItemState::Applied),
+        scan_item("interface.file_extensions", ItemState::NotApplied),
+    ]));
+    let p = profile(
+        json!({"tweaks": ["performance.sysmain", "performance.search_indexer",
+        "gaming.game_mode", "interface.file_extensions"]}),
+    );
+    let planned = plan(&fake, &p);
+    let r = row(&planned, "tweak:performance.sysmain");
+    assert_eq!(r.status, StepStatus::Change);
+    assert_eq!(r.caution.as_deref(), Some(limit));
+    assert!(!r.selected, "a row with an undo limit starts unselected");
+    let indexer = catalog::tweak("performance.search_indexer").unwrap();
+    assert_eq!(indexer.risk, crate::debloat::Risk::High);
+    assert_eq!(
+        row(&planned, "tweak:performance.search_indexer").caution,
+        Some(format!("High risk: {} {limit}", indexer.description))
+    );
+    let r = row(&planned, "tweak:gaming.game_mode");
+    assert_eq!(
+        (r.status, r.caution.as_deref()),
+        (StepStatus::Already, None)
+    );
+    let r = row(&planned, "tweak:interface.file_extensions");
+    assert!(r.caution.is_none() && r.selected);
+
+    // The default selection leaves it out; choosing it applies it.
+    apply(&fake, &p, None).unwrap();
+    assert_eq!(calls(&fake), ["apply_items interface.file_extensions"]);
+    let report = apply(&fake, &p, Some(&strings(&["tweak:performance.sysmain"]))).unwrap();
+    assert_eq!(
+        outcome(&report, "tweak:performance.sysmain"),
+        StepOutcome::Applied
+    );
+    assert_eq!(calls(&fake)[1], "apply_items performance.sysmain");
+}
+
+#[test]
+fn retired_tweak_is_never_applied_from_a_profile() {
+    let mut fake = FakeProfiles::new();
+    fake.scan = Ok(scan_report(vec![
+        revertible(not_offered(
+            scan_item("privacy.advertising_id", ItemState::NotApplied),
+            Unavailable::Retired,
+            RETIRED_NOTE,
+        )),
+        scan_item("performance.sysmain", ItemState::NotApplied),
+    ]));
+    let p = profile(json!({"tweaks": ["privacy.advertising_id", "performance.sysmain"]}));
+    let planned = plan(&fake, &p);
+    let r = row(&planned, "tweak:privacy.advertising_id");
+    assert_eq!(skipped(r), StepReason::Retired);
+    assert_eq!(r.detail, RETIRED_NOTE);
+    assert!(!r.selected);
+
+    // Neither the default selection nor naming the row applies it.
+    apply(&fake, &p, None).unwrap();
+    assert_eq!(calls(&fake), ["apply_items performance.sysmain"]);
+    let report = apply(&fake, &p, Some(&strings(&["tweak:privacy.advertising_id"]))).unwrap();
+    assert!(
+        report.session_id.is_none(),
+        "nothing to apply opens no session"
+    );
+    assert_eq!(
+        outcome(&report, "tweak:privacy.advertising_id"),
+        StepOutcome::Skipped
+    );
+    assert_eq!(
+        report.results[0].details,
+        [format!("Retired: {RETIRED_NOTE}")]
+    );
+    assert_eq!(calls(&fake).len(), 1);
+
+    // Every retired catalog tweak scans as retired, so it is skipped the same way.
+    for t in catalog::TWEAKS.iter().filter(|t| t.retired.is_some()) {
+        let item = scan_item(t.id, ItemState::Applied);
+        assert_eq!(item.unavailable, Some(Unavailable::Retired), "{}", t.id);
+        assert!(!item.recommended, "{}", t.id);
+    }
+}
+
+#[test]
+fn not_kept_items_carry_into_the_step_results() {
+    let mut fake = FakeProfiles::new();
+    fake.scan = Ok(scan_report(vec![
+        scan_item("performance.sysmain", ItemState::NotApplied),
+        scan_item("performance.power_plan", ItemState::NotApplied),
+    ]));
+    let mismatch = Mismatch {
+        target: "service SysMain".into(),
+        label: "service SysMain".into(),
+        expected: "Disabled".into(),
+        found: "Automatic".into(),
+        original: Some("Automatic".into()),
+        back_to_original: true,
+    };
+    fake.not_kept
+        .insert("tweak:performance.sysmain".into(), vec![mismatch.clone()]);
+    let p = profile(json!({"tweaks": ["performance.sysmain", "performance.power_plan"]}));
+    let report = apply(&fake, &p, None).unwrap();
+    let result = |key: &str| report.results.iter().find(|r| r.key == key).unwrap();
+    let sysmain = result("tweak:performance.sysmain");
+    assert_eq!(sysmain.outcome, StepOutcome::Applied);
+    assert_eq!(sysmain.not_kept, vec![mismatch]);
+    assert!(result("tweak:performance.power_plan").not_kept.is_empty());
+    let json = serde_json::to_value(&report).unwrap();
+    let row = json["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["key"] == "tweak:performance.sysmain")
+        .unwrap();
+    assert_eq!(row["not_kept"][0]["found"], "Automatic");
 }
 
 #[test]
@@ -865,7 +1113,7 @@ fn earlier_change_rows_say_undo_goes_to_the_first_baseline() {
     let mut fake = dns_fake();
     fake.scan = Ok(scan_report(vec![
         revertible(scan_item("performance.sysmain", ItemState::NotApplied)),
-        scan_item("privacy.cortana", ItemState::NotApplied),
+        scan_item("privacy.diagnostic_data", ItemState::NotApplied),
     ]));
     fake.startup = Ok(vec![
         startup_entry(StartupSource::UserRun, "Discord", "Discord", true),
@@ -921,7 +1169,7 @@ fn earlier_change_rows_say_undo_goes_to_the_first_baseline() {
     let p = plan(
         &fake,
         &profile(json!({
-            "tweaks": ["performance.sysmain", "privacy.cortana"],
+            "tweaks": ["performance.sysmain", "privacy.diagnostic_data"],
             "startup": [{"id": "user_run:Discord"}, {"id": "user_run:Steam"}],
             "dns": {"ethernet": {"ipv4": "cloudflare", "ipv6": "cloudflare"}},
             "windows_update": {"active_hours": {"start": 8, "end": 20}, "restart_notify": true}
@@ -929,7 +1177,7 @@ fn earlier_change_rows_say_undo_goes_to_the_first_baseline() {
     );
     let earlier = |p: &ProfilePlan, key: &str| row(p, key).detail.ends_with(EARLIER_CHANGE);
     assert!(earlier(&p, "tweak:performance.sysmain"));
-    assert!(!earlier(&p, "tweak:privacy.cortana"));
+    assert!(!earlier(&p, "tweak:privacy.diagnostic_data"));
     assert!(earlier(&p, "startup:user_run:Discord"));
     assert!(!earlier(&p, "startup:user_run:Steam"));
     assert!(earlier(&p, &format!("dns:{}", guid(1))));
@@ -1604,7 +1852,7 @@ fn export_fake() -> FakeProfiles {
     fake.scan = Ok(scan_report(vec![
         revertible(scan_item("performance.sysmain", ItemState::Applied)),
         scan_item("interface.file_extensions", ItemState::Applied),
-        scan_item("privacy.cortana", ItemState::NotApplied),
+        scan_item("privacy.diagnostic_data", ItemState::NotApplied),
         appx_item("Microsoft.BingNews", ItemState::Applied),
         appx_item("king.com.CandyCrushSaga", ItemState::NotApplied),
     ]));
@@ -1715,6 +1963,56 @@ fn candidates_list_applied_tweaks_removed_apps_disabled_startup_preset_dns() {
     assert!(wu.exclude_drivers && wu.active_hours.is_some() && wu.restart_notify.is_none());
     assert!(built.maintenance.is_some());
     assert_eq!(parse(&to_text(&built)).unwrap(), built);
+}
+
+#[test]
+fn export_leaves_out_retired_tweaks() {
+    let mut fake = export_fake();
+    if let Ok(scan) = &mut fake.scan {
+        // Its record still undoes, so the scan reads it as applied, with its retired kind.
+        scan.items.push(revertible(not_offered(
+            scan_item("privacy.advertising_id", ItemState::Applied),
+            Unavailable::Retired,
+            RETIRED_NOTE,
+        )));
+        // A tweak for another Windows version is still a setting of this PC.
+        scan.items.push(revertible(not_offered(
+            scan_item("gaming.game_mode", ItemState::Applied),
+            Unavailable::WindowsVersion,
+            "Windows 11 24H2 and later no longer use this setting; this PC runs Windows 11 \
+             Home 26H2 (build 26300.9457). Undo removes the settings Cairn stored.",
+        )));
+    }
+    let c = candidates_with(&fake).unwrap();
+    let tweaks: Vec<&str> = c
+        .rows
+        .iter()
+        .filter(|r| r.section == Section::Tweaks)
+        .map(|r| r.key.as_str())
+        .collect();
+    assert_eq!(
+        tweaks,
+        [
+            "tweak:performance.sysmain",
+            "tweak:interface.file_extensions",
+            "tweak:gaming.game_mode"
+        ]
+    );
+    let (built, missing) = build_with(
+        &fake,
+        "Desk PC",
+        "",
+        Some(&strings(&[
+            "tweak:privacy.advertising_id",
+            "tweak:performance.sysmain",
+        ])),
+        "2026-09-28",
+    )
+    .unwrap();
+    assert_eq!(built.tweaks, ["performance.sysmain"]);
+    assert_eq!(missing, ["tweak:privacy.advertising_id"]);
+    let (every, _) = build_with(&fake, "Desk PC", "", None, "2026-09-28").unwrap();
+    assert!(!every.tweaks.iter().any(|id| id == "privacy.advertising_id"));
 }
 
 #[test]

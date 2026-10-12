@@ -81,6 +81,16 @@ fn fixed_now() -> DateTime<Utc> {
         .unwrap()
         .with_timezone(&Utc)
 }
+fn no_restart_flags() -> RestartFlags {
+    RestartFlags::default()
+}
+fn all_restart_flags() -> RestartFlags {
+    RestartFlags {
+        servicing: true,
+        windows_update: true,
+        file_renames: true,
+    }
+}
 
 /// An elevated signed-in user with winget installed, on AC power, nothing else running.
 fn env() -> WingetEnv {
@@ -94,6 +104,7 @@ fn env() -> WingetEnv {
         servicing_tool: no_tool,
         now: fixed_now,
         installs_forbidden: no,
+        restart_flags: no_restart_flags,
     }
 }
 
@@ -1039,6 +1050,135 @@ fn an_update_batch_writes_a_started_and_a_final_row_per_app() {
     assert_eq!(result["restart_required"], true);
     assert_eq!(result["items"][1]["exit_code_hex"], "0x8A150109");
     assert_no_forbidden_flags(&scripted.launcher.launched());
+}
+
+/// No flag the first time it is asked (before the batch) and the servicing flag afterwards, so
+/// a batch sees a pending restart appear while it runs.
+fn pending_appears_during_batch() -> RestartFlags {
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    RestartFlags {
+        servicing: CALLS.fetch_add(1, Ordering::SeqCst) >= 1,
+        ..RestartFlags::default()
+    }
+}
+
+/// A file operation queued for the next boot on every call, and the servicing flag from the
+/// second call on (after the batch).
+fn servicing_appears_while_a_file_rename_waits() -> RestartFlags {
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    RestartFlags {
+        servicing: CALLS.fetch_add(1, Ordering::SeqCst) >= 1,
+        file_renames: true,
+        ..RestartFlags::default()
+    }
+}
+
+#[test]
+fn restart_flags_count_only_a_flag_that_was_not_set_before() {
+    let renames = RestartFlags {
+        file_renames: true,
+        ..RestartFlags::default()
+    };
+    let renames_and_servicing = RestartFlags {
+        servicing: true,
+        ..renames
+    };
+    assert!(renames_and_servicing.appeared_since(renames));
+    assert!(renames.appeared_since(RestartFlags::default()));
+    assert!(RestartFlags {
+        windows_update: true,
+        ..renames
+    }
+    .appeared_since(renames));
+    assert!(!renames.appeared_since(renames));
+    assert!(!all_restart_flags().appeared_since(all_restart_flags()));
+    assert!(!RestartFlags::default().appeared_since(all_restart_flags()));
+    assert!(!renames.appeared_since(renames_and_servicing));
+}
+
+#[test]
+fn a_batch_flags_a_pending_restart_that_appeared_during_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host(dir.path());
+    let journal = journal(dir.path());
+    let scripted = scripted(None, Some(Arc::clone(&journal)));
+    exit_with(&scripted.launcher.script(), "Successfully upgraded\r\n", 0);
+    let env = WingetEnv {
+        restart_flags: pending_appears_during_batch,
+        ..env()
+    };
+    let deps = deps(env, scripted.launcher.clone());
+    let id = start_batch(&host, &deps, UpdatesKind::Upgrade, &["Contoso.A"], &journal);
+    let snapshot = wait(&host, id);
+    // The app exited 0, but the restart that appeared during the batch needs attention.
+    assert_eq!(snapshot.state, JobState::Attention, "{snapshot:?}");
+    assert!(snapshot.restart_required, "the job needs a restart");
+    assert!(
+        snapshot
+            .summary
+            .as_deref()
+            .unwrap()
+            .contains("Windows reports a pending restart; restart Windows to finish."),
+        "{snapshot:?}"
+    );
+    let result = result_json(&host, id);
+    assert_eq!(states(&result), ["succeeded"]);
+    assert_eq!(result["pending_restart"], true);
+    assert_eq!(
+        result["restart_required"], false,
+        "no app reported a restart code; the restart is Windows' own"
+    );
+    // The app's own row says it too, since the flags do not name the app.
+    assert_eq!(
+        result["items"][0]["message"],
+        "Windows reports a pending restart; restart Windows to finish."
+    );
+}
+
+#[test]
+fn a_batch_without_a_new_pending_restart_is_not_flagged() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host(dir.path());
+    let journal = journal(dir.path());
+    let scripted = scripted(None, Some(Arc::clone(&journal)));
+    exit_with(&scripted.launcher.script(), "Successfully upgraded\r\n", 0);
+    // A PC that already wanted a restart before the batch: the batch did not cause it.
+    let env = WingetEnv {
+        restart_flags: all_restart_flags,
+        ..env()
+    };
+    let deps = deps(env, scripted.launcher.clone());
+    let id = start_batch(&host, &deps, UpdatesKind::Upgrade, &["Contoso.A"], &journal);
+    let snapshot = wait(&host, id);
+    assert_eq!(snapshot.state, JobState::Succeeded, "{snapshot:?}");
+    assert!(!snapshot.restart_required);
+    let result = result_json(&host, id);
+    assert_eq!(result["pending_restart"], false);
+    assert!(result["items"][0]["message"].is_null(), "{result}");
+}
+
+#[test]
+fn a_restart_that_appears_while_a_file_rename_waits_is_flagged() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host(dir.path());
+    let journal = journal(dir.path());
+    let scripted = scripted(None, Some(Arc::clone(&journal)));
+    exit_with(&scripted.launcher.script(), "Successfully installed\r\n", 0);
+    // A file operation an earlier install queued for the next boot was there before the batch;
+    // the servicing flag that turns on during it is still the batch's.
+    let env = WingetEnv {
+        restart_flags: servicing_appears_while_a_file_rename_waits,
+        ..env()
+    };
+    let deps = deps(env, scripted.launcher.clone());
+    let id = start_batch(&host, &deps, UpdatesKind::Upgrade, &["Contoso.A"], &journal);
+    let snapshot = wait(&host, id);
+    assert_eq!(snapshot.state, JobState::Attention, "{snapshot:?}");
+    assert!(snapshot.restart_required, "the job needs a restart");
+    let result = result_json(&host, id);
+    assert_eq!(states(&result), ["succeeded"]);
+    assert_eq!(result["pending_restart"], true);
+    assert_eq!(result["items"][0]["message"], codes::PENDING_RESTART_TEXT);
 }
 
 #[test]

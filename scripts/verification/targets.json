@@ -1,0 +1,859 @@
+{
+  "registry_values": [
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Windows\\DataCollection",
+      "name": "AllowTelemetry"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Windows\\System",
+      "name": "EnableActivityFeed"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Windows\\System",
+      "name": "PublishUserActivities"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Windows\\System",
+      "name": "UploadUserActivities"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Windows\\System",
+      "name": "EnableMmx"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Windows\\Windows Search",
+      "name": "AllowCortana"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Windows\\AdvertisingInfo",
+      "name": "DisabledByGroupPolicy"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Policies\\Microsoft\\Windows\\CloudContent",
+      "name": "DisableTailoredExperiencesWithDiagnosticData"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager",
+      "name": "SilentInstalledAppsEnabled"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager",
+      "name": "SystemPaneSuggestionsEnabled"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager",
+      "name": "SubscribedContent-338388Enabled"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager",
+      "name": "SubscribedContent-338389Enabled"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager",
+      "name": "SubscribedContent-338393Enabled"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager",
+      "name": "SubscribedContent-353694Enabled"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager",
+      "name": "SubscribedContent-353696Enabled"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Policies\\Microsoft\\Windows\\Explorer",
+      "name": "DisableSearchBoxSuggestions"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\SearchSettings",
+      "name": "IsDeviceSearchHistoryEnabled"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\SearchSettings",
+      "name": "IsMSACloudSearchEnabled"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\SearchSettings",
+      "name": "IsAADCloudSearchEnabled"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Windows\\Windows Search",
+      "name": "AllowCloudSearch"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Siuf\\Rules",
+      "name": "NumberOfSIUFInPeriod"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Windows\\DataCollection",
+      "name": "DoNotShowFeedbackNotifications"
+    },
+    {
+      "hive": "HKCU",
+      "path": "System\\GameConfigStore",
+      "name": "GameDVR_Enabled"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\GameDVR",
+      "name": "AppCaptureEnabled"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Windows\\GameDVR",
+      "name": "AllowGameDVR"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\GameBar",
+      "name": "AutoGameModeEnabled"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\GameBar",
+      "name": "AllowAutoGameMode"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile",
+      "name": "SystemResponsiveness"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile\\Tasks\\Games",
+      "name": "GPU Priority"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile\\Tasks\\Games",
+      "name": "Priority"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile\\Tasks\\Games",
+      "name": "Scheduling Category"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile\\Tasks\\Games",
+      "name": "SFIO Priority"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Control Panel\\Mouse",
+      "name": "MouseSpeed"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Control Panel\\Mouse",
+      "name": "MouseThreshold1"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Control Panel\\Mouse",
+      "name": "MouseThreshold2"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Serialize",
+      "name": "StartupDelayInMSec"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Windows\\AppPrivacy",
+      "name": "LetAppsRunInBackground"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Edge",
+      "name": "StartupBoostEnabled"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Edge",
+      "name": "BackgroundModeEnabled"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Windows\\DeliveryOptimization",
+      "name": "DODownloadMode"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Control Panel\\Desktop",
+      "name": "MenuShowDelay"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+      "name": "EnableTransparency"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Power",
+      "name": "HiberbootEnabled"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsAI",
+      "name": "DisableAIDataAnalysis"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Policies\\Microsoft\\Windows\\WindowsAI",
+      "name": "DisableAIDataAnalysis"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Policies\\Microsoft\\Windows\\WindowsCopilot",
+      "name": "TurnOffWindowsCopilot"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsCopilot",
+      "name": "TurnOffWindowsCopilot"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\WindowsNotepad",
+      "name": "DisableAIFeatures"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Windows\\AppPrivacy",
+      "name": "LetAppsAccessSystemAIModels"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+      "name": "Start_TrackProgs"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\InputPersonalization",
+      "name": "RestrictImplicitTextCollection"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\InputPersonalization",
+      "name": "RestrictImplicitInkCollection"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\InputPersonalization\\TrainedDataStore",
+      "name": "HarvestContacts"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Personalization\\Settings",
+      "name": "AcceptedPrivacyPolicy"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\TextInput",
+      "name": "AllowLinguisticDataCollection"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\input\\TIPC",
+      "name": "Enabled"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\CPSS\\Store\\ImproveInkingAndTyping",
+      "name": "Value"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Control Panel\\International\\User Profile",
+      "name": "HttpAcceptLanguageOptOut"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Speech_OneCore\\Settings\\OnlineSpeechPrivacy",
+      "name": "HasAccepted"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Microsoft\\Windows\\Windows Error Reporting",
+      "name": "Disabled"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\SQMClient\\Windows",
+      "name": "CEIPEnable"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager",
+      "name": "RotatingLockScreenOverlayEnabled"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager",
+      "name": "SubscribedContent-338387Enabled"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+      "name": "Start_IrisRecommendations"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\UserProfileEngagement",
+      "name": "ScoobeSystemSettingEnabled"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\Notifications\\Settings",
+      "name": "NOC_GLOBAL_SETTING_ALLOW_TOASTS_ABOVE_LOCK"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\PushNotifications",
+      "name": "LockScreenToastEnabled"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer",
+      "name": "ShowCloudFilesInQuickAccess"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Windows\\LocationAndSensors",
+      "name": "DisableLocation"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Policies\\Microsoft\\office\\common\\clienttelemetry",
+      "name": "SendTelemetry"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Policies\\Microsoft\\office\\16.0\\common\\feedback",
+      "name": "Enabled"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Policies\\Microsoft\\office\\16.0\\common\\feedback",
+      "name": "SurveyEnabled"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Policies\\Microsoft\\office\\16.0\\common\\privacy",
+      "name": "ControllerConnectedServicesEnabled"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Policies\\Microsoft\\office\\16.0\\common\\privacy",
+      "name": "UserContentDisabled"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Policies\\Microsoft\\office\\16.0\\common\\privacy",
+      "name": "DownloadContentDisabled"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Edge",
+      "name": "DiagnosticData"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Edge",
+      "name": "PersonalizationReportingEnabled"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Edge",
+      "name": "EdgeShoppingAssistantEnabled"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Edge",
+      "name": "ShowRecommendationsEnabled"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Edge",
+      "name": "SpotlightExperiencesAndRecommendationsEnabled"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Edge",
+      "name": "UserFeedbackAllowed"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Control Panel\\Accessibility\\StickyKeys",
+      "name": "Flags"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Control Panel\\Accessibility\\Keyboard Response",
+      "name": "Flags"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Control Panel\\Accessibility\\ToggleKeys",
+      "name": "Flags"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers",
+      "name": "HwSchMode"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile",
+      "name": "NetworkThrottlingIndex"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+      "name": "HideFileExt"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+      "name": "Hidden"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Classes\\CLSID\\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\\InprocServer32",
+      "name": ""
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Dsh",
+      "name": "AllowNewsAndInterests"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\\TaskbarDeveloperSettings",
+      "name": "TaskbarEndTask"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+      "name": "TaskbarAl"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+      "name": "ShowTaskViewButton"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\Search",
+      "name": "SearchboxTaskbarMode"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+      "name": "LaunchTo"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+      "name": "AppsUseLightTheme"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+      "name": "SystemUsesLightTheme"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+      "name": "ShowSyncProviderNotifications"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Classes\\CLSID\\{f874310e-b6b7-47dc-bc84-b9e6b38f5903}",
+      "name": "System.IsPinnedToNameSpaceTree"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Classes\\CLSID\\{e88865ea-0e1c-4e20-9aa6-edcd0212c87c}",
+      "name": "System.IsPinnedToNameSpaceTree"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Windows\\Explorer",
+      "name": "HideAIActionsMenu"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\HideDesktopIcons\\NewStartPanel",
+      "name": "{2cc5ca98-6485-489a-920e-b3e88a6ccce3}"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SYSTEM\\CurrentControlSet\\Control\\FileSystem",
+      "name": "LongPathsEnabled"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Edge",
+      "name": "HubsSidebarEnabled"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Edge",
+      "name": "DefaultBrowserSettingEnabled"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Edge",
+      "name": "DefaultBrowserSettingsCampaignEnabled"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Edge",
+      "name": "ShowPDFDefaultRecommendationsEnabled"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Edge",
+      "name": "HideFirstRunExperience"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Edge",
+      "name": "NewTabPageContentEnabled"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Edge",
+      "name": "NewTabPageHideDefaultTopSites"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Edge",
+      "name": "ShowMicrosoftRewards"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Edge",
+      "name": "ShowAcrobatSubscriptionButton"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Edge",
+      "name": "MicrosoftEdgeInsiderPromotionEnabled"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SYSTEM\\CurrentControlSet\\Control\\Remote Assistance",
+      "name": "fAllowToGetHelp"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Windows NT\\Terminal Services",
+      "name": "fAllowToGetHelp"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Windows\\Device Metadata",
+      "name": "PreventDeviceMetadataFromNetwork"
+    }
+  ],
+  "registry_keys": [
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Windows\\DataCollection"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Windows\\System"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Windows\\Windows Search"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Windows\\AdvertisingInfo"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Policies\\Microsoft\\Windows\\CloudContent"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Policies\\Microsoft\\Windows\\Explorer"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\SearchSettings"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Siuf\\Rules"
+    },
+    {
+      "hive": "HKCU",
+      "path": "System\\GameConfigStore"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\GameDVR"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Windows\\GameDVR"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\GameBar"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile\\Tasks\\Games"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Control Panel\\Mouse"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Serialize"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Windows\\AppPrivacy"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Edge"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Windows\\DeliveryOptimization"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Control Panel\\Desktop"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Power"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsAI"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Policies\\Microsoft\\Windows\\WindowsAI"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Policies\\Microsoft\\Windows\\WindowsCopilot"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsCopilot"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\WindowsNotepad"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\InputPersonalization"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\InputPersonalization\\TrainedDataStore"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Personalization\\Settings"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\TextInput"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\input\\TIPC"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\CPSS\\Store\\ImproveInkingAndTyping"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Control Panel\\International\\User Profile"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Speech_OneCore\\Settings\\OnlineSpeechPrivacy"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Microsoft\\Windows\\Windows Error Reporting"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\SQMClient\\Windows"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\UserProfileEngagement"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\Notifications\\Settings"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\PushNotifications"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Windows\\LocationAndSensors"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Policies\\Microsoft\\office\\common\\clienttelemetry"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Policies\\Microsoft\\office\\16.0\\common\\feedback"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Policies\\Microsoft\\office\\16.0\\common\\privacy"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Control Panel\\Accessibility\\StickyKeys"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Control Panel\\Accessibility\\Keyboard Response"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Control Panel\\Accessibility\\ToggleKeys"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Classes\\CLSID\\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\\InprocServer32"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Dsh"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\\TaskbarDeveloperSettings"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\Search"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Classes\\CLSID\\{f874310e-b6b7-47dc-bc84-b9e6b38f5903}"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Classes\\CLSID\\{e88865ea-0e1c-4e20-9aa6-edcd0212c87c}"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Windows\\Explorer"
+    },
+    {
+      "hive": "HKCU",
+      "path": "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\HideDesktopIcons\\NewStartPanel"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SYSTEM\\CurrentControlSet\\Control\\FileSystem"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SYSTEM\\CurrentControlSet\\Control\\Remote Assistance"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Windows NT\\Terminal Services"
+    },
+    {
+      "hive": "HKLM",
+      "path": "SOFTWARE\\Policies\\Microsoft\\Windows\\Device Metadata"
+    }
+  ],
+  "services": [
+    "DiagTrack",
+    "SysMain",
+    "MapsBroker",
+    "TrkWks",
+    "WSearch"
+  ],
+  "tasks": [
+    "\\Microsoft\\Windows\\Feedback\\Siuf\\DmClient",
+    "\\Microsoft\\Windows\\Feedback\\Siuf\\DmClientOnScenarioDownload",
+    "\\Microsoft\\Windows\\Windows Error Reporting\\QueueReporting",
+    "\\Microsoft\\Windows\\Customer Experience Improvement Program\\Consolidator",
+    "\\Microsoft\\Windows\\Customer Experience Improvement Program\\UsbCeip",
+    "\\Microsoft\\Windows\\Customer Experience Improvement Program\\KernelCeipTask",
+    "\\Microsoft\\Windows\\Autochk\\Proxy",
+    "\\Microsoft\\Windows\\DiskDiagnostic\\Microsoft-Windows-DiskDiagnosticDataCollector",
+    "\\Microsoft\\Windows\\Application Experience\\Microsoft Compatibility Appraiser",
+    "\\Microsoft\\Windows\\Application Experience\\Microsoft Compatibility Appraiser Exp",
+    "\\Microsoft\\Windows\\Application Experience\\ProgramDataUpdater",
+    "\\Microsoft\\Windows\\Application Experience\\MareBackup"
+  ]
+}

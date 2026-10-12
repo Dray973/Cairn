@@ -12,6 +12,7 @@
 pub mod restore_point;
 pub mod rollback;
 pub mod state_log;
+pub mod verify;
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -22,10 +23,12 @@ use tracing::{debug, info, warn};
 pub use restore_point::forbidden as restore_points_forbidden;
 pub use restore_point::{create_restore_point, is_system_restore_enabled, RestorePoint};
 pub use rollback::{rollback_filtered, rollback_to_baseline, RollbackFilter, RollbackReport};
-pub use state_log::{Journal, JournalSummary};
+pub use state_log::{Journal, JournalSummary, Written};
 
 use crate::network::IpFamily;
-use crate::win::registry::{write_requires_elevation, Hive, Key, RawValue, RegValue};
+use crate::win::registry::{
+    delete_key_if_empty, path_within, write_requires_elevation, Hive, Key, RawValue, RegValue,
+};
 use crate::win::scm::{Scm, Service, ServiceConfig, ServiceStatus, StartType, MUTATE_ACCESS};
 use crate::win::session;
 use crate::{is_elevated, Error, Result, VERSION};
@@ -313,9 +316,13 @@ impl Safety {
 
     /// Records the current value, then writes `value`. Creates the key and any missing
     /// parents if needed; the record names the shallowest key created, so rollback can
-    /// remove all of them.
+    /// remove all of them. The record then keeps what was written (also when the value was
+    /// already set), so later reads can tell whether the target still holds it.
     /// HKCU writes fail before anything is recorded when [`Self::ensure_interactive_user`]
-    /// does.
+    /// does. A write that fails (the key cannot be created or the value cannot be set)
+    /// leaves the target as it was: the keys the write created are removed again, the
+    /// record this call captured is withdrawn (see [`Self::withdraw_registry`]) and the
+    /// failure is logged.
     pub fn set_registry_value(
         &self,
         hive: Hive,
@@ -325,10 +332,16 @@ impl Safety {
     ) -> Result<MutationOutcome> {
         self.check_registry_write(hive, key_path)?;
         let target = registry_target(hive, key_path, value_name);
-        let current = self.snapshot_registry(hive, key_path, value_name)?;
+        let snapshot = self.snapshot_registry(hive, key_path, value_name)?;
 
         let desired = value.to_raw();
-        if current.as_ref() == Some(&desired) {
+        if snapshot.current.as_ref() == Some(&desired) {
+            self.store_written(
+                hive,
+                key_path,
+                value_name,
+                Written::Value { value: desired },
+            );
             self.journal.log_op(
                 Some(self.session_id),
                 "set_registry_value",
@@ -339,8 +352,25 @@ impl Safety {
             return Ok(MutationOutcome::AlreadyInDesiredState);
         }
 
-        let (key, _) = Key::create(hive, key_path)?;
-        key.set_raw(value_name, desired.kind, &desired.data)?;
+        let written = Key::create(hive, key_path)
+            .and_then(|(key, _)| key.set_raw(value_name, desired.kind, &desired.data));
+        if let Err(e) = written {
+            self.withdraw_registry(hive, key_path, value_name, &snapshot);
+            self.journal.log_op(
+                Some(self.session_id),
+                "set_registry_value",
+                &target,
+                "failed",
+                Some(&e.to_string()),
+            )?;
+            return Err(e);
+        }
+        self.store_written(
+            hive,
+            key_path,
+            value_name,
+            Written::Value { value: desired },
+        );
         self.journal.log_op(
             Some(self.session_id),
             "set_registry_value",
@@ -352,8 +382,10 @@ impl Safety {
         Ok(MutationOutcome::Applied)
     }
 
-    /// Records the current value, then deletes it. HKCU deletes fail before anything is
-    /// recorded when [`Self::ensure_interactive_user`] does.
+    /// Records the current value, then deletes it. The record then keeps that the value was
+    /// deleted, also when it was already absent. HKCU deletes fail before anything is recorded
+    /// when [`Self::ensure_interactive_user`] does. A delete that fails withdraws the record
+    /// this call captured, like a failed write.
     pub fn delete_registry_value(
         &self,
         hive: Hive,
@@ -362,13 +394,27 @@ impl Safety {
     ) -> Result<MutationOutcome> {
         self.check_registry_write(hive, key_path)?;
         let target = registry_target(hive, key_path, value_name);
-        let current = self.snapshot_registry(hive, key_path, value_name)?;
-        if current.is_none() {
+        let snapshot = self.snapshot_registry(hive, key_path, value_name)?;
+        if snapshot.current.is_none() {
+            self.store_written(hive, key_path, value_name, Written::Deleted);
             return Ok(MutationOutcome::AlreadyInDesiredState);
         }
-        if let Some(key) = Key::open(hive, key_path, true)? {
-            key.delete_value(value_name)?;
+        let deleted = Key::open(hive, key_path, true).and_then(|key| match key {
+            Some(key) => key.delete_value(value_name).map(|_| ()),
+            None => Ok(()),
+        });
+        if let Err(e) = deleted {
+            self.withdraw_registry(hive, key_path, value_name, &snapshot);
+            self.journal.log_op(
+                Some(self.session_id),
+                "delete_registry_value",
+                &target,
+                "failed",
+                Some(&e.to_string()),
+            )?;
+            return Err(e);
         }
+        self.store_written(hive, key_path, value_name, Written::Deleted);
         self.journal.log_op(
             Some(self.session_id),
             "delete_registry_value",
@@ -380,6 +426,69 @@ impl Safety {
         Ok(MutationOutcome::Applied)
     }
 
+    /// Undoes the bookkeeping of a registry write that failed: the keys the write created
+    /// (from the target's key up to `snapshot.created_root`) are deleted while they are
+    /// empty, and the record this call captured is ended, so no active record claims a
+    /// change that did not happen and no rollback touches the untouched target. Best
+    /// effort: what cannot be undone is logged, and the write's own error is what the
+    /// caller reports.
+    fn withdraw_registry(
+        &self,
+        hive: Hive,
+        key_path: &str,
+        value_name: &str,
+        snapshot: &RegistrySnapshot,
+    ) {
+        let target = registry_target(hive, key_path, value_name);
+        if let Some(root) = snapshot.created_root.as_deref() {
+            let mut path = key_path;
+            while path_within(path, root) {
+                match delete_key_if_empty(hive, path) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(key = %path, error = %e, "cannot remove a key created by a failed write");
+                        break;
+                    }
+                }
+                match path.rsplit_once('\\') {
+                    Some((parent, _)) if !parent.is_empty() => path = parent,
+                    _ => break,
+                }
+            }
+        }
+        if !snapshot.captured {
+            return;
+        }
+        match self
+            .journal
+            .withdraw_registry(self.session_id, hive, key_path, value_name)
+        {
+            Ok(true) => debug!(target = %target, "baseline withdrawn after a failed write"),
+            Ok(false) => warn!(target = %target, "no record of this session to withdraw"),
+            Err(e) => warn!(target = %target, error = %e, "cannot withdraw the journal record"),
+        }
+    }
+
+    /// Stores `written` on the active record of the target. A failure only costs the target
+    /// its drift check, so it is logged and never fails the write.
+    fn store_written(&self, hive: Hive, key_path: &str, value_name: &str, written: Written) {
+        match self
+            .journal
+            .set_registry_written(hive, key_path, value_name, &written)
+        {
+            Ok(true) => {}
+            Ok(false) => warn!(
+                target = %registry_target(hive, key_path, value_name),
+                "no active journal record to keep the written value on"
+            ),
+            Err(e) => warn!(
+                target = %registry_target(hive, key_path, value_name),
+                error = %e,
+                "cannot keep the written value in the journal"
+            ),
+        }
+    }
+
     /// Captures the baseline for a registry value and returns its current raw form. When
     /// the key is missing, the record also names the shallowest missing key on its path,
     /// because creating the key creates every missing ancestor as well.
@@ -388,7 +497,7 @@ impl Safety {
         hive: Hive,
         key_path: &str,
         value_name: &str,
-    ) -> Result<Option<RawValue>> {
+    ) -> Result<RegistrySnapshot> {
         let key = Key::open(hive, key_path, false)?;
         let key_existed = key.is_some();
         let current = match &key {
@@ -405,19 +514,26 @@ impl Safety {
                 key_existed,
                 value_existed: current.is_some(),
                 original: current.clone(),
-                created_root,
+                created_root: created_root.clone(),
             },
         )?;
         if captured {
             debug!(target = %registry_target(hive, key_path, value_name), "baseline captured");
         }
-        Ok(current)
+        Ok(RegistrySnapshot {
+            current,
+            captured,
+            created_root,
+        })
     }
 
     // ───────────────────────────── services ─────────────────────────────
 
     /// Records the service's start type and running state, then sets the start type.
-    /// `delayed` applies only when the new start type is `Automatic`.
+    /// `delayed` applies only when the new start type is `Automatic`. When the start type
+    /// cannot be set, the service is as it was: the record this call captured is withdrawn
+    /// and the failure logged. A delayed-start flag that cannot be set after the start type
+    /// changed keeps the record, because the start type did change.
     pub fn set_service_start_type(
         &self,
         name: &str,
@@ -426,7 +542,7 @@ impl Safety {
     ) -> Result<MutationOutcome> {
         self.check_elevation(true)?;
         let scm = Scm::connect()?;
-        let (svc, cfg, _) = self.snapshot_service(&scm, name)?;
+        let (svc, cfg, _, captured) = self.snapshot_service(&scm, name)?;
         let target = format!("service {name}");
 
         let delayed = delayed.unwrap_or(cfg.delayed_auto_start);
@@ -443,7 +559,17 @@ impl Safety {
             return Ok(MutationOutcome::AlreadyInDesiredState);
         }
 
-        svc.set_start_type(start_type)?;
+        if let Err(e) = svc.set_start_type(start_type) {
+            self.withdraw_service(name, captured);
+            self.journal.log_op(
+                Some(self.session_id),
+                "set_service_start_type",
+                &target,
+                "failed",
+                Some(&e.to_string()),
+            )?;
+            return Err(e);
+        }
         if start_type == StartType::Automatic {
             svc.set_delayed_auto_start(delayed)?;
         }
@@ -462,11 +588,12 @@ impl Safety {
         Ok(MutationOutcome::Applied)
     }
 
-    /// Records the service's state, then stops it and waits for it to report stopped.
+    /// Records the service's state, then stops it and waits for it to report stopped. A stop
+    /// request that fails withdraws the record this call captured and logs the failure.
     pub fn stop_service(&self, name: &str) -> Result<MutationOutcome> {
         self.check_elevation(true)?;
         let scm = Scm::connect()?;
-        let (svc, _, status) = self.snapshot_service(&scm, name)?;
+        let (svc, _, status, captured) = self.snapshot_service(&scm, name)?;
         let target = format!("service {name}");
 
         if !status.state.is_active() {
@@ -484,7 +611,20 @@ impl Safety {
             return Ok(MutationOutcome::Skipped(reason));
         }
 
-        let final_state = svc.stop(SERVICE_STOP_TIMEOUT)?;
+        let final_state = match svc.stop(SERVICE_STOP_TIMEOUT) {
+            Ok(state) => state,
+            Err(e) => {
+                self.withdraw_service(name, captured);
+                self.journal.log_op(
+                    Some(self.session_id),
+                    "stop_service",
+                    &target,
+                    "failed",
+                    Some(&e.to_string()),
+                )?;
+                return Err(e);
+            }
+        };
         let outcome = if final_state.is_active() {
             "timeout"
         } else {
@@ -501,11 +641,13 @@ impl Safety {
         Ok(MutationOutcome::Applied)
     }
 
+    /// Opens the service and records its baseline. The last element says whether this call
+    /// captured the record (an older active record is kept).
     fn snapshot_service(
         &self,
         scm: &Scm,
         name: &str,
-    ) -> Result<(Service, ServiceConfig, ServiceStatus)> {
+    ) -> Result<(Service, ServiceConfig, ServiceStatus, bool)> {
         let svc = scm.open_required(name, MUTATE_ACCESS)?;
         let cfg = svc.config()?;
         let status = svc.status()?;
@@ -522,7 +664,21 @@ impl Safety {
         if captured {
             debug!(service = name, "baseline captured");
         }
-        Ok((svc, cfg, status))
+        Ok((svc, cfg, status, captured))
+    }
+
+    /// Ends the service record this session captured for `name` after the change that
+    /// followed failed, so nothing claims a change that did not happen. Best effort: a
+    /// journal error is only logged.
+    fn withdraw_service(&self, name: &str, captured: bool) {
+        if !captured {
+            return;
+        }
+        match self.journal.withdraw_service(self.session_id, name) {
+            Ok(true) => debug!(service = name, "baseline withdrawn after a failed change"),
+            Ok(false) => warn!(service = name, "no record of this session to withdraw"),
+            Err(e) => warn!(service = name, error = %e, "cannot withdraw the journal record"),
+        }
     }
 
     // ───────────────────────────── rollback ─────────────────────────────
@@ -578,6 +734,17 @@ pub(crate) fn test_safety_with_outcome(
     safety
 }
 
+/// What [`Safety::snapshot_registry`] found and recorded before a write.
+#[derive(Debug)]
+struct RegistrySnapshot {
+    /// The value as it is now; `None` when it is absent.
+    current: Option<RawValue>,
+    /// This snapshot captured the record (no older active record of the target existed).
+    captured: bool,
+    /// The shallowest key the write will create, when the target's key does not exist.
+    created_root: Option<String>,
+}
+
 /// The shallowest missing key on the path to `key_path`, which is itself missing: walks up
 /// through the parents until one exists. A parent that cannot be read counts as existing,
 /// so rollback never deletes above it.
@@ -592,7 +759,9 @@ fn first_missing_key(hive: Hive, key_path: &str) -> String {
     root.to_string()
 }
 
-fn registry_target(hive: Hive, key_path: &str, value_name: &str) -> String {
+/// `HKLM\<key>\<value>`, the target text of a registry value in logs and reports, exactly as
+/// [`state_log::RegistryRecord::target`] words it.
+pub(crate) fn registry_target(hive: Hive, key_path: &str, value_name: &str) -> String {
     let name = if value_name.is_empty() {
         "(Default)"
     } else {
@@ -712,6 +881,105 @@ mod tests {
         check_interactive_user().unwrap();
     }
 
+    /// A value name longer than the registry's 16,383-character limit: the key is created,
+    /// then the value write fails with `ERROR_INVALID_PARAMETER`.
+    fn too_long_value_name() -> String {
+        "n".repeat(16_384)
+    }
+
+    #[test]
+    fn a_failed_registry_write_removes_the_created_keys_and_withdraws_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let safety = unit_session(dir.path());
+        let root = format!(r"{SANDBOX}\FailedWrite");
+        let key_path = format!(r"{root}\Leaf");
+        let _cleanup = KeyCleanup(vec![key_path.clone(), root.clone()]);
+        // The parent of the key the write creates exists, so only Leaf and FailedWrite are new.
+        let (sandbox, _) = Key::create(Hive::CurrentUser, SANDBOX).unwrap();
+        drop(sandbox);
+        assert!(!exists(Hive::CurrentUser, &root).unwrap(), "clean start");
+
+        let err = safety
+            .set_registry_value(
+                Hive::CurrentUser,
+                &key_path,
+                &too_long_value_name(),
+                &RegValue::Dword(1),
+            )
+            .unwrap_err();
+        assert!(!err.to_string().is_empty(), "the write reports the failure");
+
+        // The keys the write created on the way to the value are gone again.
+        assert!(
+            !exists(Hive::CurrentUser, &key_path).unwrap(),
+            "the leaf key the write created was removed"
+        );
+        assert!(
+            !exists(Hive::CurrentUser, &root).unwrap(),
+            "the parent key the write created was removed"
+        );
+        // No active record claims a change, so the drift check lists nothing and Undo has
+        // nothing to restore: the registry is untouched.
+        assert!(
+            safety.journal().active_registry().unwrap().is_empty(),
+            "the record captured for the failed write was withdrawn"
+        );
+        let report = safety.rollback_to_baseline().unwrap();
+        assert_eq!(report.registry_restored, 0);
+        assert_eq!(report.registry_deleted, 0);
+        assert!(report.is_clean());
+    }
+
+    #[test]
+    fn a_failed_registry_write_keeps_a_record_an_earlier_session_made() {
+        // When an earlier session already recorded the target, a later session's failed write
+        // of that same target does not withdraw the older record: its change did happen.
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(dir.path().join("journal.db")).unwrap());
+        let key_path = format!(r"{SANDBOX}\SharedTarget");
+        let _cleanup = KeyCleanup(vec![key_path.clone()]);
+        let (key, _) = Key::create(Hive::CurrentUser, &key_path).unwrap();
+        drop(key);
+        let name = too_long_value_name();
+        let first = journal.begin_session("first", "test").unwrap();
+        assert!(journal
+            .record_registry(
+                first,
+                &state_log::NewRegistryRecord {
+                    hive: Hive::CurrentUser,
+                    key_path: key_path.clone(),
+                    value_name: name.clone(),
+                    key_existed: true,
+                    value_existed: false,
+                    original: None,
+                    created_root: None,
+                },
+            )
+            .unwrap());
+        journal.end_session(first).unwrap();
+
+        let second = test_safety(journal.clone(), "second", false);
+        second
+            .set_registry_value(Hive::CurrentUser, &key_path, &name, &RegValue::Dword(2))
+            .unwrap_err();
+        // The write itself was made and failed (not the read before it).
+        let ops = journal.ops(10).unwrap();
+        assert!(
+            ops.iter()
+                .any(|op| op.session_id == Some(second.session_id())
+                    && op.op == "set_registry_value"
+                    && op.outcome == "failed"),
+            "{ops:#?}"
+        );
+        // The older session's record of the same target stays active, and the key it found
+        // existing is kept.
+        let active = journal.active_registry().unwrap();
+        assert_eq!(active.len(), 1, "only the older session's record remains");
+        assert_eq!(active[0].session_id, first);
+        assert_eq!(active[0].value_name, name);
+        assert!(exists(Hive::CurrentUser, &key_path).unwrap());
+    }
+
     #[test]
     fn first_missing_key_is_the_child_of_the_deepest_existing_key() {
         let parent = format!(r"{SANDBOX}\FirstMissing");
@@ -731,5 +999,98 @@ mod tests {
             "PCOptimizerNoSuchRootKey"
         );
         assert_eq!(read_value(Hive::CurrentUser, &parent, "x").unwrap(), None);
+    }
+
+    /// The active record of `key`\Probe.
+    fn probe_record(safety: &Safety, key: &str) -> state_log::RegistryRecord {
+        safety
+            .journal()
+            .active_registry()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.key_path.eq_ignore_ascii_case(key) && r.value_name == "Probe")
+            .expect("an active record of Probe")
+    }
+
+    fn written_dword(value: u32) -> Option<Written> {
+        Some(Written::Value {
+            value: RegValue::Dword(value).to_raw(),
+        })
+    }
+
+    #[test]
+    fn set_registry_value_records_what_it_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let safety = unit_session(dir.path());
+        let key = format!(r"{SANDBOX}\Written");
+        let _cleanup = KeyCleanup(vec![key.clone()]);
+        let (handle, _) = Key::create(Hive::CurrentUser, &key).unwrap();
+        handle.set("Probe", &RegValue::Dword(1)).unwrap();
+        drop(handle);
+
+        // Already set: the record keeps the value all the same.
+        let outcome = safety
+            .set_registry_value(Hive::CurrentUser, &key, "Probe", &RegValue::Dword(1))
+            .unwrap();
+        assert_eq!(outcome, MutationOutcome::AlreadyInDesiredState);
+        assert_eq!(probe_record(&safety, &key).written, written_dword(1));
+
+        let outcome = safety
+            .set_registry_value(Hive::CurrentUser, &key, "Probe", &RegValue::Dword(0))
+            .unwrap();
+        assert_eq!(outcome, MutationOutcome::Applied);
+        let record = probe_record(&safety, &key);
+        assert_eq!(record.written, written_dword(0));
+        assert_eq!(
+            record.original,
+            Some(RegValue::Dword(1).to_raw()),
+            "the baseline is kept"
+        );
+        assert_eq!(
+            safety.journal().summary().unwrap().registry_total,
+            1,
+            "one record of the target"
+        );
+    }
+
+    #[test]
+    fn delete_registry_value_records_a_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let safety = unit_session(dir.path());
+        let key = format!(r"{SANDBOX}\WrittenDelete");
+        let _cleanup = KeyCleanup(vec![key.clone()]);
+        let (handle, _) = Key::create(Hive::CurrentUser, &key).unwrap();
+        handle.set("Probe", &RegValue::Dword(5)).unwrap();
+        drop(handle);
+
+        let outcome = safety
+            .delete_registry_value(Hive::CurrentUser, &key, "Probe")
+            .unwrap();
+        assert_eq!(outcome, MutationOutcome::Applied);
+        assert_eq!(read_value(Hive::CurrentUser, &key, "Probe").unwrap(), None);
+        let record = probe_record(&safety, &key);
+        assert_eq!(record.written, Some(Written::Deleted));
+        assert_eq!(record.original, Some(RegValue::Dword(5).to_raw()));
+    }
+
+    #[test]
+    fn already_absent_delete_records_written_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let safety = unit_session(dir.path());
+        let key = format!(r"{SANDBOX}\WrittenAbsent");
+        let _cleanup = KeyCleanup(vec![key.clone()]);
+        assert!(!exists(Hive::CurrentUser, &key).unwrap());
+
+        let outcome = safety
+            .delete_registry_value(Hive::CurrentUser, &key, "Probe")
+            .unwrap();
+        assert_eq!(outcome, MutationOutcome::AlreadyInDesiredState);
+        let record = probe_record(&safety, &key);
+        assert_eq!(record.written, Some(Written::Deleted));
+        assert_eq!(record.original, None);
+        assert!(
+            !exists(Hive::CurrentUser, &key).unwrap(),
+            "nothing was created"
+        );
     }
 }

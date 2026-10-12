@@ -143,12 +143,29 @@ keeps the changed schedule: turn it off in Maintenance or History to remove it.
 ## Previewing and applying
 
 Opening a profile changes nothing. Cairn reads only what the profile's sections need and shows
-one row per setting: **will change**, **already set**, or **skipped** with its reason (not on this
-PC, unknown to this version, can't be changed here, belongs to another account, not on this
-edition, couldn't be read). Change rows start checked, except rows with a caution: High-risk
-tweaks, the Ultimate Performance power plan on a PC with a battery, scheduled maintenance and
-deferring feature updates. A row whose setting Cairn had already changed in an earlier session
-says so, because undoing it returns the setting to how it was before Cairn first changed it.
+one row per setting: **will change**, **already set**, or **skipped** with its reason. Change
+rows start checked, except rows with a caution: High-risk tweaks, tweaks with a change that Undo
+cannot bring back (the caution says what), the Ultimate Performance power plan on a PC with a
+battery, scheduled maintenance and deferring feature updates. A row whose setting Cairn had
+already changed in an earlier session says so, because undoing it returns the setting to how it
+was before Cairn first changed it.
+
+A skipped row names its reason (`reason` in the `--json` output of `optctl profile plan`):
+
+| `reason` | Shown as | When |
+|---|---|---|
+| `not_on_this_pc` | Not on this PC | What the setting is for (an app, a Windows component, a device, a startup entry or a network adapter) is not on this PC. |
+| `windows_version` | Not on this version of Windows | This Windows build does not use the tweak's settings. |
+| `edition` | Not on this edition of Windows | This Windows edition does not use the setting. |
+| `retired` | Retired | Cairn no longer offers the tweak. |
+| `unknown_id` | Unknown to this version of Cairn | A newer version of Cairn may know the setting. |
+| `cannot_change` | Can't be changed here | Something on this PC keeps Cairn from changing it, such as Group Policy, a connected VPN or a protected app. |
+| `other_account` | Belongs to another account | The setting belongs to a user account, and Cairn runs as another account than the signed-in user. |
+| `unreadable` | Couldn't be read | The setting's current state could not be read. |
+| `unsupported` | Not supported by this version | A profile cannot make this change, such as turning scheduled maintenance off. |
+
+A tweak that is not offered on a PC is skipped there even when Cairn changed it earlier: applying
+a profile never changes it, and Undo in History still restores what Cairn stored.
 
 Applying needs administrator rights. The chosen rows are planned again, then applied in one
 journal session labelled `profile: <name>`, in this order: tweaks, startup apps, DNS, Windows
@@ -162,14 +179,15 @@ tweaks, Store apps, per-user startup entries) are skipped.
 ## Exporting
 
 "Export this PC's settings…" (or `optctl profile export`) offers the settings Cairn manages on
-this PC: applied tweaks, Store apps Cairn removed, startup apps that are turned off (except those
-set by Group Policy), the DNS preset of each adapter kind, and the Windows Update and scheduled
-maintenance choices Cairn set. You choose the rows and a name. The file never holds the computer
-name, a user name, a network adapter's name or GUID, a package version or full name, or a custom
-DNS server address: custom DNS servers are left out, with a note. So are startup apps whose name
-ends in an identifier of the PC or account (an underscore and 16 or more hex digits), such as a
-browser's auto-start entry, which is named after a hash of the browser's profile folder
-(`MicrosoftEdgeAutoLaunch_` and 32 hex digits).
+this PC: applied tweaks (except retired ones, which Cairn never applies again), Store apps Cairn
+removed, startup apps that are turned off (except those set by Group Policy), the DNS preset of
+each adapter kind, and the Windows Update and scheduled maintenance choices Cairn set. You
+choose the rows and a name. The file never holds the computer name, a user name, a network
+adapter's name or GUID, a package version or full name, or a custom DNS server address: custom
+DNS servers are left out, with a note. So are startup apps whose name ends in an identifier of
+the PC or account (an underscore and 16 or more hex digits), such as a browser's auto-start
+entry, which is named after a hash of the browser's profile folder (`MicrosoftEdgeAutoLaunch_`
+and 32 hex digits).
 
 ## Versions
 

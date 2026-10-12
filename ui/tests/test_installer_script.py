@@ -1,6 +1,7 @@
 """The Inno Setup script `installer/cairn.iss`, read as text: a fixed install folder, upgrades that
-delete only inside Cairn's own folder, no deletion of user data, the uninstall checks and the
-identifiers the engine shares with it. Nothing is compiled or run."""
+delete only inside Cairn's own folder, no deletion of user data, the uninstall checks, the
+identifiers the engine shares with it, the signed-uninstaller mode and the version information
+code signing checks. Nothing is compiled or run."""
 
 from __future__ import annotations
 
@@ -148,6 +149,46 @@ def test_downgrades_are_refused() -> None:
     assert "'DisplayVersion'" in body and "ComparePackedVersion(Have, Want) > 0" in body
     assert "A newer version of Cairn (" in body
     assert "Result := False;" in body
+
+
+def preprocessor_blocks(name: str) -> list[list[str]]:
+    """The lines inside each `#ifdef <name>` ... `#endif` block, comments left out."""
+    blocks: list[list[str]] = []
+    current: list[str] | None = None
+    for raw in text().splitlines():
+        line = raw.strip()
+        if line == f"#ifdef {name}":
+            current = []
+        elif line == "#endif" and current is not None:
+            blocks.append(current)
+            current = None
+        elif current is not None and line and not line.startswith(";"):
+            current.append(line)
+    return blocks
+
+
+def test_the_uninstaller_is_signed_only_with_a_signed_uninstaller_folder() -> None:
+    # build_release.ps1 -SigningDir defines SignedUninstallerDir: ISCC then writes the
+    # uninstaller there and stops until a signed copy replaces it. Without the define the setup
+    # is built as before, with nothing to sign.
+    assert preprocessor_blocks("SignedUninstallerDir") == [
+        ["SignedUninstaller=yes", "SignedUninstallerDir={#SignedUninstallerDir}"]
+    ]
+    code = [line.strip() for line in text().splitlines() if not line.strip().startswith(";")]
+    signed = [line for line in code if "SignedUninstaller" in line and not line.startswith("#ifdef")]
+    assert len(signed) == 2, "SignedUninstaller appears only inside its block"
+    assert not any("SignTool" in line for line in code), "signing happens outside ISCC"
+
+
+def test_the_setup_names_its_product_and_version() -> None:
+    values = setup()
+    assert values["VersionInfoProductName"] == "{#AppName}"
+    assert values["VersionInfoProductTextVersion"] == "{#AppVersion}"
+    assert values["VersionInfoProductVersion"] == "{#AppVersion}.0"
+    assert values["VersionInfoTextVersion"] == "{#AppVersion}"
+    assert values["VersionInfoVersion"] == "{#AppVersion}.0"
+    assert values["AppCopyright"] == "Copyright (c) 2026 {#AppPublisher}", "the copyright of the version info"
+    assert "#if Ver < EncodeVer(6, 3, 0)" in text(), "an older Inno Setup stops the compile"
 
 
 def test_shortcuts_carry_the_taskbar_identity() -> None:

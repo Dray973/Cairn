@@ -17,9 +17,10 @@ use std::sync::Arc;
 use anyhow::{bail, Context};
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use optimizer_core::app;
+use optimizer_core::debloat::requirements::Unavailable;
 use optimizer_core::debloat::{
-    self, catalog, ApplyOptions, ApplyReport, CatalogEntry, Category, Engine, ItemOutcome,
-    ItemState, RestartNeed, Risk, ScanReport,
+    self, catalog, ApplyOptions, ApplyReport, CatalogEntry, Category, DriftKind, DriftReport,
+    Engine, ItemOutcome, ItemState, Mismatch, RestartNeed, Risk, ScanReport,
 };
 use optimizer_core::maintenance;
 use optimizer_core::safety::state_log::{self, Journal};
@@ -66,6 +67,12 @@ enum Cmd {
     Apply(ApplyArgs),
     /// Revert journaled changes by item id, by category or all of them.
     Revert(RevertArgs),
+    /// Recorded changes whose targets no longer hold what Cairn set. Read-only. Exit code 0:
+    /// none; 3: some; 1: the check failed.
+    Drift(DriftArgs),
+    /// The same check as `drift`, for the given tweaks only. Read-only. Exit code 0: none;
+    /// 3: some; 1: the check failed.
+    Verify(VerifyArgs),
     /// Read a registry value, e.g. `reg-get "HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection" AllowTelemetry`.
     RegGet {
         key: String,
@@ -157,9 +164,10 @@ enum JournalCmd {
     Pending,
 }
 
-/// `journal pending`: changes that can be undone are recorded.
+/// `journal pending`: changes that can be undone are recorded. `drift` and `verify`: some
+/// recorded changes no longer hold.
 const EXIT_PENDING: i32 = 3;
-/// `journal pending`: the journal could not be read.
+/// `journal pending`: the journal could not be read. `drift` and `verify`: the check failed.
 const EXIT_ERROR: i32 = 1;
 
 #[derive(Args, Debug)]
@@ -184,15 +192,32 @@ struct ScanArgs {
     /// Print the scan report as JSON.
     #[arg(long)]
     json: bool,
-    /// Only show one category (privacy, gaming, performance, interface, bloatware).
+    /// Only show one category (privacy, gaming, performance, interface, security, bloatware).
     #[arg(long, value_parser = parse_category)]
     category: Option<Category>,
 }
 
 #[derive(Args, Debug)]
+struct DriftArgs {
+    /// Print the drift report as JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args, Debug)]
+struct VerifyArgs {
+    /// Tweak ids, e.g. `privacy.activity_history`.
+    #[arg(value_name = "ID", required = true)]
+    ids: Vec<String>,
+    /// Print the drift report as JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args, Debug)]
 #[command(group(ArgGroup::new("selector").required(true).args(["ids", "category"])))]
 struct ApplyArgs {
-    /// Item ids, e.g. `privacy.activity_history` or `appx.Microsoft.BingNews`.
+    /// Item ids, e.g. `privacy.advertising_id` or `appx.Microsoft.BingNews`.
     #[arg(value_name = "ID")]
     ids: Vec<String>,
     /// Apply every recommended item of this category that is not applied yet.
@@ -377,7 +402,7 @@ fn main() -> anyhow::Result<()> {
                 eprintln!("{}", restart_text(report.restart));
             }
             if !report.is_clean() {
-                bail!("{} item(s) failed to revert", report.failures.len());
+                bail!("{}", incomplete_revert(&report));
             }
         }
 
@@ -385,6 +410,14 @@ fn main() -> anyhow::Result<()> {
         Cmd::Scan(args) => run_scan(&open_engine()?, &args)?,
         Cmd::Apply(args) => run_apply(&open_engine()?, &args)?,
         Cmd::Revert(args) => run_revert(&open_engine()?, &args)?,
+        Cmd::Drift(args) => std::process::exit(run_drift(
+            || open_engine()?.drift().map_err(Into::into),
+            args.json,
+        )),
+        Cmd::Verify(args) => std::process::exit(run_drift(
+            || open_engine()?.verify(&args.ids).map_err(Into::into),
+            args.json,
+        )),
 
         Cmd::RegGet { key, value } => {
             let (hive, path) = split_path(&key)?;
@@ -688,13 +721,49 @@ fn run_revert(engine: &Engine, args: &RevertArgs) -> anyhow::Result<()> {
     let report = revert(args.dry_run)?;
     print_rollback(&report);
     if !report.is_clean() {
-        bail!(
-            "revert incomplete: {} failure(s), {} package(s) need a Store reinstall",
-            report.failures.len(),
-            report.appx_store_required.len()
-        );
+        bail!("{}", incomplete_revert(&report));
     }
     Ok(())
+}
+
+/// Why a rollback report is not clean, in one line.
+fn incomplete_revert(report: &RollbackReport) -> String {
+    format!(
+        "revert incomplete: {} failure(s), {} package(s) need a Store reinstall, {} restored \
+         value(s) changed again",
+        report.failures.len(),
+        report.appx_store_required.len(),
+        report.not_restored.len()
+    )
+}
+
+/// `drift` and `verify`: prints the report (as JSON with `json`) and returns the exit code:
+/// 0 when every recorded change still holds, [`EXIT_PENDING`] when some no longer hold,
+/// [`EXIT_ERROR`] when the check failed.
+fn run_drift(check: impl FnOnce() -> anyhow::Result<DriftReport>, json: bool) -> i32 {
+    let report = match check() {
+        Ok(report) => report,
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            return EXIT_ERROR;
+        }
+    };
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(text) => println!("{text}"),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return EXIT_ERROR;
+            }
+        }
+    } else {
+        print_drift(&report);
+    }
+    if report.entries.is_empty() {
+        0
+    } else {
+        EXIT_PENDING
+    }
 }
 
 // ───────────────────────────── output ─────────────────────────────
@@ -714,6 +783,15 @@ fn print_catalog(entries: &[CatalogEntry]) {
             if e.default_on { "yes" } else { "no" },
             e.title
         );
+        for (label, text) in [
+            ("windows", &e.windows),
+            ("retired", &e.retired),
+            ("undo limit", &e.undo_limit),
+        ] {
+            if let Some(text) = text {
+                println!("{:<id_w$}  {label}: {text}", "");
+            }
+        }
     }
     println!("\n{} item(s)", entries.len());
 }
@@ -755,8 +833,17 @@ fn print_scan(report: &ScanReport) {
                 if item.revertible { "revertible" } else { "" }
             );
             println!("{}", line.trim_end());
+            if let Some(kind) = item.unavailable {
+                println!("      unavailable: {}", unavailable_label(kind));
+            }
             if let Some(note) = &item.note {
                 println!("      note: {note}");
+            }
+            for m in &item.drift {
+                println!(
+                    "      changed since applied: {} is {}, not {}",
+                    m.label, m.found, m.expected
+                );
             }
         }
     }
@@ -787,6 +874,16 @@ fn print_apply(report: &ApplyReport) {
         println!("  {:<15}  {}", outcome_label(r.outcome), r.id);
         for detail in &r.details {
             println!("  {:<15}    {detail}", "");
+        }
+        for m in &r.not_kept {
+            println!(
+                "  {:<15}    not kept: {}: now {}; Cairn set {}",
+                "", m.target, m.found, m.expected
+            );
+        }
+        let undo_limit = catalog::tweak(&r.id).and_then(|t| t.undo_limit);
+        if let (ItemOutcome::Applied, Some(limit)) = (r.outcome, undo_limit) {
+            println!("  {:<15}    cannot be undone: {limit}", "");
         }
     }
     if report.results.is_empty() {
@@ -887,12 +984,87 @@ fn print_rollback(report: &RollbackReport) {
         }
     }
 
+    if !report.not_restored.is_empty() {
+        println!();
+        for m in &report.not_restored {
+            println!(
+                "not restored: {}: now {}; restored {}",
+                m.target, m.found, m.expected
+            );
+        }
+    }
+
+    if !report.warnings.is_empty() {
+        println!("\nwarnings:");
+        for w in &report.warnings {
+            println!("  {w}");
+        }
+    }
+
     if report.restart != RestartNeed::None {
         if report.dry_run {
             println!("\nafter reverting: {}", restart_text(report.restart));
         } else if report.total_reverted() > 0 {
             println!("\n{}", restart_text(report.restart));
         }
+    }
+}
+
+fn print_drift(report: &DriftReport) {
+    println!(
+        "Checked {} recorded changes in {} ms; {} no longer hold.",
+        report.checked,
+        report.duration_ms,
+        report.entries.len()
+    );
+    for entry in &report.entries {
+        let owner = entry
+            .item
+            .as_deref()
+            .unwrap_or_else(|| drift_kind_label(entry.kind));
+        println!("  {owner}  {}", drift_line(&entry.mismatch));
+    }
+    if !report.warnings.is_empty() {
+        println!("\nwarnings:");
+        for w in &report.warnings {
+            println!("  {w}");
+        }
+    }
+}
+
+/// `{target}: now {found}; Cairn set {expected}; original {original}`, with
+/// " (back to the original)" when the target holds its value from before Cairn's change.
+fn drift_line(m: &Mismatch) -> String {
+    format!(
+        "{}: now {}; Cairn set {}; original {}{}",
+        m.target,
+        m.found,
+        m.expected,
+        m.original.as_deref().unwrap_or("unknown"),
+        if m.back_to_original {
+            " (back to the original)"
+        } else {
+            ""
+        }
+    )
+}
+
+fn drift_kind_label(kind: DriftKind) -> &'static str {
+    match kind {
+        DriftKind::Registry => "registry",
+        DriftKind::Service => "service",
+        DriftKind::ScheduledTask => "scheduled task",
+        DriftKind::Power => "power",
+        DriftKind::Dns => "DNS",
+    }
+}
+
+fn unavailable_label(kind: Unavailable) -> &'static str {
+    match kind {
+        Unavailable::NotOnThisPc => "Not on this PC",
+        Unavailable::WindowsVersion => "Not on this version of Windows",
+        Unavailable::Edition => "Not on this edition of Windows",
+        Unavailable::Retired => "Retired",
     }
 }
 
@@ -961,5 +1133,102 @@ fn restart_text(restart: RestartNeed) -> &'static str {
         RestartNeed::Explorer => "restart File Explorer to finish",
         RestartNeed::SignOut => "sign out and back in to finish",
         RestartNeed::Restart => "restart Windows to finish",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use optimizer_core::debloat::DriftEntry;
+    use optimizer_core::safety::rollback::RollbackFilter;
+
+    fn mismatch(original: Option<&str>, back_to_original: bool) -> Mismatch {
+        Mismatch {
+            target: r"HKLM\SOFTWARE\Policies\Example\Value".into(),
+            label: "Value".into(),
+            expected: "0".into(),
+            found: "1".into(),
+            original: original.map(str::to_string),
+            back_to_original,
+        }
+    }
+
+    #[test]
+    fn drift_lines_name_the_found_set_and_original_values() {
+        assert_eq!(
+            drift_line(&mismatch(Some("1"), true)),
+            r"HKLM\SOFTWARE\Policies\Example\Value: now 1; Cairn set 0; original 1 (back to the original)"
+        );
+        assert_eq!(
+            drift_line(&mismatch(None, false)),
+            r"HKLM\SOFTWARE\Policies\Example\Value: now 1; Cairn set 0; original unknown"
+        );
+    }
+
+    #[test]
+    fn drift_exit_codes_follow_journal_pending() {
+        let entry = DriftEntry {
+            item: Some("privacy.example".into()),
+            kind: DriftKind::Registry,
+            mismatch: mismatch(Some("not set"), false),
+            filter: RollbackFilter::default(),
+            recorded_at: "2026-01-01T00:00:00+00:00".into(),
+        };
+        let report = |entries: Vec<DriftEntry>| DriftReport {
+            checked: entries.len(),
+            entries,
+            ..Default::default()
+        };
+        assert_eq!(run_drift(|| Ok(report(Vec::new())), false), 0);
+        assert_eq!(
+            run_drift(|| Ok(report(vec![entry.clone()])), false),
+            EXIT_PENDING
+        );
+        assert_eq!(run_drift(|| Ok(report(vec![entry])), true), EXIT_PENDING);
+        assert_eq!(
+            run_drift(|| Err(anyhow::anyhow!("not available")), false),
+            EXIT_ERROR
+        );
+    }
+
+    #[test]
+    fn unavailable_labels_are_distinct() {
+        let labels = [
+            Unavailable::NotOnThisPc,
+            Unavailable::WindowsVersion,
+            Unavailable::Edition,
+            Unavailable::Retired,
+        ]
+        .map(unavailable_label);
+        for (i, label) in labels.iter().enumerate() {
+            assert!(!labels[i + 1..].contains(label), "{label}");
+        }
+        assert_eq!(labels[1], "Not on this version of Windows");
+    }
+
+    #[test]
+    fn apply_help_names_offered_tweaks() {
+        use clap::CommandFactory;
+        let cli = Cli::command();
+        let apply = cli.find_subcommand("apply").expect("apply subcommand");
+        let ids = apply
+            .get_arguments()
+            .find(|a| a.get_id() == "ids")
+            .expect("ids argument");
+        let help = ids.get_help().expect("ids help").to_string();
+        let tweaks: Vec<&str> = help
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|s| !s.starts_with("appx."))
+            .collect();
+        assert!(!tweaks.is_empty(), "{help}");
+        for id in tweaks {
+            let t = catalog::tweak(id).unwrap_or_else(|| panic!("{id} is not a catalog tweak"));
+            assert!(
+                t.retired.is_none(),
+                "the apply help names the retired tweak {id}"
+            );
+        }
     }
 }

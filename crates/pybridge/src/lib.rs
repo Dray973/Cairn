@@ -100,6 +100,24 @@ fn parse_category(value: &str) -> PyResult<Category> {
         ))
     })
 }
+
+/// A record filter given as a dict or as its JSON text (see `revert_targets`). Raises
+/// `ValueError` when it does not describe a filter.
+fn parse_filter(py: Python<'_>, filter: &Bound<'_, PyAny>) -> PyResult<safety::RollbackFilter> {
+    let text = if let Ok(s) = filter.extract::<String>() {
+        s
+    } else {
+        let json = py.import("json")?;
+        json.call_method1("dumps", (filter,))?.extract::<String>()?
+    };
+    filter_from_json(&text).map_err(PyValueError::new_err)
+}
+
+/// The record filter `text` describes; kinds it does not name select nothing.
+fn filter_from_json(text: &str) -> std::result::Result<safety::RollbackFilter, String> {
+    serde_json::from_str(text).map_err(|e| format!("invalid revert filter: {e}"))
+}
+
 #[pyfunction]
 fn version() -> &'static str {
     optimizer_core::VERSION
@@ -265,18 +283,38 @@ fn revert_all(py: Python<'_>, dry_run: bool) -> PyResult<Py<PyAny>> {
 #[pyfunction]
 #[pyo3(signature = (filter, dry_run = false))]
 fn revert_targets(py: Python<'_>, filter: &Bound<'_, PyAny>, dry_run: bool) -> PyResult<Py<PyAny>> {
-    let text = if let Ok(s) = filter.extract::<String>() {
-        s
-    } else {
-        let json = py.import("json")?;
-        json.call_method1("dumps", (filter,))?.extract::<String>()?
-    };
-    let filter: safety::RollbackFilter = serde_json::from_str(&text)
-        .map_err(|e| PyValueError::new_err(format!("invalid revert filter: {e}")))?;
+    let filter = parse_filter(py, filter)?;
     blocking(py, move || {
         let journal = Journal::open_default()?;
         safety::rollback_filtered(&journal, &filter, dry_run)
     })
+}
+
+/// Read-only: every active journal record whose target no longer holds what Cairn set.
+/// Returns `{"entries", "checked", "unchecked", "unchecked_no_value", "warnings",
+/// "duration_ms"}`; each entry has `item` (the catalog tweak, or None), `kind`, `mismatch`,
+/// `filter` (selects exactly that record for `revert_targets` and `forget_targets`) and
+/// `recorded_at`. `unchecked_no_value` counts the unchecked registry records an earlier
+/// version of Cairn left without the value it set.
+#[pyfunction]
+fn drift(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    blocking(py, || Engine::open_default()?.drift())
+}
+
+/// Read-only: the same check as `drift` for the catalog tweaks `ids` only.
+#[pyfunction]
+fn verify(py: Python<'_>, ids: Vec<String>) -> PyResult<Py<PyAny>> {
+    blocking(py, move || Engine::open_default()?.verify(&ids))
+}
+
+/// Stops tracking the selected records whose targets changed since Cairn set them, so the
+/// current values stay. Nothing on the PC is changed. `filter` as in `revert_targets`.
+/// Returns `{"forgotten", "refused"}`: the targets no longer tracked with the value they keep,
+/// and the targets refused with the reason.
+#[pyfunction]
+fn forget_targets(py: Python<'_>, filter: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    let filter = parse_filter(py, filter)?;
+    blocking(py, move || Engine::open_default()?.forget(&filter))
 }
 
 /// The engine's log: events that pass the `OPTIMIZER_LOG` filter (default `info`) go to
@@ -323,6 +361,9 @@ fn optimizer_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(revert_category, m)?)?;
     m.add_function(wrap_pyfunction!(revert_all, m)?)?;
     m.add_function(wrap_pyfunction!(revert_targets, m)?)?;
+    m.add_function(wrap_pyfunction!(drift, m)?)?;
+    m.add_function(wrap_pyfunction!(verify, m)?)?;
+    m.add_function(wrap_pyfunction!(forget_targets, m)?)?;
     cleanup::register(m)?;
     startup::register(m)?;
     network::register(m)?;
@@ -343,7 +384,41 @@ mod tests {
     use std::io::Write;
     use std::sync::{Arc, Mutex};
 
-    use super::log_subscriber;
+    use optimizer_core::win::registry::Hive;
+
+    use super::{filter_from_json, log_subscriber};
+
+    #[test]
+    fn a_filter_names_only_the_kinds_it_selects() {
+        let filter = filter_from_json(
+            r#"{"registry": [{"hive": "HKCU", "key_path": "Software\\Example", "value_name": "Value"}],
+                "dns": ["{00000000-0000-0000-0000-00000000c0de}"]}"#,
+        )
+        .unwrap();
+        assert_eq!(filter.registry.len(), 1);
+        assert_eq!(filter.registry[0].hive, Hive::CurrentUser);
+        assert_eq!(filter.registry[0].key_path, r"Software\Example");
+        assert_eq!(filter.registry[0].value_name, "Value");
+        assert_eq!(filter.dns, vec!["{00000000-0000-0000-0000-00000000c0de}"]);
+        assert!(filter.services.is_empty() && filter.scheduled_tasks.is_empty());
+        assert!(!filter.power);
+        assert!(
+            filter_from_json("{}").unwrap().is_empty(),
+            "selects nothing"
+        );
+    }
+
+    #[test]
+    fn an_invalid_filter_is_refused_with_the_reason() {
+        for text in [
+            r#"{"power": "yes"}"#,
+            r#"{"registry": [{"hive": "HKXX"}]}"#,
+            "not json",
+        ] {
+            let error = filter_from_json(text).unwrap_err();
+            assert!(error.starts_with("invalid revert filter: "), "{error}");
+        }
+    }
 
     /// Collects what a subscriber writes.
     #[derive(Debug, Clone, Default)]

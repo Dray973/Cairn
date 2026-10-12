@@ -1,8 +1,11 @@
 //! Firewall and network: Windows Firewall, Remote Desktop, Remote Assistance and SMB 1.0,
 //! checks 6 to 9.
 
-use super::checkup::{unreadable, Check, CheckId, Severity};
+use super::checkup::{unreadable, Check, CheckId, FixAction, Severity};
 use super::probe::{hklm, hklm_dword, hklm_exists, key_dword, CheckupRaw};
+use crate::debloat::catalog::{
+    REMOTE_ASSISTANCE_SETTING, REMOTE_ASSISTANCE_TWEAK, TERMINAL_SERVICES_POLICY,
+};
 use crate::win::firewall::{self, FirewallState, PROFILE_DOMAIN, PROFILE_PRIVATE, PROFILE_PUBLIC};
 use crate::win::scm::{self, Scm, StartType};
 use crate::win::security_center::ProductState;
@@ -10,8 +13,8 @@ use crate::Result;
 
 const TERMINAL_SERVER: &str = r"SYSTEM\CurrentControlSet\Control\Terminal Server";
 const RDP_TCP: &str = r"SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp";
-const TERMINAL_SERVICES_POLICY: &str = r"SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services";
-const REMOTE_ASSISTANCE: &str = r"SYSTEM\CurrentControlSet\Control\Remote Assistance";
+/// Remote Assistance's switch, in its own key and in the Remote Desktop Services policy.
+const ALLOW_TO_GET_HELP: &str = "fAllowToGetHelp";
 const SMB1_CLIENT: &str = r"SYSTEM\CurrentControlSet\Services\mrxsmb10";
 const SMB1_SERVER: &str = r"SYSTEM\CurrentControlSet\Services\srv";
 const SERVER_PARAMETERS: &str = r"SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters";
@@ -72,8 +75,8 @@ pub(crate) fn read_remote() -> Result<RemoteRaw> {
         nla: key_dword(rdp.as_ref(), "UserAuthentication"),
         nla_policy: key_dword(policy.as_ref(), "UserAuthentication"),
         port: key_dword(rdp.as_ref(), "PortNumber"),
-        assistance: hklm_dword(REMOTE_ASSISTANCE, "fAllowToGetHelp"),
-        assistance_policy: key_dword(policy.as_ref(), "fAllowToGetHelp"),
+        assistance: hklm_dword(REMOTE_ASSISTANCE_SETTING, ALLOW_TO_GET_HELP),
+        assistance_policy: key_dword(policy.as_ref(), ALLOW_TO_GET_HELP),
         smb1_client_key: hklm_exists(SMB1_CLIENT),
         smb1_client_start: hklm_dword(SMB1_CLIENT, "Start"),
         smb1_server_key: hklm_exists(SMB1_SERVER),
@@ -255,7 +258,8 @@ pub(crate) fn remote_desktop(raw: &CheckupRaw, home: Option<bool>) -> Check {
 const RA_DETAIL: &str = "Remote Assistance lets someone you invite view or control this PC. \
     Scammers often ask people to send an invitation.";
 
-/// Check 8: Remote Assistance invitations.
+/// Check 8: Remote Assistance invitations. While they are allowed, the catalog tweak that
+/// turns them off is the main fix (journaled, undoable from History).
 pub(crate) fn remote_assistance(raw: &CheckupRaw) -> Check {
     let remote = match &raw.remote {
         Ok(remote) => remote,
@@ -268,13 +272,22 @@ pub(crate) fn remote_assistance(raw: &CheckupRaw) -> Check {
             )
         }
     };
-    let check = Check::new(CheckId::RemoteAssistance, RA_DETAIL)
-        .tool("Open Remote settings", "remote_settings");
+    let check = Check::new(CheckId::RemoteAssistance, RA_DETAIL);
     let allowed = remote.assistance_policy.or(remote.assistance).unwrap_or(0);
     if allowed != 0 {
-        check.attention(Severity::Low, "Invitations are allowed")
+        check
+            .fix(
+                "Turn off Remote Assistance",
+                FixAction::Tweak {
+                    id: REMOTE_ASSISTANCE_TWEAK.into(),
+                },
+            )
+            .tool("Open Remote settings", "remote_settings")
+            .attention(Severity::Low, "Invitations are allowed")
     } else {
-        check.good("Off")
+        check
+            .tool("Open Remote settings", "remote_settings")
+            .good("Off")
     }
 }
 
@@ -626,6 +639,60 @@ mod tests {
         assert_eq!(remote_assistance(&raw).summary, "Off");
         let raw = remote(|r| r.assistance_policy = Some(1));
         assert_eq!(remote_assistance(&raw).summary, "Invitations are allowed");
+    }
+
+    #[test]
+    fn remote_assistance_offers_the_tweak_fix() {
+        let tweak = FixAction::Tweak {
+            id: REMOTE_ASSISTANCE_TWEAK.into(),
+        };
+        for raw in [
+            remote(|r| r.assistance = Some(1)),
+            remote(|r| r.assistance_policy = Some(1)),
+        ] {
+            let check = remote_assistance(&raw);
+            assert_eq!(check.state, CheckState::Attention);
+            assert_eq!(check.fixes[0].label, "Turn off Remote Assistance");
+            assert_eq!(check.fixes[0].action, tweak);
+            assert_eq!(check.fixes[1].label, "Open Remote settings");
+            assert!(!check.per_user, "a machine-wide tweak");
+        }
+        // Nothing to turn off: only the settings remain.
+        let off = remote_assistance(&fixtures::raw());
+        assert!(off.fixes.iter().all(|f| f.action != tweak));
+        let mut failed = fixtures::raw();
+        failed.remote = Err("x".into());
+        assert!(remote_assistance(&failed)
+            .fixes
+            .iter()
+            .all(|f| f.action != tweak));
+    }
+
+    #[test]
+    fn the_remote_assistance_tweak_writes_the_values_the_check_reads() {
+        use crate::debloat::catalog::{self, Action, Category, RegData};
+        use crate::win::registry::Hive;
+        let tweak = catalog::tweak(REMOTE_ASSISTANCE_TWEAK).expect("catalog tweak");
+        assert_eq!(tweak.category, Category::Security);
+        let mut written: Vec<(&str, &str)> = Vec::new();
+        for action in tweak.actions {
+            match action {
+                Action::Registry(r) => {
+                    assert_eq!(r.hive, Hive::LocalMachine);
+                    assert_eq!(r.name, ALLOW_TO_GET_HELP);
+                    assert_eq!(r.data, RegData::Dword(0));
+                    written.push((r.path, r.name));
+                }
+                other => panic!("unexpected action {other:?}"),
+            }
+        }
+        written.sort_unstable();
+        let mut read = vec![
+            (REMOTE_ASSISTANCE_SETTING, ALLOW_TO_GET_HELP),
+            (TERMINAL_SERVICES_POLICY, ALLOW_TO_GET_HELP),
+        ];
+        read.sort_unstable();
+        assert_eq!(written, read);
     }
 
     #[test]

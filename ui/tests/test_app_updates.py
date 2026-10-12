@@ -1,12 +1,14 @@
 """The Updates section in the real window with a FakeEngine: lazy loading, the update check, the
 update and install flows with their dialogs, the job strip, closing while apps are updated, the
-install list editor and the Windows Update settings with their undo.
+install list in sections with its Find box and editor, the honest install results, and the
+Windows Update settings with their undo.
 
 No test confirms the administrator dialog; process helpers are replaced by recorders.
 """
 
 from __future__ import annotations
 
+import json
 import time
 from typing import Any
 
@@ -16,6 +18,8 @@ from optimizer import system
 from optimizer.features.updates import (
     AGREEMENTS_NOTE,
     ALL_INSTALLED_TEXT,
+    DEBLOAT_REMOVED_NOTE,
+    DEPENDENCIES_NOTE,
     HOME_DEFER_TEXT,
     INSTALL_CONFIRM_MESSAGE,
     LOST_TEXT,
@@ -23,6 +27,7 @@ from optimizer.features.updates import (
     OTHER_USER_TEXT,
     RESTORE_POINT_TIP,
     TOO_MANY_TEXT,
+    UNLISTED_TEXT,
     UNSUPPORTED_TEXT,
     UPDATE_CONFIRM_MESSAGE,
     UPDATES_POLL_HIDDEN_HZ,
@@ -30,23 +35,29 @@ from optimizer.features.updates import (
     USER_UNKNOWN_TEXT,
     WINGET_MISSING_TEXT,
 )
+from optimizer.widgets import updates as updates_view
 from optimizer.widgets.updates import (
     APP_INSTALLER_STORE_URI,
+    CATEGORY_TITLES,
     DUPLICATE_TEXT,
     INVALID_ID_TEXT,
     LIGHT_ROWS_ABOVE,
+    MAX_FIND_RESULTS,
     MAX_NAME_CHARS,
     NAME_MISSING_TEXT,
+    REPORTED_TEXT,
     RETRY_LEFT_OUT_TEXT,
     STORE_UPDATES_URI,
     VIEWS,
     UpdateRow,
     UpdatesPanel,
+    day_text,
     pause_text,
 )
 
 from .app_support import (
     ADMIN_DIALOG_TITLE,
+    FIT_SIZES,
     App,
     AppFactory,
     assert_section_fits,
@@ -61,7 +72,7 @@ from .app_support import (
     show_section,
     theme,
 )
-from .fake_updates import PAUSE_LIMIT_TEXT, UX_SETTINGS
+from .fake_updates import DEFAULT_APPS, PAUSE_LIMIT_TEXT, UX_SETTINGS
 
 UNAVAILABLE_TITLE = "Administrator rights not available"
 # The engine's message for winget's INSTALLER_PROHIBITS_ELEVATION (0x8A150056), the longest of
@@ -775,11 +786,22 @@ def test_network_reset_waits_for_a_batch(make_app: AppFactory) -> None:
 # -- installing and the install list ----------------------------------------------------
 
 
-def open_install(app: App, engine: Any) -> UpdatesPanel:
+def open_install(app: App, engine: Any, tiles: int = len(DEFAULT_APPS)) -> UpdatesPanel:
+    """Shows Install apps, finishes the first check and waits for the list's `tiles` (a list of
+    up to 40 apps opens every section, so all its tiles are built)."""
     panel = open_updates(app)
     switch_view(app, "install")
     finish_check(app, engine)
-    pump(app, 5.0, until=lambda: app._updates_apps is not None and len(panel.install.tiles) == 6)
+    pump(app, 5.0, until=lambda: app._updates_apps is not None and len(panel.install.tiles) == tiles)
+    return panel
+
+
+def open_long_list(app: App, engine: Any) -> UpdatesPanel:
+    """Shows Install apps with a list of more than 40 apps, after the first check."""
+    panel = open_updates(app)
+    switch_view(app, "install")
+    finish_check(app, engine)
+    pump(app, 5.0, until=lambda: app._updates_apps is not None and bool(panel.install.sections))
     return panel
 
 
@@ -787,12 +809,57 @@ def tile(panel: UpdatesPanel, package: str) -> Any:
     return next(t for t in panel.install.tiles if t.app["id"] == package)
 
 
+def many_apps(count: int = 130) -> list[dict[str, str]]:
+    """A list of `count` generic apps over the nine categories, with three that test the Find
+    box: two whose names hold the word "zip" and one that holds it only inside a word."""
+    apps = [
+        {"id": "Contoso.Zip", "name": "Contoso Zip", "category": "utilities", "source": "winget"},
+        {"id": "Fabrikam.NanoZip", "name": "NanoZip", "category": "utilities", "source": "winget"},
+        {"id": "Tailspin.Unzipped", "name": "Unzipped", "category": "utilities", "source": "winget"},
+    ]
+    keys = list(CATEGORY_TITLES)
+    for n in range(count - len(apps)):
+        apps.append(
+            {
+                "id": f"Contoso.App{n:03}",
+                "name": f"Contoso App {n:03}",
+                "category": keys[n % len(keys)],
+                "source": "winget",
+            }
+        )
+    return apps
+
+
+def count_tiles(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    """Records every AppTile the install list builds from now on."""
+    built: list[Any] = []
+
+    class CountedTile(updates_view.AppTile):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            built.append(self)
+
+    monkeypatch.setattr(updates_view, "AppTile", CountedTile)
+    return built
+
+
+def gridded(tiles: list[Any]) -> list[str]:
+    return [t.app["id"] for t in tiles if t.winfo_manager()]
+
+
+def shown_tiles(panel: UpdatesPanel) -> list[str]:
+    """Ids of the tiles that are gridded inside a section frame that is gridded, in list order."""
+    view = panel.install
+    open_frames = {key for key, s in view.sections.items() if s.frame is not None and s.frame.winfo_manager()}
+    return [t.app["id"] for t in view.tiles if t.app["category"] in open_frames and t.winfo_manager()]
+
+
 def test_installs_skip_the_apps_already_installed(make_app: AppFactory) -> None:
     app, engine = make_app(elevated=True, installed=["Contoso.Editor"])
     panel = open_install(app, engine)
     summary = str(panel.install.summary.cget("text"))
     assert (
-        summary == "Pick apps to install. Apps already on this PC are skipped.  ·  1 of 6 already installed"
+        summary == "Pick apps to install. Apps already on this PC are skipped.  ·  1 of 9 already installed"
     )
     editor = tile(panel, "Contoso.Editor")
     assert editor.badge.cget("text") == "✓ Installed"
@@ -807,6 +874,7 @@ def test_installs_skip_the_apps_already_installed(make_app: AppFactory) -> None:
     text = confirm_batch(app)
     assert INSTALL_CONFIRM_MESSAGE in text
     assert "Contoso Browser  ·  Contoso.Browser" in text
+    assert DEPENDENCIES_NOTE in text, "runtimes winget adds get no rows of their own"
     job = running_job(app, "install")
     items = [
         {"id": "Contoso.Browser", "source": "winget", "name": "Contoso Browser"},
@@ -824,7 +892,15 @@ def test_installs_skip_the_apps_already_installed(make_app: AppFactory) -> None:
 def test_a_selection_of_installed_apps_starts_nothing(make_app: AppFactory) -> None:
     app, engine = make_app(elevated=True, installed=["Contoso.Editor"])
     panel = open_install(app, engine)
-    tile(panel, "Contoso.Editor").var.set(1)
+    tile(panel, "Contoso.Browser").check.toggle()
+    assert panel.install.install_button.cget("text") == "Install selected (1)"
+    # The next check finds the ticked app installed, as when it was installed elsewhere.
+    panel.install.check_button.invoke()
+    finish_check(app, engine, installed=["Contoso.Editor", "Contoso.Browser"])
+    browser = tile(panel, "Contoso.Browser")
+    assert browser.badge.cget("text") == "✓ Installed"
+    assert browser.check.cget("state") == "disabled" and browser.var.get() == 0
+    assert panel.install.install_button.cget("text") == "Install selected (0)"
     app._on_updates_install()
     assert status(app)[0] == ALL_INSTALLED_TEXT
     assert [c for c in starts(engine) if c[0] == "install"] == []
@@ -833,7 +909,8 @@ def test_a_selection_of_installed_apps_starts_nothing(make_app: AppFactory) -> N
 
 
 def test_an_app_its_install_found_installed_stays_marked_installed(make_app: AppFactory) -> None:
-    # winget's list of installed apps leaves out Fabrikam Chat, so the check never reports it.
+    # winget's list of installed apps leaves out Fabrikam Chat, but winget found it by its id
+    # (already installed), so the check that does not list it changes nothing.
     app, engine = make_app(elevated=True, installed=["Contoso.Editor"])
     panel = open_install(app, engine)
     tile(panel, "Fabrikam.Chat").check.toggle()
@@ -848,8 +925,435 @@ def test_an_app_its_install_found_installed_stays_marked_installed(make_app: App
     chat = tile(panel, "Fabrikam.Chat")
     assert chat.badge.cget("text") == "✓ Installed"
     assert chat.check.cget("state") == "disabled"
-    assert str(panel.install.summary.cget("text")).endswith("  ·  2 of 6 already installed")
+    assert str(panel.install.summary.cget("text")).endswith("  ·  2 of 9 already installed")
     assert app._updates_installed_ids() == ["Contoso.Editor", "Fabrikam.Chat"]
+    assert app._updates_last_results["fabrikam.chat"]["state"] == "already_installed"
+    assert app.errors == []
+
+
+def test_an_install_windows_does_not_list_is_never_marked_installed(make_app: AppFactory) -> None:
+    # winget reports success, but the check after the batch doesn't find the app, as when an
+    # installer hands its work to another process and exits at once.
+    app, engine = make_app(elevated=True, installed=["Contoso.Editor"])
+    panel = open_install(app, engine)
+    tile(panel, "Fabrikam.Chat").check.toggle()
+    panel.install.install_button.invoke()
+    confirm_batch(app)
+    job = running_job(app, "install")
+    engine.updates_item(job, 0, "succeeded", exit_code=0)
+    chat = tile(panel, "Fabrikam.Chat")
+    pump(app, 5.0, until=lambda: chat.badge.cget("text") == f"◐ {REPORTED_TEXT}")
+    assert chat.var.get() == 0, "an app winget installed isn't left ticked for a second install"
+    finish_batch(app, engine, job, "succeeded", "1 installed")
+    assert chat.badge.cget("text") == f"◐ {REPORTED_TEXT}", "winget's report until a check ends"
+    assert status(app) == ("Done: ✓ 1 installed", theme.GOOD)
+    finish_check(app, engine)
+    assert chat.badge.cget("text") == f"◐ {UNLISTED_TEXT}"
+    assert chat.check.cget("state") == "normal", "it can be picked again"
+    assert chat.var.get() == 0 and panel.install.install_button.cget("text") == "Install selected (0)"
+    assert app._updates_last_results["fabrikam.chat"]["state"] == "succeeded_unlisted"
+    assert app._updates_installed_ids() == ["Contoso.Editor"]
+    assert str(panel.install.summary.cget("text")).endswith("  ·  1 of 9 already installed")
+    assert panel.job.result_text == "◐ 1 not listed yet"
+    assert panel.job.result_label.cget("text_color") == theme.WARNING
+    assert status(app) == ("Done: ◐ 1 not listed yet", theme.WARNING)
+
+    # Check again finds it: from then on it is installed.
+    panel.install.check_button.invoke()
+    finish_check(app, engine, installed=["Contoso.Editor", "Fabrikam.Chat"])
+    assert chat.badge.cget("text") == "✓ Installed"
+    assert chat.check.cget("state") == "disabled"
+    assert app._updates_last_results["fabrikam.chat"]["state"] == "succeeded"
+    assert app._updates_installed_ids() == ["Contoso.Editor", "Fabrikam.Chat"]
+    assert status(app) == ("Done: ✓ 1 installed", theme.GOOD)
+    assert app.errors == []
+
+
+def test_an_install_that_needs_a_restart_is_installed_only_once_a_check_lists_it(
+    make_app: AppFactory,
+) -> None:
+    app, engine = make_app(elevated=True, installed=["Contoso.Editor"])
+    panel = open_install(app, engine)
+    tile(panel, "Fabrikam.Chat").check.toggle()
+    panel.install.install_button.invoke()
+    confirm_batch(app)
+    job = running_job(app, "install")
+    engine.updates_item(job, 0, "restart_required", exit_code=3010, message="Restart Windows to finish.")
+    finish_batch(app, engine, job, "succeeded", "restart needed for 1")
+    finish_check(app, engine)
+    chat = tile(panel, "Fabrikam.Chat")
+    assert chat.badge.cget("text") == "⚠ Restart Windows to finish", "the check does not list it"
+    assert chat.var.get() == 0 and chat.check.cget("state") == "normal"
+    assert app._updates_installed_ids() == ["Contoso.Editor"]
+    assert str(panel.install.summary.cget("text")).endswith("  ·  1 of 9 already installed")
+
+    panel.install.check_button.invoke()
+    finish_check(app, engine, installed=["Contoso.Editor", "Fabrikam.Chat"])
+    assert chat.badge.cget("text") == "✓ Installed"
+    assert app._updates_installed_ids() == ["Contoso.Editor", "Fabrikam.Chat"]
+    assert app.errors == []
+
+
+def test_a_pending_restart_after_an_install_batch_is_shown(make_app: AppFactory) -> None:
+    # The installer exited cleanly, but Windows' pending-restart flags turned on during the batch,
+    # which winget's exit code does not carry: the app's tile and the batch's line say so.
+    app, engine = make_app(elevated=True, installed=["Contoso.Editor"])
+    panel = open_install(app, engine)
+    tile(panel, "Fabrikam.Chat").check.toggle()
+    panel.install.install_button.invoke()
+    confirm_batch(app)
+    job = running_job(app, "install")
+    engine.updates_item(job, 0, "succeeded", exit_code=0)
+    note = "Windows reports a pending restart; restart Windows to finish"
+    checks = sum(1 for call in starts(engine) if call[0] == "scan")
+    engine.updates_finish(job, "attention", f"1 installed · {note}.", pending_restart=True)
+    chat = tile(panel, "Fabrikam.Chat")
+    pump(app, 5.0, until=lambda: chat.badge.cget("text") == f"◐ {REPORTED_TEXT}  ·  ⚠ {note}.")
+    assert chat.badge.cget("text_color") == theme.WARNING
+    pump(app, 5.0, until=lambda: sum(1 for call in starts(engine) if call[0] == "scan") > checks)
+    assert panel.job.result_text == f"✓ 1 installed  ·  ⚠ {note}"
+    assert panel.job.result_label.cget("text_color") == theme.WARNING
+    assert status(app) == (f"Done: ✓ 1 installed  ·  ⚠ {note}", theme.WARNING)
+
+    # The check after the batch lists the app; the batch's line keeps the restart note.
+    finish_check(app, engine, installed=["Contoso.Editor", "Fabrikam.Chat"])
+    assert chat.badge.cget("text") == "✓ Installed"
+    assert panel.job.result_text == f"✓ 1 installed  ·  ⚠ {note}"
+    assert panel.job.result_label.cget("text_color") == theme.WARNING
+    assert app.errors == []
+
+
+def test_the_check_after_a_batch_keeps_a_newer_status_message(make_app: AppFactory) -> None:
+    app, engine = make_app(elevated=True, installed=["Contoso.Editor"])
+    panel = open_install(app, engine)
+    tile(panel, "Fabrikam.Chat").check.toggle()
+    panel.install.install_button.invoke()
+    confirm_batch(app)
+    job = running_job(app, "install")
+    engine.updates_item(job, 0, "succeeded", exit_code=0)
+    finish_batch(app, engine, job, "succeeded", "1 installed")
+    app.set_status("The install list was saved.")
+    finish_check(app, engine)
+    assert panel.job.result_text == "◐ 1 not listed yet"
+    assert status(app)[0] == "The install list was saved.", "the status bar keeps the newer message"
+    assert app.errors == []
+
+
+def test_an_app_removed_after_its_install_is_no_longer_marked_installed(make_app: AppFactory) -> None:
+    # The check after the batch finds the app; it is then removed in Settings › Apps, so the
+    # next check doesn't list it.
+    app, engine = make_app(elevated=True, installed=["Contoso.Editor"])
+    panel = open_install(app, engine)
+    tile(panel, "Fabrikam.Chat").check.toggle()
+    panel.install.install_button.invoke()
+    confirm_batch(app)
+    job = running_job(app, "install")
+    engine.updates_item(job, 0, "succeeded", exit_code=0)
+    finish_batch(app, engine, job, "succeeded", "1 installed")
+    finish_check(app, engine, installed=["Contoso.Editor", "Fabrikam.Chat"])
+    chat = tile(panel, "Fabrikam.Chat")
+    assert chat.badge.cget("text") == "✓ Installed"
+    assert app._updates_unverified == set()
+
+    panel.install.check_button.invoke()
+    finish_check(app, engine, installed=["Contoso.Editor"])
+    assert chat.badge.cget("text") == "", "neither ✓ Installed nor winget's earlier report"
+    assert chat.check.cget("state") == "normal" and chat.var.get() == 0
+    assert app._updates_installed_ids() == ["Contoso.Editor"]
+    assert str(panel.install.summary.cget("text")).endswith("  ·  1 of 9 already installed")
+    assert app.errors == []
+
+
+def test_a_failed_check_proves_nothing(make_app: AppFactory) -> None:
+    app, engine = make_app(elevated=True, installed=["Contoso.Editor"])
+    panel = open_install(app, engine)
+    tile(panel, "Fabrikam.Chat").check.toggle()
+    panel.install.install_button.invoke()
+    confirm_batch(app)
+    job = running_job(app, "install")
+    engine.updates_item(job, 0, "succeeded", exit_code=0)
+    finish_batch(app, engine, job, "succeeded", "1 installed")
+    finish_check(app, engine, error="winget couldn't reach its sources. Check your internet connection.")
+    assert app._updates_last_results["fabrikam.chat"]["state"] == "succeeded"
+    chat = tile(panel, "Fabrikam.Chat")
+    assert chat.badge.cget("text") == f"◐ {REPORTED_TEXT}", "winget's own report, never ✓ Installed"
+    assert chat.check.cget("state") == "normal" and chat.var.get() == 0
+    assert app._updates_installed_ids() == ["Contoso.Editor"]
+    assert app._updates_unverified == {"fabrikam.chat"}, "the next good check decides"
+    assert app.errors == []
+
+
+def test_a_check_that_could_not_read_the_installed_apps_proves_nothing(make_app: AppFactory) -> None:
+    # The check ran, but winget's list of installed apps could not be read.
+    app, engine = make_app(elevated=True, installed=["Contoso.Editor"])
+    panel = open_install(app, engine)
+    tile(panel, "Fabrikam.Chat").check.toggle()
+    panel.install.install_button.invoke()
+    confirm_batch(app)
+    job = running_job(app, "install")
+    engine.updates_item(job, 0, "succeeded", exit_code=0)
+    finish_batch(app, engine, job, "succeeded", "1 installed")
+    finish_check(app, engine, inventory_complete=False)
+    chat = tile(panel, "Fabrikam.Chat")
+    assert chat.badge.cget("text") == f"◐ {REPORTED_TEXT}", "a list that was not read proves nothing"
+    assert app._updates_last_results["fabrikam.chat"]["state"] == "succeeded"
+    assert app._updates_unverified == {"fabrikam.chat"}, "the next good check decides"
+    assert app.errors == []
+
+
+def appx_removal(family: str, stamp: str) -> dict[str, Any]:
+    """An active Appx entry of the journal export, as a Debloat removal leaves it."""
+    name, publisher = family.split("_")
+    return {
+        "id": 1,
+        "session_id": 1,
+        "recorded_at": stamp,
+        "package_full_name": f"{name}_1.0.0.0_x64__{publisher}",
+        "package_family": family,
+        "install_location": "C:\\Program Files\\WindowsApps\\Package",
+        "all_users": False,
+        "active": True,
+        "reverted_at": None,
+    }
+
+
+def test_installing_an_app_cairn_removed_names_the_removal(make_app: AppFactory) -> None:
+    apps = [
+        {"id": "Microsoft.Teams", "name": "Microsoft Teams", "category": "chat", "source": "winget"},
+        {"id": "Contoso.Browser", "name": "Contoso Browser", "category": "browsers", "source": "winget"},
+    ]
+    app, engine = make_app(elevated=True, installed=[], app_list=apps)
+    stamp = "2026-09-20T10:00:00+00:00"
+    export = engine.journal_export_json
+
+    def with_removal() -> str:
+        journal = json.loads(export())
+        journal["appx"] = [appx_removal("MSTeams_8wekyb3d8bbwe", stamp)]
+        return json.dumps(journal)
+
+    engine.journal_export_json = with_removal  # type: ignore[method-assign]
+    panel = open_install(app, engine, tiles=2)
+    tile(panel, "Microsoft.Teams").check.toggle()
+    tile(panel, "Contoso.Browser").check.toggle()
+    panel.install.install_button.invoke()
+    dialog = next_dialog(app)
+    text = dialog_text(dialog)
+    note = DEBLOAT_REMOVED_NOTE.format(date=day_text(stamp))
+    assert f"Microsoft Teams  ·  {note}" in text
+    assert text.count("removed this app") == 1, "only the app Debloat also lists"
+    assert "Contoso Browser  ·  Contoso.Browser" in text
+    dialog._cancel()
+    pump(app, 5.0, until=lambda: idle(app))
+    assert len(engine.calls_named("journal_export_json")) >= 1
+    assert app.errors == []
+
+
+def test_an_app_without_a_removal_record_needs_no_journal_read(make_app: AppFactory) -> None:
+    app, engine = make_app(elevated=True, installed=["Contoso.Editor"])
+    panel = open_install(app, engine)
+    reads = len(engine.calls_named("journal_export_json"))
+    tile(panel, "Contoso.Browser").check.toggle()
+    panel.install.install_button.invoke()
+    text = dialog_text(next_dialog(app))
+    assert "removed this app" not in text
+    assert len(engine.calls_named("journal_export_json")) == reads
+    dialogs(app)[-1]._cancel()
+    assert app.errors == []
+
+
+def test_an_own_list_says_how_many_default_apps_it_lacks(make_app: AppFactory) -> None:
+    apps = [
+        dict(DEFAULT_APPS[0]),
+        {"id": "Wingtip.Notes", "name": "Wingtip Notes", "category": "productivity", "source": "winget"},
+    ]
+    app, engine = make_app(elevated=True, installed=[], app_list=apps)
+    panel = open_install(app, engine, tiles=2)
+    summary = str(panel.install.summary.cget("text"))
+    assert summary.endswith(
+        "The default list has 8 apps your list doesn't. Restore the default list to see them; your own "
+        "additions are then removed."
+    )
+    panel.install.edit_button.invoke()
+    panel.install.reset_link.invoke()
+    pump(app, 5.0, until=lambda: app._updates_apps is not None and not app._updates_apps["custom"])
+    pump(app, 5.0, until=lambda: len(panel.install.tiles) == len(DEFAULT_APPS))
+    assert "The default list has" not in str(panel.install.summary.cget("text"))
+    assert app.errors == []
+
+
+# -- the install list in sections -------------------------------------------------------
+
+
+def test_a_long_list_starts_closed_and_builds_a_section_when_it_opens(
+    make_app: AppFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    built = count_tiles(monkeypatch)
+    apps = many_apps()
+    app, engine = make_app(elevated=True, installed=["Contoso.App002"], app_list=apps)
+    panel = open_long_list(app, engine)
+    view = panel.install
+    assert built == [] and view.tiles == [], "no tile exists while every section is closed"
+    assert list(view.sections) == list(CATEGORY_TITLES)
+    gaming = [a for a in apps if a["category"] == "gaming"]
+    header = view.sections["gaming"].header
+    assert header.cget("text") == f"▸ Gaming  ·  {len(gaming)} apps  ·  1 installed"
+    header.invoke()
+    assert [t.app["id"] for t in built] == [a["id"] for a in gaming], "opening builds exactly its tiles"
+    assert header.cget("text").startswith("▾ Gaming")
+    pump(app, 0.2)
+    assert gridded(built) == [a["id"] for a in gaming]
+    assert [t.cell for t in built] == [(i // 2, i % 2) for i in range(len(gaming))]
+    frame = view.sections["gaming"].frame
+    assert frame is not None and frame.winfo_manager()
+
+    header.invoke()
+    pump(app, 0.2)
+    assert not frame.winfo_manager(), "closing hides the tiles"
+    assert all(t.winfo_exists() for t in built), "and keeps them"
+    header.invoke()
+    pump(app, 0.2)
+    assert len(built) == len(gaming), "reopening builds nothing"
+    assert frame.winfo_manager() and gridded(built) == [a["id"] for a in gaming]
+
+    view.check_button.invoke()
+    finish_check(app, engine, installed=["Contoso.App002", "Contoso.App011"])
+    assert len(built) == len(gaming), "a check that changes no app builds nothing"
+    assert view.sections["gaming"].expanded, "an opened section stays open"
+    assert tile(panel, "Contoso.App011").badge.cget("text") == "✓ Installed"
+    assert header.cget("text") == f"▾ Gaming  ·  {len(gaming)} apps  ·  2 installed"
+    assert app.errors == []
+
+
+def test_ticks_and_statuses_live_in_the_list_not_in_the_tiles(make_app: AppFactory) -> None:
+    apps = many_apps()
+    app, engine = make_app(elevated=True, installed=[], app_list=apps)
+    panel = open_long_list(app, engine)
+    view = panel.install
+    view.toggle_section("gaming")
+    gaming = view.tiles[0]
+    gaming.check.toggle()
+    view.toggle_section("gaming")
+    view.toggle_section("media")
+    media = next(t for t in view.tiles if t.app["category"] == "media")
+    media.check.toggle()
+    assert view.install_button.cget("text") == "Install selected (2)", "the count spans the sections"
+    assert view.sections["gaming"].header.cget("text").endswith("  ·  1 selected")
+    view.toggle_section("gaming")
+    assert gaming.var.get() == 1, "a closed section keeps its ticks"
+    assert [i["id"] for i in view.selected_items()] == [gaming.app["id"], media.app["id"]]
+
+    developer = next(a for a in apps if a["category"] == "developer")
+    view.set_items([{"id": developer["id"], "state": "failed", "message": APP_OPEN_TEXT}])
+    assert not any(t.app["id"] == developer["id"] for t in view.tiles)
+    view.toggle_section("developer")
+    assert tile(panel, developer["id"]).badge.cget("text") == f"⚠ Failed: {APP_OPEN_TEXT}"
+    assert app.errors == []
+
+
+def test_edit_list_shows_remove_links_without_building_tiles_again(
+    make_app: AppFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    built = count_tiles(monkeypatch)
+    app, engine = make_app(elevated=True, installed=[], app_list=many_apps())
+    panel = open_long_list(app, engine)
+    view = panel.install
+    view.toggle_section("chat")
+    count = len(built)
+    assert count > 0
+    view.edit_button.invoke()
+    pump(app, 0.2)
+    assert view.form.winfo_manager()
+    assert all(t.remove.winfo_manager() for t in view.tiles)
+    view.edit_button.invoke()
+    pump(app, 0.2)
+    assert not view.form.winfo_manager()
+    assert not any(t.remove.winfo_manager() for t in view.tiles)
+    assert len(built) == count, "Edit list builds no tile"
+    assert app.errors == []
+
+
+def test_removing_an_app_rebuilds_only_its_section(
+    make_app: AppFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    built = count_tiles(monkeypatch)
+    apps = many_apps()
+    app, engine = make_app(elevated=True, installed=[], app_list=apps)
+    panel = open_long_list(app, engine)
+    view = panel.install
+    view.toggle_section("gaming")
+    view.toggle_section("media")
+    gaming = [t for t in view.tiles if t.app["category"] == "gaming"]
+    media = [t for t in view.tiles if t.app["category"] == "media"]
+    view.edit_button.invoke()
+    gaming[0].remove.invoke()
+    pump(app, 5.0, until=lambda: len(app._updates_apps["apps"]) == len(apps) - 1 and idle(app))
+    pump(app, 0.2)
+    assert [t for t in view.tiles if t.app["category"] == "media"] == media, "the other sections stay"
+    rebuilt = [t for t in view.tiles if t.app["category"] == "gaming"]
+    assert len(rebuilt) == len(gaming) - 1
+    assert not set(rebuilt) & set(gaming), "the changed section is built again"
+    assert len(built) == len(gaming) + len(media) + len(rebuilt)
+    assert app.errors == []
+
+
+def test_the_find_box_shows_only_the_matching_tiles(
+    make_app: AppFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    built = count_tiles(monkeypatch)
+    apps = many_apps()
+    app, engine = make_app(elevated=True, installed=[], app_list=apps)
+    panel = open_long_list(app, engine)
+    view = panel.install
+    view.toggle_section("media")
+    media = len(built)
+    view.find.set_query("zip")
+    pump(app, 0.2)
+    assert shown_tiles(panel) == ["Contoso.Zip", "Fabrikam.NanoZip"]
+    assert [t.app["id"] for t in built[media:]] == ["Contoso.Zip", "Fabrikam.NanoZip"], (
+        "a search builds only the tiles it shows"
+    )
+    assert [k for k, s in view.sections.items() if s.header.winfo_manager()] == ["utilities"]
+    assert view.find_note.winfo_manager() and view.find_note.cget("text") == "2 apps match."
+
+    view.find.set_query("contoso")
+    pump(app, 0.2)
+    total = sum(1 for a in apps if a["id"].startswith("Contoso."))
+    assert len(shown_tiles(panel)) == MAX_FIND_RESULTS
+    assert view.find_note.cget("text") == (
+        f"{total} apps match. The first {MAX_FIND_RESULTS} are shown; type more to narrow the search."
+    )
+    view.find.set_query("nothing like it")
+    pump(app, 0.2)
+    assert shown_tiles(panel) == []
+    assert view.find_note.cget("text") == "No app on the list matches your search."
+
+    view.find.clear()
+    pump(app, 0.2)
+    assert not view.find_note.winfo_manager()
+    assert all(s.header.winfo_manager() for s in view.sections.values())
+    assert [k for k, s in view.sections.items() if s.expanded] == ["media"], "the sections are as before"
+    assert app.errors == []
+
+
+def test_an_install_opens_the_sections_of_its_apps(make_app: AppFactory) -> None:
+    app, engine = make_app(elevated=True, installed=[], app_list=many_apps())
+    panel = open_long_list(app, engine)
+    view = panel.install
+    view.find.set_query("zip")
+    tile(panel, "Contoso.Zip").check.toggle()
+    view.find.clear()
+    view.toggle_section("gaming")
+    next(t for t in view.tiles if t.app["category"] == "gaming").check.toggle()
+    view.toggle_section("gaming")
+    assert not view.sections["utilities"].expanded and not view.sections["gaming"].expanded
+    view.find.set_query("contoso app")
+    view.install_button.invoke()
+    confirm_batch(app)
+    running_job(app, "install")
+    pump(app, 0.2)
+    assert view.find.query == "", "the search ends"
+    assert [k for k, s in view.sections.items() if s.expanded] == ["gaming", "utilities"]
+    assert tile(panel, "Contoso.Zip").badge.cget("text") == "○ Waiting"
     assert app.errors == []
 
 
@@ -932,9 +1436,9 @@ def test_the_install_list_is_edited_in_place(make_app: AppFactory) -> None:
     view.name_entry.insert(0, "Wingtip Notes")
     view.category_menu.set("Productivity")
     view.add_button.invoke()
-    pump(app, 5.0, until=lambda: len(view.tiles) == 7)
+    pump(app, 5.0, until=lambda: len(view.tiles) == len(DEFAULT_APPS) + 1)
     added = saves(engine)[0][0]
-    assert len(added) == 7
+    assert len(added) == len(DEFAULT_APPS) + 1
     assert added[-1] == {
         "id": "Wingtip.Notes",
         "name": "Wingtip Notes",
@@ -943,15 +1447,25 @@ def test_the_install_list_is_edited_in_place(make_app: AppFactory) -> None:
     }
     assert app._updates_apps is not None and app._updates_apps["custom"] is True
     assert view.error.cget("text") == ""
+    assert tile(panel, "Wingtip.Notes").remove.winfo_manager(), "a tile built while editing offers Remove"
+
+    view.category_menu.set("Security and privacy")
+    view.id_entry.insert(0, "Contoso.Vault")
+    view.name_entry.insert(0, "Contoso Vault")
+    view.add_button.invoke()
+    pump(app, 5.0, until=lambda: len(view.tiles) == len(DEFAULT_APPS) + 2)
+    assert saves(engine)[1][0][-1]["category"] == "security"
+    tile(panel, "Contoso.Vault").remove.invoke()
+    pump(app, 5.0, until=lambda: len(view.tiles) == len(DEFAULT_APPS) + 1)
 
     tile(panel, "Litware.Dev").remove.invoke()
-    pump(app, 5.0, until=lambda: len(view.tiles) == 6)
-    assert [a["id"] for a in saves(engine)[1][0]][-1] == "Wingtip.Notes"
-    assert "Litware.Dev" not in [a["id"] for a in saves(engine)[1][0]]
+    pump(app, 5.0, until=lambda: len(view.tiles) == len(DEFAULT_APPS))
+    assert [a["id"] for a in saves(engine)[3][0]][-1] == "Wingtip.Notes"
+    assert "Litware.Dev" not in [a["id"] for a in saves(engine)[3][0]]
 
     view.reset_link.invoke()
-    pump(app, 5.0, until=lambda: len(saves(engine)) == 3 and not app._updates_apps["custom"])
-    assert saves(engine)[2] == (None,)
+    pump(app, 5.0, until=lambda: len(saves(engine)) == 5 and not app._updates_apps["custom"])
+    assert saves(engine)[4] == (None,)
     assert status(app)[0] == "The default install list is back."
     view.edit_button.invoke()
     assert not view.form.winfo_manager()
@@ -1247,6 +1761,39 @@ def test_install_apps_fit(make_app: AppFactory) -> None:
     pump(app, 5.0, until=lambda: app._updates_status is not None and idle(app))
     assert app.updates_panel.install.message.winfo_manager(), "the longest layout: the list and the message"
     assert_section_fits(app, "Updates")
+    assert app.errors == []
+
+
+def test_install_apps_fit_with_a_long_list_and_a_search(make_app: AppFactory) -> None:
+    app, engine = make_app(elevated=True, installed=["Contoso.App002"], app_list=many_apps())
+    panel = open_long_list(app, engine)
+    view = panel.install
+    view.find.set_query("zip")
+    tile(panel, "Contoso.Zip").check.toggle()
+    pump(app, 0.2)
+    assert view.find.clear_shown and view.find_note.winfo_manager()
+    assert view.sections["utilities"].expanded, "the search opened a section"
+    assert view.install_button.cget("text") == "Install selected (1)"
+    assert_section_fits(app, "Updates")
+    assert app.errors == []
+
+
+def test_install_apps_fit_with_the_editor_open(make_app: AppFactory) -> None:
+    app, engine = make_app(elevated=True)
+    panel = open_install(app, engine)
+    view = panel.install
+    view.edit_button.invoke()
+    view.category_menu.set("Security and privacy")
+    view.show_error(INVALID_ID_TEXT)
+    pump(app, 0.2)
+    assert_section_fits(app, "Updates")
+    # The menu keeps its width at every size; the narrowest window leaves the form the least room.
+    width, height = min(FIT_SIZES)
+    resize_to(app, width, height)
+    menu = view.category_menu
+    assert menu.get() == "Security and privacy"
+    assert fits(menu._text_label), f"'Security and privacy' is cut in the category menu at {width}x{height}"
+    assert right_edge(view.add_button) <= right_edge(view.form), f"Add sticks out at {width}x{height}"
     assert app.errors == []
 
 

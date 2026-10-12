@@ -786,8 +786,12 @@ impl Run<'_> {
             total,
             stopping: false,
             restart_required: false,
+            pending_restart: false,
         };
         self.publish_batch(&mut batch);
+        // Windows' pending-restart flags before the batch: a flag that turns on while the batch
+        // runs is the batch's, even when every app exited cleanly.
+        let restart_flags_before = (self.deps.env.restart_flags)();
 
         if install {
             self.ctx
@@ -1015,6 +1019,20 @@ impl Run<'_> {
             self.publish_batch(&mut batch);
         }
         batch.current = None;
+        // A pending-restart flag that was not set before the batch is the batch's, even when
+        // every app reported success: winget's exit code does not carry it. The flags are
+        // compared one by one, so one that was set already does not hide a new one.
+        batch.pending_restart =
+            (self.deps.env.restart_flags)().appeared_since(restart_flags_before);
+        if batch.pending_restart {
+            // The flags do not say which app's installer queued the restart, so every app that
+            // installed or updated carries the note on its row.
+            for item in batch.items.iter_mut() {
+                if item.state == ItemState::Succeeded {
+                    item.message = Some(super::codes::PENDING_RESTART_TEXT.to_string());
+                }
+            }
+        }
         self.publish_batch(&mut batch);
         self.batch_end(kind, &batch, launched_any, audit_failed, stopped)
     }
@@ -1065,10 +1083,17 @@ impl Run<'_> {
         if not_started > 0 {
             parts.push(format!("{not_started} not started"));
         }
-        let summary = parts.join(" · ");
+        let mut summary = parts.join(" · ");
+        if batch.pending_restart {
+            if !summary.is_empty() {
+                summary.push_str(" · ");
+            }
+            summary.push_str(super::codes::PENDING_RESTART_TEXT);
+        }
+        let restart_needed = restart > 0 || batch.pending_restart;
         let state = if audit_failed || (!launched_any && failed > 0) {
             JobState::Failed
-        } else if failed > 0 || restart > 0 {
+        } else if failed > 0 || restart_needed {
             JobState::Attention
         } else if not_started > 0 || stopped {
             JobState::Cancelled
@@ -1082,7 +1107,7 @@ impl Run<'_> {
             state,
             summary,
             hint,
-            restart_required: restart > 0,
+            restart_required: restart_needed,
             audit_detail: None,
         }
     }

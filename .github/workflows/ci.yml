@@ -1,0 +1,293 @@
+# Checks of every push to main and every pull request: rustfmt, clippy and the Rust tests (the
+# tests inside optctl.exe included), the Rust 1.80 check, the telemetry DLL with its smoke test,
+# ruff and the UI tests on the hidden desktop with the real natives, and on main an unsigned setup
+# as a download. release.yml runs the same jobs (without the setup) before it builds a release.
+#
+# Every action is pinned to the full commit of its release; Dependabot proposes updates.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['LICENSE']
+  pull_request:
+    paths-ignore: ['LICENSE']
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      release:
+        description: The checks of a release, with the verification records gate (CAIRN_RELEASE=1).
+        type: boolean
+        default: false
+      skip_ui:
+        description: Leave out the UI tests (release.yml, when they ran locally for the release).
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  # Smaller debug information keeps the caches and the runner's disk in bounds.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  PYTHONUTF8: '1'
+  # Every program and library must carry its version resource.
+  CAIRN_REQUIRE_RESOURCES: '1'
+  # With 1, every shipped tweak needs its verification record (crates/core/tests/verification_records.rs).
+  CAIRN_RELEASE: ${{ inputs.release && '1' || '0' }}
+  # The engine refuses these actions while a variable is 1; .cargo/config.toml and the UI
+  # conftest set them too.
+  OPTIMIZER_FORBID_RESTORE_POINT: '1'
+  OPTIMIZER_FORBID_DRIVE_TESTS: '1'
+  OPTIMIZER_FORBID_UPDATE_SEARCH: '1'
+  OPTIMIZER_FORBID_APP_INSTALLS: '1'
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  rust:
+    name: Rust (rustfmt, clippy, tests)
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        id: python
+        with:
+          python-version: '3.12.10'
+      - name: Rust toolchain of rust-toolchain.toml
+        run: rustup toolchain install
+      - name: Build information
+        run: |
+          $commands = @(
+            { rustc -vV },
+            { cargo -V },
+            { Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{ n = 'Free GB'; e = { [math]::Round($_.Free / 1GB, 1) } } -AutoSize | Out-String }
+          )
+          foreach ($command in $commands) { try { & $command } catch { Write-Warning $_ } }
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        env:
+          PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
+      - name: Tests
+        run: cargo test --workspace --locked
+        env:
+          PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
+      - name: Tests of optctl
+        # `cargo test --workspace` leaves out the tests inside optctl.exe: its requireAdministrator
+        # manifest also applies to their test program (crates/cli/Cargo.toml), which only an
+        # elevated process can start. A GitHub-hosted runner is elevated.
+        run: cargo test -p optctl --bin optctl --locked
+        env:
+          PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
+
+  msrv:
+    name: Rust 1.80 (MSRV)
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        id: python
+        with:
+          python-version: '3.12.10'
+      - name: Rust 1.80
+        run: rustup toolchain install 1.80 --profile minimal
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: msrv-1.80
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: cargo +1.80 check
+        run: cargo +1.80 check --workspace --all-targets --locked
+        env:
+          PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
+
+  telemetry:
+    name: Telemetry DLL
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Configure and build (AVX2, as development builds)
+        run: |
+          cmake -S . -B build/ci-cpp -A x64 -DTEL_BUILD_TESTS=ON
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed with $LASTEXITCODE" }
+          cmake --build build/ci-cpp --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { throw "cmake build failed with $LASTEXITCODE" }
+      - name: Configure and build without AVX2 (as release builds)
+        run: |
+          cmake -S . -B build/ci-cpp-v2 -A x64 -DTEL_AVX2=OFF -DTEL_BUILD_TESTS=OFF
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed with $LASTEXITCODE" }
+          cmake --build build/ci-cpp-v2 --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { throw "cmake build failed with $LASTEXITCODE" }
+      - name: Smoke test
+        run: |
+          & build/ci-cpp/bin/Release/telemetry_smoke.exe
+          if ($LASTEXITCODE -ne 0) { throw "telemetry_smoke failed $LASTEXITCODE checks" }
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: telemetry-dll
+          path: build/ci-cpp/bin/Release/optimizer_telemetry.dll
+          retention-days: 1
+          if-no-files-found: error
+
+  ui:
+    name: UI (ruff, pytest)
+    if: ${{ !inputs.skip_ui }}
+    needs: telemetry
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        id: python
+        with:
+          python-version: '3.12.10'
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - name: Virtual environment
+        env:
+          BASE_PYTHON: ${{ steps.python.outputs.python-path }}
+        run: |
+          & $env:BASE_PYTHON -m venv .venv
+          if ($LASTEXITCODE -ne 0) { throw "venv failed with $LASTEXITCODE" }
+          .venv\Scripts\python.exe -m pip install --disable-pip-version-check -r requirements.txt
+          if ($LASTEXITCODE -ne 0) { throw "pip install failed with $LASTEXITCODE" }
+      - name: Rust toolchain of rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ui-engine
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Engine module
+        run: cargo build -p optimizer_engine --locked
+        env:
+          PYO3_PYTHON: ${{ github.workspace }}\.venv\Scripts\python.exe
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: telemetry-dll
+          path: ui/optimizer/native
+      - name: Deploy the engine module
+        run: Copy-Item target\debug\optimizer_engine.dll ui\optimizer\native\optimizer_engine.pyd
+      - name: Display
+        run: |
+          try {
+            Add-Type -AssemblyName System.Windows.Forms
+            if (Get-Command Set-DisplayResolution -ErrorAction SilentlyContinue) {
+              try { Set-DisplayResolution -Width 1920 -Height 1080 -Force } catch { Write-Warning $_ }
+            }
+            $screen = [System.Windows.Forms.Screen]::PrimaryScreen
+            $session = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
+            "Session $session, screen $($screen.Bounds.Size), work area $($screen.WorkingArea.Size)"
+          } catch { Write-Warning $_ }
+      - name: ruff
+        working-directory: ui
+        run: ..\.venv\Scripts\python.exe -m ruff check .
+      - name: UI tests
+        shell: powershell
+        env:
+          CAIRN_REQUIRE_NATIVES: '1'
+        run: >-
+          .\scripts\pytest_serial.ps1 tests -q -ra --durations=30 -o timeout=180
+          --junitxml=..\build\pytest-junit.xml
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure()
+        with:
+          name: pytest-junit
+          path: build/pytest-junit.xml
+          retention-days: 7
+
+  public:
+    name: Public data check
+    if: github.event_name == 'pull_request'
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        id: python
+        with:
+          python-version: '3.12.10'
+      - name: check_public.py --generic-only
+        env:
+          BASE_PYTHON: ${{ steps.python.outputs.python-path }}
+        run: |
+          & $env:BASE_PYTHON scripts/check_public.py --generic-only
+          if ($LASTEXITCODE -ne 0) { throw "check_public.py found something ($LASTEXITCODE)" }
+
+  package:
+    name: Unsigned setup
+    # Pushes to main only: not in pull requests, and not when release.yml calls this workflow
+    # (a called workflow sees the caller's name).
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && github.workflow == 'CI'
+    needs: [rust, msrv, ui]
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        id: python
+        with:
+          python-version: '3.12.10'
+      - name: Rust toolchain of rust-toolchain.toml
+        run: rustup toolchain install
+      - name: Build information
+        run: |
+          $commands = @(
+            { rustc -vV },
+            { cmake --version },
+            { py --list },
+            { & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property catalog_productDisplayVersion },
+            { "Image $env:ImageOS $env:ImageVersion" },
+            { Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{ n = 'Free GB'; e = { [math]::Round($_.Free / 1GB, 1) } } -AutoSize | Out-String }
+          )
+          foreach ($command in $commands) { try { & $command } catch { Write-Warning $_ } }
+      - name: Inno Setup 6.7.3
+        run: .\.github\scripts\install_inno_setup.ps1
+      - name: Stage, gates and setup
+        shell: powershell
+        env:
+          BASE_PYTHON: ${{ steps.python.outputs.python-path }}
+        run: .\scripts\build_release.ps1 -SkipChecks -Python $env:BASE_PYTHON
+      - name: Install, upgrade and uninstall
+        continue-on-error: true
+        # A hung installer must not use up the job's time before the setup is uploaded.
+        timeout-minutes: 20
+        shell: powershell
+        run: .\.github\scripts\install_smoke.ps1 -Dist build\dist
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cairn-unsigned-${{ github.sha }}
+          path: |
+            build/dist/Cairn-*-setup.exe
+            build/dist/SHA256SUMS.txt
+            build/dist/build-info.json
+          retention-days: 14
+          if-no-files-found: error

@@ -1,6 +1,6 @@
 //! Device security: drive encryption through BitLocker's WMI class (administrators only),
 //! and Secure Boot, the TPM and memory integrity from the system information readers;
-//! checks 13 to 16.
+//! checks 13, 14, 16 and 17.
 
 use super::checkup::{unreadable, Check, CheckId, FixAction, Severity, BITLOCKER_URI};
 use super::probe::{CheckupRaw, Context};
@@ -229,7 +229,7 @@ pub(crate) fn secure_boot(raw: &CheckupRaw) -> Check {
     }
 }
 
-/// Check 15: a TPM 2.0.
+/// Check 16: a TPM 2.0.
 pub(crate) fn tpm(raw: &CheckupRaw) -> Check {
     const DETAIL: &str =
         "BitLocker, device encryption and Windows Hello keep their keys in the TPM.";
@@ -278,7 +278,7 @@ fn virtualization_text(info: &SecurityInfo) -> String {
     }
 }
 
-/// Check 16: memory integrity (hypervisor-protected code integrity).
+/// Check 17: memory integrity (hypervisor-protected code integrity).
 pub(crate) fn memory_integrity(raw: &CheckupRaw) -> Check {
     const DETAIL: &str = "Memory integrity stops malicious drivers from changing the Windows \
         kernel. Windows Security lists any old driver that blocks it.";

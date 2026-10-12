@@ -14,6 +14,7 @@ from optimizer import app, theme
 from optimizer.features import profiles as feature
 from optimizer.widgets.profiles import (
     ADMIN_NOTE,
+    NOT_KEPT_STYLE,
     NOT_SELECTED_STYLE,
     REASON_TEXT,
     RESTART_TEXT,
@@ -27,6 +28,7 @@ from optimizer.widgets.profiles import (
     filter_is_empty,
     fold_text,
     group_rows,
+    not_kept_lines,
     plan_counts_text,
     restart_max,
     result_status,
@@ -74,8 +76,12 @@ def test_row_status_names_every_skip_reason() -> None:
         "edition",
         "not_on_this_pc",
         "unknown_id",
+        "windows_version",
+        "retired",
     }
     assert REASON_TEXT["unknown_id"] == "Unknown to this version of Cairn"
+    assert REASON_TEXT["windows_version"] == "Not on this version of Windows"
+    assert REASON_TEXT["retired"] == "Retired"
 
 
 def test_result_status_prefers_the_outcome_then_marks_unselected_changes() -> None:
@@ -87,6 +93,27 @@ def test_result_status_prefers_the_outcome_then_marks_unselected_changes() -> No
     )
     assert RESULT_STYLE["applied"] == ("✓", "Applied", theme.GOOD)
     assert RESULT_STYLE["failed"] == ("⚠", "Failed", theme.CRITICAL)
+
+
+def test_a_step_whose_values_were_not_kept_says_so() -> None:
+    mismatch = {
+        "target": "HKLM\\Test\\gaming.game_mode",
+        "label": "AllowAutoGameMode",
+        "expected": "1",
+        "found": "not set",
+        "original": "not set",
+        "back_to_original": True,
+    }
+    result = {"key": "tweak:gaming.game_mode", "outcome": "applied", "details": [], "not_kept": [mismatch]}
+    assert not_kept_lines(result) == ["Not kept: AllowAutoGameMode is not set, not 1."]
+    assert (
+        result_status(row("tweak:gaming.game_mode"), {result["key"]: result}, {result["key"]})
+        == NOT_KEPT_STYLE
+    )
+    assert NOT_KEPT_STYLE == ("⚠", "Not kept", theme.WARNING)
+    kept = {**result, "not_kept": []}
+    assert not_kept_lines(kept) == [] and not_kept_lines({"key": "x", "outcome": "applied"}) == []
+    assert result_status(row("tweak:gaming.game_mode"), {kept["key"]: kept}, set()) == RESULT_STYLE["applied"]
 
 
 def test_group_rows_follows_the_apply_order_and_puts_unknown_sections_last() -> None:

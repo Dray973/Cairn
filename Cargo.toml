@@ -4,13 +4,14 @@
 #   crates/pybridge  optimizer_engine   PyO3 cdylib → ui/optimizer/native/optimizer_engine.pyd
 #   crates/cli       optctl             admin-manifested CLI (optctl.exe) and cairn-maintenance.exe
 #   crates/launcher  cairn              Cairn.exe: starts the embedded Python runtime
+#   crates/winres    cairn-winres       build-script helper: version resources of the Windows binaries
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/pybridge", "crates/cli", "crates/launcher"]
+members = ["crates/core", "crates/pybridge", "crates/cli", "crates/launcher", "crates/winres"]
 default-members = ["crates/core", "crates/pybridge", "crates/cli", "crates/launcher"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT"
@@ -92,6 +93,7 @@ once_cell = "1"
 
 # Internal
 optimizer_core = { path = "crates/core" }
+cairn-winres = { path = "crates/winres" }
 
 [profile.release]
 opt-level = 3

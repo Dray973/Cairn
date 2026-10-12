@@ -4,7 +4,9 @@ A header card holds the score, its grade, what needs fixing, when the checkup ra
 "Check again" action, plus the notes of checks that could not run; below it a scrollable list
 in three blocks: "To fix" (most severe first), "Could not check" and the collapsed "Passed"
 list. The engine renders every text and fix; this module only lays them out and decides which
-fix buttons are enabled.
+fix buttons are enabled. A fix opens a settings or Windows Security page only when
+`allowed_uri` accepts it, and a web page only when it is exactly one of the Microsoft pages of
+`MICROSOFT_LINKS` (the same list as the engine's).
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ LEFT_OUT_TEXT = "The score leaves out checks that could not run."
 PER_USER_NOTE = "Your own settings can only be changed when Cairn runs as your account."
 ADMIN_TOOL_NOTE = "Opens only with administrator rights."
 BUSY_NOTE = "Wait for the running operation to finish."
+LINK_NOTE = "Opens a Microsoft page in your web browser."
 STOP_TEXT = "Stop"
 
 # severity -> (chip text, icon, colour) of an attention finding.
@@ -79,6 +82,16 @@ SAFE_DEFENDER_PAGES = frozenset(
     }
 )
 BITLOCKER_URI = "shell:::{D9EF8727-CAC2-4E60-809E-86F80A666C91}"
+# Microsoft web pages a fix may open in the browser: exact strings, language-neutral (aka.ms
+# short links and support.microsoft.com/topic/<id>).
+MICROSOFT_LINKS = (
+    "https://aka.ms/getsecureboot",
+    "https://support.microsoft.com/topic/e01cc486-8721-457f-9bc7-5cb801c1759e",
+    "https://support.microsoft.com/topic/9ecc3ba4-fb50-4bd3-9e9b-f16b35b8fb68",
+    "https://support.microsoft.com/topic/5d1bf6b4-7972-455a-a421-0184f1e1ed7d",
+    "https://support.microsoft.com/topic/37e47cf8-608b-4a87-8175-bdead630eb69",
+    "https://aka.ms/myrecoverykey",
+)
 PENDING_UPDATES = "pending_updates"
 
 CARD_PAD = 14
@@ -101,6 +114,12 @@ def allowed_uri(uri: str) -> bool:
         page = rest.replace("?", "/").replace("#", "/").split("/", 1)[0]
         return page in SAFE_DEFENDER_PAGES
     return lower.startswith("ms-settings:") and len(lower) > len("ms-settings:")
+
+
+def allowed_link(url: str) -> bool:
+    """Whether a fix may open the web page `url`: exactly one of `MICROSOFT_LINKS`, never a
+    prefix or a variant of one."""
+    return url in MICROSOFT_LINKS
 
 
 def state_style(check: Mapping[str, Any]) -> tuple[str, str]:
@@ -212,7 +231,7 @@ def fix_state(
     """(enabled, note) of a fix button. A tweak fix changes Windows through the journaled apply
     flow: it waits while another change runs, and a per-user one needs Cairn to run as the
     signed-in user. A tool that needs administrator rights says so when Cairn is not
-    elevated (clicking it explains how to get them)."""
+    elevated (clicking it explains how to get them). A link says it opens a web page."""
     action = fix.get("action") or {}
     kind = action.get("kind") if isinstance(action, Mapping) else None
     if kind == "tweak":
@@ -223,6 +242,8 @@ def fix_state(
         return True, ""
     if kind == "windows_tool" and action.get("requires_admin") and not elevated:
         return True, ADMIN_TOOL_NOTE
+    if kind == "link":
+        return True, LINK_NOTE
     return True, ""
 
 
@@ -301,7 +322,7 @@ class CheckRow(ScaledFrame):
     """One check. Expanded (findings and checks that could not run): icon, title, severity chip,
     summary, detail, facts, fix buttons and their notes. Compact (passed checks): one line. An
     informational finding is listed with the passed checks (`informational`): its line carries
-    the severity chip and its fix buttons, with the detail, facts and fix notes under it.
+    the severity chip, with the detail, facts, fix buttons and fix notes under it.
 
     `fix_buttons` pairs each fix with its button; `stop_button` replaces the "Check online now"
     button while a Windows Update search runs (`set_scanning`). `chip_label` and `detail_label`
@@ -392,18 +413,21 @@ class CheckRow(ScaledFrame):
         if not self.informational:
             # A passed line keeps only the Windows Update search, so it can always be run again.
             fixes = [fix for fix in fixes if self._is_scan_fix(fix)]
-        if fixes:
-            self.grid_columnconfigure(1, weight=0)
-            buttons = self._fix_bar(fixes, height=24, accent=not self.informational)
-            buttons.grid(row=0, column=1, sticky="e", padx=(0, pad), pady=self._px(2))
-        if not self.informational:
+            if fixes:
+                self.grid_columnconfigure(1, weight=0)
+                buttons = self._fix_bar(fixes, height=24)
+                buttons.grid(row=0, column=1, sticky="e", padx=(0, pad), pady=self._px(2))
             return
-        # What explains the finding starts under the line's text, right of the icon.
+        # What explains the finding starts under the line's text, right of the icon. The fix
+        # buttons follow the facts: on the line they would leave the summary, which does not
+        # wrap, too little width.
         self._wrap_inset = self.icon_label.winfo_reqwidth() + self._px(8)
         left = pad + self._wrap_inset
         row = self._detail_rows(1, left=left, gap=0)
         if fixes:
-            row = self._notes_row(row, left=left)
+            buttons = self._fix_bar(fixes, height=24, accent=False)
+            buttons.grid(row=row, column=0, columnspan=2, sticky="w", padx=(left, pad), pady=(self._px(4), 0))
+            row = self._notes_row(row + 1, left=left)
         self.grid_rowconfigure(row, minsize=self._px(3))
 
     def _chip(self, master: tk.Misc) -> tk.Label:

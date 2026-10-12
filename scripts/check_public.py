@@ -7,8 +7,9 @@ caches, logs, the local data folder and the deployed native binaries are skipped
 - the identifiers of this PC: the account and machine SIDs, the MachineGuid, the product
   IdentifyingNumber and UUID, the BIOS, baseboard, disk, memory and monitor serial numbers, the
   MAC addresses of the network adapters (written AA-BB-..., AA:BB:... or as 12 hex digits) and
-  their IPv6 addresses; an identifier written with 16 hex digits or more also matches in part,
-  when 12 of its digits in a row appear in a line whatever separates them;
+  their IPv6 addresses and IPv4 addresses (loopback left out; matched as whole addresses, so
+  192.0.2.5 does not match inside 192.0.2.50); an identifier written with 16 hex digits or more
+  also matches in part, when 12 of its digits in a row appear in a line whatever separates them;
 - the hardware names of this PC: the model, family and SKU, the baseboard product, the BIOS
   version, the memory part numbers, the disk models and firmware revisions, the monitor names,
   the descriptions of the physical network adapters and the PCI subsystem ids of the display
@@ -16,7 +17,9 @@ caches, logs, the local data folder and the deployed native binaries are skipped
 - any text given with --forbid;
 - the DNS resolver the network fixtures used to name;
 - a path under C:\\Users other than C:\\Users\\Test (and Windows' own Public, Default and All Users);
-- an e-mail address other than a GitHub noreply address;
+- an e-mail address other than a GitHub noreply address or an address at a name reserved for
+  documentation and tests (example.com, example.net, example.org and the .example, .test,
+  .invalid and .localhost names of RFC 2606);
 - a MAC address outside the documentation range 00-00-5E-00-53-00 to 00-00-5E-00-53-FF.
 
 Every value is read at run time and kept in memory: neither this script nor its output contains
@@ -29,6 +32,11 @@ and UTF-16 text.
 Run it from the repository with the development environment's Python:
 
     .venv\\Scripts\\python.exe scripts\\check_public.py [--forbid TEXT ...]
+
+`--generic-only` applies only the rules that need nothing of the PC that runs the check (the old
+fixture resolver, paths under C:\\Users, e-mail addresses, MAC addresses and any --forbid text):
+the continuous integration runs it on pull requests, on a build server whose identifiers say
+nothing about the repository.
 
 Exit code 0: nothing found; 1: something found; 2: the check could not read an identifier
 source or a file, so it is incomplete.
@@ -93,6 +101,8 @@ HEX_SOURCE = 16
 HEX_RUN = 12
 # Sources whose values are hardware names rather than identifiers.
 HARDWARE_SOURCES = ("hardware names", "monitor names")
+# Loopback addresses (127.0.0.0/8) are every PC's, not this one's.
+IPV4_LOOPBACK = "127."
 DIGIT = re.compile(r"\d")
 
 # Windows' own profile folders under C:\Users, and the fixture account.
@@ -105,6 +115,9 @@ USER_PATH = re.compile(
 )
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
 NOREPLY_DOMAIN = "users.noreply.github.com"
+# RFC 2606: names reserved for documentation and tests, such as the fixtures of URL checks.
+DOCUMENTATION_DOMAINS = ("example.com", "example.net", "example.org")
+DOCUMENTATION_SUFFIXES = (".example", ".test", ".invalid", ".localhost")
 HEX_PAIR = "[0-9A-Fa-f]{2}"
 MAC = re.compile(
     r"(?<![0-9A-Fa-f:-])" + HEX_PAIR + r"([-:])(?:" + HEX_PAIR + r"\1){4}" + HEX_PAIR + r"(?![0-9A-Fa-f:-])"
@@ -171,6 +184,9 @@ Read-Values 'MAC addresses' {
 }
 Read-Values 'IPv6 addresses' {
     Get-NetIPAddress -AddressFamily IPv6 | ForEach-Object { $_.IPAddress }
+}
+Read-Values 'IPv4 addresses' {
+    Get-NetIPAddress -AddressFamily IPv4 | ForEach-Object { $_.IPAddress }
 }
 $found | ConvertTo-Json -Compress
 """
@@ -318,6 +334,7 @@ def machine_needles() -> tuple[list[Needle], set[str], list[str]]:
     sources that could not be read, by name."""
     values: list[str] = []
     names: list[str] = []
+    ipv4: set[str] = set()
     failed: list[str] = []
     guid = machine_guid()
     if guid is None:
@@ -339,6 +356,8 @@ def machine_needles() -> tuple[list[Needle], set[str], list[str]]:
                     values.extend(mac_spellings(mac))
         elif name == "IPv6 addresses":
             values.extend(a.split("%", 1)[0] for a in items if a.split("%", 1)[0] not in ("::1", "::"))
+        elif name == "IPv4 addresses":
+            ipv4.update(a.strip() for a in items if usable(a) and not a.strip().startswith(IPV4_LOOPBACK))
         elif name in HARDWARE_SOURCES:
             names.extend(items)
         else:
@@ -350,6 +369,8 @@ def machine_needles() -> tuple[list[Needle], set[str], list[str]]:
     needles += [
         Needle("hardware name", n, whole_word=True) for n in sorted(hardware - set(unique), key=str.lower)
     ]
+    # Whole addresses: a short address of this PC is often the start of a longer fixture address.
+    needles += [Needle("IPv4 address of this PC", a, whole_word=True) for a in sorted(ipv4)]
     return needles, hex_runs(unique), failed
 
 
@@ -387,6 +408,15 @@ def decode_text(data: bytes) -> str | None:
     return data.decode("utf-8", errors="replace")
 
 
+def documentation_domain(domain: str) -> bool:
+    """True for a name reserved for documentation and tests (RFC 2606), or one under it."""
+    return (
+        domain in DOCUMENTATION_DOMAINS
+        or domain.endswith(tuple("." + name for name in DOCUMENTATION_DOMAINS))
+        or domain.endswith(DOCUMENTATION_SUFFIXES)
+    )
+
+
 def line_rules(line: str) -> Iterator[str]:
     """The generic rules a line breaks."""
     if OLD_RESOLVER.search(line):
@@ -396,7 +426,8 @@ def line_rules(line: str) -> Iterator[str]:
         if name and name not in ALLOWED_PROFILES and not name.startswith(PLACEHOLDER_START):
             yield "path under C:\\Users other than Test"
     for match in EMAIL.finditer(line):
-        if match.group(0).lower().rsplit("@", 1)[1] != NOREPLY_DOMAIN:
+        domain = match.group(0).lower().rsplit("@", 1)[1]
+        if domain != NOREPLY_DOMAIN and not documentation_domain(domain):
             yield "e-mail address"
     for match in MAC.finditer(line):
         mac = match.group(0).upper().replace(":", "-")
@@ -444,17 +475,29 @@ def main(argv: list[str] | None = None) -> int:
         help="also fail on this text (case ignored); may be given several times",
     )
     parser.add_argument("--root", type=Path, default=ROOT, help="folder to check (default: the repository)")
+    parser.add_argument(
+        "--generic-only",
+        action="store_true",
+        help="apply only the rules that read nothing of this PC (as on a build server)",
+    )
     args = parser.parse_args(argv)
-    if sys.platform != "win32":
-        print("check_public.py reads this PC's identifiers from Windows; run it on Windows.", file=sys.stderr)
-        return 2
-
-    env_needles, missing = environment_needles(dict(os.environ))
-    pc_needles, runs, failed = machine_needles()
+    env_needles: list[Needle] = []
+    pc_needles: list[Needle] = []
+    runs: set[str] = set()
+    problems: list[str] = []
+    if not args.generic_only:
+        if sys.platform != "win32":
+            print(
+                "check_public.py reads this PC's identifiers from Windows; run it on Windows.",
+                file=sys.stderr,
+            )
+            return 2
+        env_needles, missing = environment_needles(dict(os.environ))
+        pc_needles, runs, failed = machine_needles()
+        problems += [f"environment variable {name} is not set" for name in missing]
+        problems += [f"could not read {source}" for source in failed]
     needles = env_needles + pc_needles + forbidden_needles(args.forbid)
     patterns = [needle.pattern() for needle in needles]
-    problems = [f"environment variable {name} is not set" for name in missing]
-    problems += [f"could not read {source}" for source in failed]
 
     root = args.root.resolve()
     hits: list[Hit] = []

@@ -2,12 +2,15 @@
 Update search and the boot history.
 
 Mixed into `FakeEngine`, which calls `_init_health` from its constructor. Nothing is read
-from the system. The checkup lists all 24 checks in the engine's order with generic texts:
+from the system. The checkup lists all 25 checks in the engine's order with generic texts:
 by default "File name extensions" (low, with the tweak fix) and "Remote Assistance" (low,
-with a Windows tool fix) need attention, Remote Desktop is not applicable, drive encryption
-is unknown without administrator rights (with the elevate fix) and "Drive C: is not
-encrypted" (medium) with them, "Waiting updates" follows the fake Windows Update search and
-every other check passed. The score is computed with a copy of the engine's penalty table.
+with the tweak fix "Turn off Remote Assistance" and a Windows tool fix) need attention,
+Remote Desktop is not applicable, drive encryption is unknown without administrator rights
+(with the elevate fix) and "Drive C: is not encrypted" (medium) with them, "Waiting updates"
+follows the fake Windows Update search, "Secure Boot certificates" says the 2023
+certificates are installed (with the Device security fix) and every other check passed. The
+score is computed with a copy of the engine's penalty table. `health_microsoft_links` lists
+the Microsoft pages a `link` fix may open, as the engine does.
 
 The Windows Update search never ends on its own: `update_scan_finish(updates, error)` ends it
 the way the engine's search thread would.
@@ -59,6 +62,7 @@ CHECKS: tuple[tuple[str, str, str, str], ...] = (
     ("update_restart", "updates", "Restart for updates", "medium"),
     ("encryption", "device", "Drive encryption", "high"),
     ("secure_boot", "device", "Secure Boot", "high"),
+    ("secure_boot_certificates", "device", "Secure Boot certificates", "medium"),
     ("tpm", "device", "TPM", "medium"),
     ("memory_integrity", "device", "Memory integrity", "medium"),
     ("uac", "accounts", "User Account Control", "critical"),
@@ -74,6 +78,17 @@ PER_USER = ("edge_smartscreen", "file_extensions")
 # Points an attention finding takes off the score (the engine's table).
 PENALTY = {"critical": 40, "high": 20, "medium": 8, "low": 3, "info": 0}
 SEVERITY_ORDER = ("info", "low", "medium", "high", "critical")
+# The Microsoft pages a `link` fix may open, in the engine's order.
+MICROSOFT_LINKS = (
+    "https://aka.ms/getsecureboot",
+    "https://support.microsoft.com/topic/e01cc486-8721-457f-9bc7-5cb801c1759e",
+    "https://support.microsoft.com/topic/9ecc3ba4-fb50-4bd3-9e9b-f16b35b8fb68",
+    "https://support.microsoft.com/topic/5d1bf6b4-7972-455a-a421-0184f1e1ed7d",
+    "https://support.microsoft.com/topic/37e47cf8-608b-4a87-8175-bdead630eb69",
+    "https://aka.ms/myrecoverykey",
+)
+DEVICE_SECURITY_PAGE = "windowsdefender://devicesecurity/"
+REMOTE_ASSISTANCE_TWEAK = "security.remote_assistance"
 
 DEFAULT_SLOW: tuple[tuple[Any, ...], ...] = (
     ("app", "Discord.exe", "Discord", "C:\\Apps\\Discord.exe", ("user_run:Discord",)),
@@ -113,6 +128,15 @@ def tool_fix(label: str, tool: str, requires_admin: bool, note: str | None = Non
         "note": note,
         "action": {"kind": "windows_tool", "tool": tool, "requires_admin": requires_admin},
     }
+
+
+def link_fix(label: str, url: str) -> dict[str, Any]:
+    """A fix that opens a Microsoft web page in the browser."""
+    return {"label": label, "note": None, "action": {"kind": "link", "url": url}}
+
+
+def tweak_fix(label: str, tweak_id: str) -> dict[str, Any]:
+    return {"label": label, "note": None, "action": {"kind": "tweak", "id": tweak_id}}
 
 
 def check(check_id: str, state: str, summary: str, severity: str | None = None) -> dict[str, Any]:
@@ -238,16 +262,16 @@ class FakeHealth:
                 item = self._pending_check(scan)
             elif check_id == "file_extensions":
                 item = check(check_id, "attention", "Hidden", "low")
-                item["fixes"] = [
-                    {
-                        "label": "Show file extensions",
-                        "note": None,
-                        "action": {"kind": "tweak", "id": "interface.file_extensions"},
-                    }
-                ]
+                item["fixes"] = [tweak_fix("Show file extensions", "interface.file_extensions")]
             elif check_id == "remote_assistance":
                 item = check(check_id, "attention", "Invitations are allowed", "low")
-                item["fixes"] = [tool_fix("Open Remote settings", "remote_settings", True)]
+                item["fixes"] = [
+                    tweak_fix("Turn off Remote Assistance", REMOTE_ASSISTANCE_TWEAK),
+                    tool_fix("Open Remote settings", "remote_settings", True),
+                ]
+            elif check_id == "secure_boot_certificates":
+                item = check(check_id, "good", "The 2023 certificates are installed")
+                item["fixes"] = [uri_fix("Open Device security", DEVICE_SECURITY_PAGE)]
             elif check_id == "remote_desktop":
                 item = check(check_id, "not_applicable", "Not available on Windows 11 Home")
             elif check_id == "encryption":
@@ -309,6 +333,10 @@ class FakeHealth:
             "notes": notes,
             "errors": [],
         }
+
+    def health_microsoft_links(self) -> list[str]:
+        self._record_quick("health_microsoft_links")
+        return list(MICROSOFT_LINKS)
 
     def health_update_scan_start(self, online: bool = False) -> dict[str, Any]:
         self._record_quick("health_update_scan_start", online)
@@ -523,10 +551,13 @@ class FakeHealth:
 
 __all__ = [
     "CHECKS",
+    "MICROSOFT_LINKS",
     "PENALTY",
     "SEVERITY_ORDER",
     "FakeHealth",
     "check",
     "idle_update_scan",
+    "link_fix",
     "score_of",
+    "tweak_fix",
 ]

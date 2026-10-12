@@ -1,16 +1,22 @@
 """Takes the README screenshots in docs/screenshots.
 
 The real window runs with the in-memory engine of the UI tests (`ui/tests/fake_engine.py`) and
-the real telemetry DLL. The tweak catalog, the cleanup locations and the starter profiles are read
-from the engine's Rust sources, so those sections show Cairn's own texts; everything else comes
-from the tests' generic fixtures (TEST-PC, Contoso, Fabrikam, C:\\Users\\Test). No engine reads or
-changes anything on this PC. The process helpers of `optimizer.system` (relaunching, bringing a
-window to the front, message boxes, File Explorer, folders, URIs and file dialogs) and the
-clipboard are replaced by stubs that fail the run when reached. As a second layer, every engine
-result passes through a scrubber that replaces this PC's user and computer names, MAC addresses
-and public IPv4 addresses; the Dashboard's process table lists only Windows' own processes; and
-every text the window shows is checked for those identifiers before a picture is taken. The
-demo's times are wall-clock times, so the pictures show them unchanged in every time zone.
+the real telemetry DLL. The tweak catalog (with each tweak's topic, Windows range, requirement and
+retirement), the cleanup locations, the starter profiles, the built-in app list and the texts of
+the Secure Boot certificates check are read from the engine's Rust sources, so those sections show
+Cairn's own texts; everything else comes from the tests' generic fixtures (TEST-PC, Contoso,
+Fabrikam, C:\\Users\\Test). The demo PC runs the Windows 11 Home of the System section's fixture,
+without Recall and without an Office that honours policies; after its last scan, a privacy
+switch is changed back in Settings and a startup app turned on again, so two recorded changes no
+longer hold. Optimize shows a search, Updates its Install apps view and History, taken last, its
+Changed view. No engine reads or changes anything on this PC.
+The process helpers of `optimizer.system` (relaunching, bringing a window to the front, message
+boxes, File Explorer, folders, URIs and file dialogs) and the clipboard are replaced by stubs
+that fail the run when reached. As a second layer, every engine result passes through a scrubber
+that replaces this PC's user and computer names, MAC addresses and public IPv4 addresses; the
+Dashboard's process table lists only Windows' own processes; and every text the window shows is
+checked for those identifiers before a picture is taken. The demo's times are wall-clock times,
+so the pictures show them unchanged in every time zone.
 
 The window runs on a separate desktop that is never shown, so nothing appears on the screen or
 takes the keyboard focus, and each picture is the window's own drawing of itself (PrintWindow).
@@ -28,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import copy
 import ctypes
 import gc
 import ipaddress
@@ -73,6 +80,8 @@ from optimizer.bridge.telemetry import TEL_MAX_TOP_PROCESSES, Telemetry  # noqa:
 from optimizer.features import system_info  # noqa: E402
 from optimizer.widgets import monitor  # noqa: E402
 from optimizer.widgets.dialogs import MessageDialog  # noqa: E402
+from optimizer.widgets.history import VIEW_CHANGED, empty_filter  # noqa: E402
+from optimizer.widgets.updates import VIEWS  # noqa: E402
 from tests import (  # noqa: E402
     fake_health,
     fake_maintenance,
@@ -81,7 +90,7 @@ from tests import (  # noqa: E402
     fake_storage,
     fake_sysinfo,
 )
-from tests.fake_engine import FakeEngine  # noqa: E402
+from tests.fake_engine import WINDOWS, FakeEngine  # noqa: E402
 
 WIDTH, HEIGHT = 1440, 900
 PLACE = "+240+60"
@@ -245,24 +254,42 @@ class Rust:
         return calls
 
     def string_constants(self) -> dict[str, str]:
-        """Every `const NAME: &str = "…";` of the file."""
+        """Every `const NAME: &str = "…";` of the file whose value is one string literal (a
+        `concat!` is left out)."""
         constants = {}
         for match in re.finditer(r"\bconst\s+(\w+)\s*:\s*&(?:'static\s+)?str\s*=", self.masked):
             end = self.masked.index(";", match.end())
-            constants[match.group(1)] = rust_string(self.text[match.end() : end])
+            value = self.text[match.end() : end]
+            if _RUST_STRING.fullmatch(value.strip()):
+                constants[match.group(1)] = rust_string(value)
         return constants
+
+
+@dataclass(frozen=True)
+class WindowsRange:
+    """A tweak's Windows range: its build floors as (number, revision), the newest servicing
+    family that uses it (None: no limit) and its editions as serialized ("all",
+    "pro_or_higher", "enterprise_or_education")."""
+
+    floors: tuple[tuple[int, int], ...] = ()
+    through: int | None = None
+    editions: str = "all"
 
 
 @dataclass(frozen=True)
 class CatalogTweak:
     id: str
     category: str
+    topic: str
     title: str
     description: str
     risk: str
     default_on: bool
     restart: str
     requires: str | None
+    windows: WindowsRange
+    retired: str | None
+    undo_limit: str | None
     # (hive, key path, value name, the value the tweak writes as source text, "" for text data)
     registry: tuple[tuple[str, str, str, str], ...]
     services: tuple[str, ...]
@@ -298,12 +325,28 @@ class Starter:
 
 
 @dataclass(frozen=True)
+class WindowsTexts:
+    """What `debloat/requirements.rs` knows about Windows versions: the version label of each
+    build number, the servicing family of each enablement build and the texts of an unmet
+    Windows range by constant name."""
+
+    versions: dict[int, str]
+    families: dict[int, int]
+    texts: dict[str, str]
+
+
+@dataclass(frozen=True)
 class Sources:
     tweaks: tuple[CatalogTweak, ...]
     # Requirement serde name -> why a tweak with it is not offered.
     requirements: dict[str, str]
+    windows: WindowsTexts
     cleanup: tuple[CleanupLocation, ...]
     starters: tuple[Starter, ...]
+    # The built-in install list: {"id", "name", "category", "source"} as the engine lists it.
+    apps: tuple[dict[str, str], ...]
+    # Fields of the Secure Boot certificates check while Windows waits for Microsoft's data.
+    certificates: dict[str, Any]
 
 
 def _hive(source: str) -> str:
@@ -316,6 +359,31 @@ def _hive(source: str) -> str:
 def _text_or_constant(source: str, constants: dict[str, str]) -> str:
     source = source.strip()
     return constants[source] if re.fullmatch(r"\w+", source) else rust_string(source)
+
+
+def _optional_text(source: str, constants: dict[str, str]) -> str | None:
+    """The text of an `Option<&str>` field: None, or the literal or constant in `Some(…)`."""
+    source = source.strip()
+    if source == "None":
+        return None
+    match = re.fullmatch(r"Some\((.*)\)", source, re.DOTALL)
+    if match is None:
+        raise ValueError(f"not an optional text: {source[:60]!r}")
+    return _text_or_constant(match.group(1).strip().removesuffix(",").strip(), constants)
+
+
+def _windows_range(field: Rust) -> WindowsRange:
+    """A tweak's `windows` field: `ANY_WINDOWS` or a `WindowsRange { … }` literal."""
+    if field.text.strip() == "ANY_WINDOWS":
+        return WindowsRange()
+    [body] = field.literals("WindowsRange")
+    through = body.word("through")
+    floors = re.findall(r"Build::new\(\s*(\d+)\s*,\s*(\d+)\s*\)", body.field("from").text)
+    return WindowsRange(
+        floors=tuple((int(number), int(revision)) for number, revision in floors),
+        through=None if through == "None" else int(through.removeprefix("Some(").removesuffix(")")),
+        editions=snake_variant(body.word("editions")),
+    )
 
 
 def read_catalog() -> tuple[tuple[CatalogTweak, ...], dict[str, str]]:
@@ -341,12 +409,16 @@ def read_catalog() -> tuple[tuple[CatalogTweak, ...], dict[str, str]]:
             CatalogTweak(
                 id=body.string("id"),
                 category=snake_variant(body.word("category")),
+                topic=snake_variant(body.word("topic")),
                 title=body.string("title"),
                 description=body.string("description"),
                 risk=snake_variant(body.word("risk")),
                 default_on=body.word("default_on") == "true",
                 restart=snake_variant(body.word("restart")),
                 requires=None if requires == "None" else snake_variant(requires.removesuffix(")")),
+                windows=_windows_range(body.field("windows")),
+                retired=_optional_text(body.field("retired").text, constants),
+                undo_limit=_optional_text(body.field("undo_limit").text, constants),
                 registry=tuple(registry),
                 services=tuple(rust_string(args[0]) for args in actions.calls("service")),
                 tasks=tuple(_text_or_constant(args[0], constants) for args in actions.calls("disable_task")),
@@ -394,14 +466,97 @@ def read_starters() -> tuple[Starter, ...]:
     )
 
 
+def read_windows_texts() -> WindowsTexts:
+    """The version tables and the unmet-range texts of `debloat/requirements.rs`."""
+    source = Rust.read("debloat", "requirements.rs")
+    labels = re.findall(r"\(\s*(\d+)\s*,\s*\"([^\"]+)\"\s*\)", source.array("VERSIONS").text)
+    bases = re.findall(r"\(\s*(\d+)\s*,\s*(\d+)\s*\)", source.array("SERVICING_FAMILIES").text)
+    return WindowsTexts(
+        {int(number): label for number, label in labels},
+        {int(build): int(family) for build, family in bases},
+        source.string_constants(),
+    )
+
+
+def read_apps() -> tuple[dict[str, str], ...]:
+    """The built-in install list (`DEFAULT_APPS` of `updates/apps.rs`), in its order."""
+    array = Rust.read("updates", "apps.rs").array("DEFAULT_APPS")
+    apps = []
+    # Each entry is `("id", "name", AppCategory::X)`; its two literals are blank in the masked text.
+    for match in re.finditer(r"\(\s*,\s*,\s*AppCategory::(\w+)\s*,?\s*\)", array.masked):
+        literals = _RUST_STRING.finditer(array.text[match.start() : match.end()])
+        app_id, name = (rust_string(literal.group(0)) for literal in literals)
+        category = snake_variant(match.group(1))
+        apps.append({"id": app_id, "name": name, "category": category, "source": "winget"})
+    if len(apps) != len(re.findall(r"\bAppCategory::", array.masked)):
+        raise ValueError("DEFAULT_APPS of updates/apps.rs has an entry this script cannot read")
+    return tuple(apps)
+
+
+def read_certificates() -> dict[str, Any]:
+    """The Secure Boot certificates check of `health/certificates.rs` while Windows Update waits
+    for Microsoft's data on PCs like this one (`Verdict::WaitingForData`): its outcome, summary,
+    detail and fix buttons, without facts (no update event was logged yet)."""
+    source = Rust.read("health", "certificates.rs")
+    texts = source.string_constants()
+    targets = {
+        **Rust.read("health", "checkup.rs").string_constants(),
+        **Rust.read("health", "updates.rs").string_constants(),
+    }
+    # Fix buttons by constant name: (kind, label, the constant naming the page or URL).
+    specs = {
+        name: (kind, rust_string(label), target)
+        for name, kind, label, target in re.findall(
+            r"\bconst\s+(\w+)\s*:\s*FixSpec\s*=\s*FixSpec::(Page|Link)\(\s*(\"(?:[^\"\\]|\\.)*\")\s*,\s*(\w+)\s*\)",
+            source.text,
+        )
+    }
+    shown = re.search(
+        r"Verdict::WaitingForData\s*=>\s*Shown::new\(\s*attention\((\w+)\)\s*,\s*(\w+)\s*,"
+        r"\s*&\[([^\]]*)\]\s*,\s*&\[([^\]]*)\]",
+        source.function("shown").text,
+    )
+    if shown is None:
+        raise ValueError("the waiting verdict of health/certificates.rs changed its layout")
+    severity, summary, sentences, fixes = shown.groups()
+    buttons = []
+    for name in re.findall(r"\w+", fixes):
+        kind, label, target = specs[name]
+        make = fake_health.link_fix if kind == "Link" else fake_health.uri_fix
+        buttons.append(make(label, targets[target]))
+    return {
+        "state": "attention",
+        "severity": severity.lower(),
+        "summary": texts[summary],
+        "detail": " ".join([texts["DETAIL"], *(texts[name] for name in re.findall(r"\w+", sentences))]),
+        "facts": [],
+        "fixes": buttons,
+    }
+
+
 def read_sources() -> Sources:
     try:
         tweaks, requirements = read_catalog()
-        sources = Sources(tweaks, requirements, read_cleanup(), read_starters())
+        sources = Sources(
+            tweaks,
+            requirements,
+            read_windows_texts(),
+            read_cleanup(),
+            read_starters(),
+            read_apps(),
+            read_certificates(),
+        )
     except (OSError, ValueError, KeyError) as exc:
         raise ShotError(f"could not read the engine's sources: {exc}") from exc
-    if len(sources.cleanup) < 8 or len(sources.starters) < 3 or "office" not in sources.requirements:
-        raise ShotError("the cleanup locations, starter profiles or requirements changed their layout")
+    range_texts = {"NO_LONGER_USED", "NEEDS_NEWER_BUILD", "NEEDS_PRO", "NEEDS_ENTERPRISE"}
+    if (
+        len(sources.cleanup) < 8
+        or len(sources.starters) < 3
+        or len(sources.apps) < 100
+        or not set(DEMO_UNMET) <= set(sources.requirements)
+        or not range_texts <= set(sources.windows.texts)
+    ):
+        raise ShotError("the cleanup locations, starters, app list, requirements or Windows texts changed")
     return sources
 
 
@@ -426,6 +581,20 @@ WHEN = {
 }
 # Tweaks of the Gaming category that the demo journal holds besides Privacy Mode.
 GAMING_APPLIED = ("gaming.game_mode", "gaming.background_recording")
+# Requirements the demo PC does not meet: it has no Recall (it is not a Copilot+ PC), and its
+# Office is an edition that ignores Office policies.
+DEMO_UNMET = ("recall_component", "office_business")
+# What Optimize's search box holds in its picture.
+OPTIMIZE_QUERY = "microsoft edge"
+# The changes History's Changed view lists: a recommended tweak's switch was turned back on in
+# Settings, and a startup app Cairn turned off was turned on again in Task Manager.
+CHANGED_TWEAK = "privacy.start_suggestions"
+CHANGED_STARTUP = "user_run:Discord"
+# Install apps: the apps of the built-in list that the demo PC has, the apps ticked (in any
+# category) and the categories its picture shows opened.
+INSTALLED_APPS = ("Mozilla.Firefox",)
+INSTALL_TICKED = ("Brave.Brave", "OBSProject.OBSStudio")
+INSTALL_OPENED = ("browsers",)
 # Rows of History's activity log, oldest first: (time, operation, target, outcome).
 ACTIVITY = (
     ("2026-09-27 19:02", "set_service_start_type", "service DiagTrack", "applied"),
@@ -572,24 +741,114 @@ APP_UPGRADES = (
 )
 
 
+def _windows_text(texts: WindowsTexts, name: str, **values: str) -> str:
+    text = texts.texts[name]
+    for key, value in values.items():
+        text = text.replace("{" + key + "}", value)
+    return text
+
+
+def _floors_text(floors: tuple[tuple[int, int], ...], versions: dict[int, str]) -> str:
+    """A range's floors in words, as `floors_text` of `debloat/catalog.rs` words them."""
+
+    def named(number: int, revision: int, inner: str = "") -> str:
+        label = versions.get(number)
+        build = f"build {number}.{revision}{inner}"
+        return f"{label} ({build})" if label else build
+
+    if len(floors) == 1:
+        return f"{named(*floors[0])} or later"
+    parts = [named(number, revision, " or later") for number, revision in floors]
+    return f"{', '.join(parts[:-1])} or {parts[-1]}"
+
+
+def demo_unmet(tweak: CatalogTweak, sources: Sources, windows: dict[str, Any]) -> tuple[str, str] | None:
+    """(kind, text) of why the demo PC (Windows as `windows` describes it, without the
+    requirements in `DEMO_UNMET`) cannot use `tweak`, in the engine's order (retired, the
+    Windows range, the requirement) and words; None when it can."""
+    if tweak.retired is not None:
+        return "retired", tweak.retired
+    texts = sources.windows
+    number, revision = windows["build"]["number"], windows["build"]["revision"]
+    family = windows["family"]
+    pc = f"{windows['name']} {windows['version']} (build {number}.{revision})"
+    span = tweak.windows
+    if span.through is not None and family > span.through:
+        newer = [b for b in sorted(texts.versions) if b > span.through and texts.families.get(b, b) == b]
+        upcoming = texts.versions[newer[0]] if newer else f"build {family}"
+        return "windows_version", _windows_text(texts, "NO_LONGER_USED", next=upcoming, pc=pc)
+    if span.floors:
+        same = [(n, r) for n, r in span.floors if texts.families.get(n, n) == family]
+        if same:
+            met = number >= same[0][0] and revision >= same[0][1]
+        else:
+            met = all(texts.families.get(n, n) < family for n, _ in span.floors)
+        if not met:
+            floors = _floors_text(span.floors, texts.versions)
+            return "windows_version", _windows_text(texts, "NEEDS_NEWER_BUILD", floors=floors, pc=pc)
+    edition = windows["edition"]
+    if span.editions == "pro_or_higher" and edition == "home":
+        return "edition", _windows_text(texts, "NEEDS_PRO", name=windows["name"])
+    if span.editions == "enterprise_or_education" and edition in ("home", "pro"):
+        return "edition", _windows_text(texts, "NEEDS_ENTERPRISE", name=windows["name"])
+    if tweak.requires in DEMO_UNMET:
+        return "not_on_this_pc", sources.requirements[tweak.requires]
+    return None
+
+
 class DemoEngine(FakeEngine):
-    """The tests' FakeEngine with Cairn's tweak catalog, cleanup locations and starter profiles,
-    and a journal that holds a few days of changes."""
+    """The tests' FakeEngine with Cairn's tweak catalog, cleanup locations, starter profiles and
+    install list, the tweaks the demo PC cannot use, and a journal that holds a few days of
+    changes."""
 
     def __init__(self, sources: Sources, **options: Any) -> None:
-        missing = {t.id: sources.requirements[t.requires] for t in sources.tweaks if t.requires == "office"}
-        super().__init__(elevated=True, missing=missing, **options)
+        super().__init__(elevated=True, **options)
         self.sources = sources
         self.catalog_tweaks = {t.id: t for t in sources.tweaks}
         self.tweaks = [(t.id, t.category, t.default_on) for t in sources.tweaks]
+        self.topics = {t.id: t.topic for t in sources.tweaks}
+        self.undo_limits = {t.id: t.undo_limit for t in sources.tweaks if t.undo_limit is not None}
+        self.requires = {t.id: t.requires for t in sources.tweaks if t.requires is not None}
+        # The scans report the Windows the System section shows.
+        os_info = FakeEngine.sysinfo_snapshot(self)["info"]["os"]
+        number = os_info["build"]
+        self.windows = {
+            **WINDOWS,
+            "build": {"number": number, "revision": os_info["revision"]},
+            "family": sources.windows.families.get(number, number),
+            "version": os_info["display_version"],
+            "edition_id": os_info["edition_id"],
+            "name": os_info["product_name"],
+        }
+        self.unavailable = {
+            t.id: unmet for t in sources.tweaks if (unmet := demo_unmet(t, sources, self.windows)) is not None
+        }
         for adapter in self.network_adapters:
             adapter.update(ADAPTER_NAMES.get(adapter["id"], {}))
 
     def version(self) -> str:
         return __version__
 
+    def updates_app_list(self) -> dict[str, Any]:
+        """Cairn's built-in install list, as the engine lists it for an account without a list of
+        its own."""
+        listing = super().updates_app_list()
+        return {**listing, "apps": [dict(a) for a in self.sources.apps], "custom": False, "default_ids": []}
+
+    def _drift_entry(self, item_id: str, mismatch: dict[str, Any]) -> dict[str, Any]:
+        """The drift entry of a catalog tweak, selecting the record of its real target."""
+        entry = super()._drift_entry(item_id, mismatch)
+        hive, _, rest = str(mismatch["target"]).partition("\\")
+        key_path, _, value_name = rest.rpartition("\\")
+        entry["filter"] = {
+            **empty_filter(),
+            "registry": [{"hive": hive, "key_path": key_path, "value_name": value_name}],
+        }
+        entry["recorded_at"] = utc(WHEN["privacy"])
+        return entry
+
     def scan(self) -> dict[str, Any]:
-        return {**super().scan(), "duration_ms": 384}
+        return {**super().scan(), "duration_ms": 384, "windows": copy.deepcopy(self.windows)}
 
     def _items(self) -> list[dict[str, Any]]:
         items = super()._items()
@@ -790,10 +1049,10 @@ def build_engine(sources: Sources) -> DemoEngine:
     run_started, run_ended = (utc(t) for t in MAINTENANCE_RUN_AT)
     engine = DemoEngine(
         sources,
-        health_check_overrides=SECURITY_CHECKS,
+        health_check_overrides={**SECURITY_CHECKS, "secure_boot_certificates": sources.certificates},
         storage_history=[{**fake_storage.SPEED_RESULT, "started_at": started, "finished_at": finished}],
         upgrades=list(APP_UPGRADES),
-        installed=[u["id"] for u in APP_UPGRADES],
+        installed=[u["id"] for u in APP_UPGRADES] + list(INSTALLED_APPS),
         edition="Core",
         now=utc(APPS_CHECKED_AT),
         maintenance_task=dict(fake_maintenance.DEFAULTS),
@@ -805,13 +1064,65 @@ def build_engine(sources: Sources) -> DemoEngine:
     privacy = [
         t.id
         for t in sources.tweaks
-        if t.category == "privacy" and t.default_on and t.id not in engine.missing
+        if t.category == "privacy" and t.default_on and t.id not in engine.unavailable
     ]
     engine.applied.update(privacy + list(GAMING_APPLIED))
-    engine.startup_set_enabled("user_run:Discord", False)
+    engine.startup_set_enabled(CHANGED_STARTUP, False)
     engine.network_set_dns(fake_network.WIFI, "cloudflare")
     engine.updates_wu_set("active_hours", [8, 23])
     return engine
+
+
+def _dword_text(value: int) -> str:
+    """A DWORD as the engine's read-backs show it: "0x00000001 (1)"."""
+    return f"0x{value:08X} ({value})"
+
+
+def add_changed_records(engine: DemoEngine) -> None:
+    """Changes made outside Cairn after the demo's last scan, so its records no longer hold what
+    Cairn set: `CHANGED_TWEAK`'s switch is back at its value from before Cairn's change, and the
+    startup app `CHANGED_STARTUP` that Cairn turned off is on again."""
+    tweak = engine.catalog_tweaks.get(CHANGED_TWEAK)
+    if (
+        tweak is None
+        or CHANGED_TWEAK not in engine.applied
+        or len(tweak.registry) != 1
+        or tweak.registry[0][3] not in ("0", "1")
+        or tweak.registry[0][1].lower().startswith("software\\policies")
+    ):
+        raise ShotError(f"{CHANGED_TWEAK} is no longer a recommended Settings switch of the demo journal")
+    hive, key_path, value_name, written = tweak.registry[0]
+    before = 1 - int(written)
+    engine.drifted[CHANGED_TWEAK] = [
+        {
+            "target": f"{hive}\\{key_path}\\{value_name}",
+            "label": value_name,
+            "expected": _dword_text(int(written)),
+            "found": _dword_text(before),
+            "original": _dword_text(before),
+            "back_to_original": True,
+        }
+    ]
+    hive, key_path, value_name = engine._startup_record(CHANGED_STARTUP)
+    engine.drift_entries.append(
+        {
+            "item": None,
+            "kind": "registry",
+            "mismatch": {
+                "target": f"{hive}\\{key_path}\\{value_name}",
+                "label": value_name,
+                "expected": "off",
+                "found": "on",
+                "original": "not set",
+                "back_to_original": True,
+            },
+            "filter": {
+                **empty_filter(),
+                "registry": [{"hive": hive, "key_path": key_path, "value_name": value_name}],
+            },
+            "recorded_at": utc(WHEN["startup"]),
+        }
+    )
 
 
 # -- the second layer: scrubbing and checking -------------------------------------------------
@@ -1119,6 +1430,10 @@ def prepare_security(app: App, engine: DemoEngine) -> None:
 def prepare_optimize(app: App, engine: DemoEngine) -> None:
     pump(app, 15.0, until=lambda: app._last_scan is not None, what="the scan")
     show(app, "Optimize")
+    app.optimize_list.set_query(OPTIMIZE_QUERY)
+    settle(app)
+    if not app.optimize_list.visible_ids():
+        raise ShotError(f"Optimize: no tweak matches {OPTIMIZE_QUERY!r}")
 
 
 def prepare_cleanup(app: App, engine: DemoEngine) -> None:
@@ -1150,6 +1465,29 @@ def prepare_updates(app: App, engine: DemoEngine) -> None:
     engine.updates_finish_scan(app._updates_job)
     pump(app, 15.0, until=lambda: app._updates_job is None, what="the end of the check")
     settle(app)
+    # Install apps, as a click on the view switch opens it.
+    panel = app.updates_panel
+    panel._switched(VIEWS["install"])
+    install = panel.install
+    pump(app, 15.0, until=lambda: bool(install.apps), what="the install list")
+    settle(app)
+    # Each app is ticked in its opened category, as clicks on the header and the check box do;
+    # then only the categories of `INSTALL_OPENED` stay open.
+    for app_id in INSTALL_TICKED:
+        key = next((k for k, s in install.sections.items() if any(a["id"] == app_id for a in s.apps)), None)
+        if key is None:
+            raise ShotError(f"Updates: {app_id} is not on the install list")
+        if not install.sections[key].expanded:
+            install.toggle_section(key)
+            settle(app)
+        next(tile for tile in install.tiles if tile.app["id"] == app_id).check.toggle()
+        settle(app)
+    for key, section in install.sections.items():
+        if section.expanded != (key in INSTALL_OPENED):
+            install.toggle_section(key)
+            settle(app)
+    if len(install.selected_items()) != len(INSTALL_TICKED):
+        raise ShotError("Updates: the ticked apps are not selected")
 
 
 def prepare_tools(app: App, engine: DemoEngine) -> None:
@@ -1171,9 +1509,15 @@ def prepare_tools(app: App, engine: DemoEngine) -> None:
 
 
 def prepare_history(app: App, engine: DemoEngine) -> None:
+    add_changed_records(engine)
     app.show_section("History")
-    pump(app, 15.0, until=lambda: app.history_panel.row_count > 0, what="the journal")
+    panel = app.history_panel
+    pump(app, 15.0, until=lambda: panel.row_count > 0 and panel.drift_shown, what="the journal")
     settle(app)
+    panel.set_view(VIEW_CHANGED)
+    settle(app)
+    if panel.drift_count != 2 or len(panel.rows) != 2:
+        raise ShotError(f"History: the Changed view lists {len(panel.rows)} changes, not 2")
 
 
 def prepare_profiles(app: App, engine: DemoEngine) -> None:
@@ -1198,7 +1542,8 @@ def prepare_dashboard(app: App, engine: DemoEngine) -> None:
     pump(app, 1.0)
 
 
-# (picture name, section, preparation); the Dashboard comes last, once its charts are full.
+# (picture name, section, preparation); the Dashboard comes once its charts are full, and History
+# last, after the demo's changes outside Cairn (`add_changed_records`).
 SHOTS: tuple[tuple[str, str, Callable[[App, DemoEngine], None]], ...] = (
     ("system", "System", lambda app, _engine: show(app, "System")),
     ("security", "Security", prepare_security),
@@ -1209,9 +1554,9 @@ SHOTS: tuple[tuple[str, str, Callable[[App, DemoEngine], None]], ...] = (
     ("storage", "Storage", prepare_storage),
     ("maintenance", "Maintenance", lambda app, _engine: show(app, "Maintenance")),
     ("tools", "Tools", prepare_tools),
-    ("history", "History", prepare_history),
     ("profiles", "Profiles", prepare_profiles),
     ("dashboard", "Dashboard", prepare_dashboard),
+    ("history", "History", prepare_history),
 )
 
 

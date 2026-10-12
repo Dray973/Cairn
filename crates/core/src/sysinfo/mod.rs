@@ -37,6 +37,7 @@ mod smbios;
 mod storage;
 
 pub use report::{render, Group, Level, ReportSection, Row, Snapshot};
+pub(crate) use smbios::clean_oem;
 
 // ───────────────────────────── Sections ─────────────────────────────
 
@@ -786,7 +787,7 @@ mod tests {
             names,
             [
                 Some("Intel Graphics"),
-                Some("NVIDIA GeForce RTX 5060 Ti"),
+                Some("NVIDIA GeForce RTX 4060 Ti"),
                 None
             ]
         );
