@@ -314,7 +314,8 @@ def test_real_engine_module_scan_is_read_only() -> None:
         pytest.skip(str(exc))
     try:
         future = bridge.scan()
-        _wait(bridge, [future], timeout=30)
+        # A full scan of the real engine takes about 30 s on a 4-processor CI runner.
+        _wait(bridge, [future], timeout=120)
         report = future.result()
         assert {c["category"] for c in report["categories"]} == {
             "privacy",
