@@ -3,11 +3,14 @@
 //! Reads the products registered with Windows Security Center (`IWSCProductList`) and the
 //! overall health of a provider (`WscGetSecurityProviderHealth`). Both only read; the calling
 //! thread must be in a COM apartment (see `win::com`). They fail while the Security Center
-//! service is stopped or disabled.
+//! service is stopped or disabled, and on Windows Server, which has no Security Center.
 
-use windows::core::HRESULT;
-use windows::Win32::Foundation::S_OK;
+use windows::core::{s, w, HRESULT};
+use windows::Win32::Foundation::{FreeLibrary, ERROR_MOD_NOT_FOUND, HMODULE, S_OK};
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+use windows::Win32::System::LibraryLoader::{
+    GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
+};
 use windows::Win32::System::SecurityCenter::{
     IWSCProductList, WSCProductList, WSC_SECURITY_PRODUCT_STATE,
     WSC_SECURITY_PRODUCT_STATE_EXPIRED, WSC_SECURITY_PRODUCT_STATE_OFF,
@@ -21,20 +24,32 @@ pub(crate) use windows::Win32::System::SecurityCenter::{
     WSC_SECURITY_PROVIDER_ANTIVIRUS, WSC_SECURITY_PROVIDER_FIREWALL,
 };
 
+use super::is_win32;
 use crate::{Error, Result};
 
-// wscapi.dll export (wscapi.h). Declared here for its return code: the windows-rs wrapper
-// maps every success code to `Ok(())`, and S_FALSE means the Security Center service is not
-// running, so the out value does not describe the provider.
-#[link(name = "wscapi.dll", kind = "raw-dylib", modifiers = "+verbatim")]
-extern "system" {
-    fn WscGetSecurityProviderHealth(
-        providers: u32,
-        health: *mut WSC_SECURITY_PROVIDER_HEALTH,
-    ) -> HRESULT;
-}
+/// `WscGetSecurityProviderHealth` (wscapi.h). It is called through its address instead of
+/// being imported, because wscapi.dll exists only on client editions of Windows: an import
+/// would keep every program that links this crate from starting on Windows Server. It is
+/// called directly instead of through the windows-rs wrapper for its return code: the wrapper
+/// maps every success code to `Ok(())`, and S_FALSE means the Security Center service is not
+/// running, so the out value does not describe the provider.
+type GetProviderHealth =
+    unsafe extern "system" fn(providers: u32, health: *mut WSC_SECURITY_PROVIDER_HEALTH) -> HRESULT;
 
 const NOT_RUNNING: &str = "Windows Security Center is not running";
+const NOT_AVAILABLE: &str = "Windows Security Center is not part of this edition of Windows";
+
+/// `wscapi.dll`, unloaded on drop.
+struct Library(HMODULE);
+
+impl Drop for Library {
+    fn drop(&mut self) {
+        // SAFETY: the module was loaded by LoadLibraryExW and is released once, here.
+        unsafe {
+            let _ = FreeLibrary(self.0);
+        }
+    }
+}
 
 /// Overall health Security Center reports for one kind of protection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,9 +147,31 @@ fn health_reading(code: HRESULT, health: WSC_SECURITY_PROVIDER_HEALTH) -> Result
 
 /// Overall health of `provider` (for example `WSC_SECURITY_PROVIDER_ANTIVIRUS`).
 pub(crate) fn provider_health(provider: WSC_SECURITY_PROVIDER) -> Result<ProviderHealth> {
+    // SAFETY: a constant, NUL-terminated library name; the search is limited to System32.
+    let module =
+        match unsafe { LoadLibraryExW(w!("wscapi.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32) } {
+            Ok(module) => module,
+            Err(e) if is_win32(&e, ERROR_MOD_NOT_FOUND) => {
+                return Err(Error::Other(NOT_AVAILABLE.into()))
+            }
+            Err(e) => return Err(e.into()),
+        };
+    let library = Library(module);
+    // SAFETY: a valid module handle and a constant, NUL-terminated export name.
+    let export = unsafe { GetProcAddress(library.0, s!("WscGetSecurityProviderHealth")) }
+        .ok_or_else(|| {
+            Error::Other("wscapi.dll does not export WscGetSecurityProviderHealth".into())
+        })?;
+    // SAFETY: the export has the signature wscapi.h declares, which `GetProviderHealth`
+    // repeats, so both function pointer types have the same calling convention and ABI.
+    let get_health = unsafe {
+        std::mem::transmute::<unsafe extern "system" fn() -> isize, GetProviderHealth>(export)
+    };
     let mut health = WSC_SECURITY_PROVIDER_HEALTH::default();
-    // SAFETY: `health` is a valid out pointer for the duration of the call.
-    let code = unsafe { WscGetSecurityProviderHealth(provider.0 as u32, &mut health) };
+    // SAFETY: the export stays loaded while `library` is alive; `health` is a valid out
+    // pointer for the duration of the call.
+    let code = unsafe { get_health(provider.0 as u32, &mut health) };
+    drop(library);
     health_reading(code, health)
 }
 
