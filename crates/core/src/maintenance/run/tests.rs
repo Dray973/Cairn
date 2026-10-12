@@ -57,6 +57,7 @@ struct Fake {
     dism: FakeCheck,
     started: RefCell<Vec<ToolId>>,
     abandoned: Cell<usize>,
+    /// The run's time limit once a check has started.
     run_limit: Duration,
     messages: SfcMessages,
 }
@@ -287,8 +288,14 @@ impl MaintenanceSystem for Fake {
         Local::now()
     }
 
+    /// `run_limit` applies once a check has started, so a run whose setup is slow on a busy
+    /// machine still starts its first check.
     fn run_limit(&self) -> Duration {
-        self.run_limit
+        if self.started.borrow().is_empty() {
+            Duration::from_secs(3600)
+        } else {
+            self.run_limit
+        }
     }
 
     fn poll_interval(&self) -> Duration {

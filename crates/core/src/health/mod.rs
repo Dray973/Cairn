@@ -331,19 +331,16 @@ mod tests {
     #[test]
     fn live_boot_history_reads_or_needs_admin() {
         // Read-only: event log queries; the Diagnostics-Performance log needs administrator
-        // rights, so a standard user gets needs_admin.
+        // rights, so a standard user gets needs_admin. Windows Server has no such log.
         let history = boot_history(5).unwrap();
-        assert!(
-            matches!(
-                history.access,
-                LogAccess::Ok | LogAccess::NeedsAdmin | LogAccess::LogDisabled
-            ),
-            "{:?}",
-            history.access
-        );
-        if !crate::is_elevated() {
-            assert_eq!(history.access, LogAccess::NeedsAdmin);
-            assert!(history.boots.is_empty());
+        match history.access {
+            LogAccess::LogMissing => assert!(history.boots.is_empty()),
+            LogAccess::Ok | LogAccess::NeedsAdmin | LogAccess::LogDisabled => {
+                if !crate::is_elevated() {
+                    assert_eq!(history.access, LogAccess::NeedsAdmin);
+                    assert!(history.boots.is_empty());
+                }
+            }
         }
         assert!(history.boots.len() <= 5);
     }

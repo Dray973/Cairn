@@ -289,10 +289,14 @@ def test_real_module_update_scan_view_is_idle() -> None:
 def test_real_module_boot_history_reads_or_needs_admin() -> None:
     module = _real_module()
     history = module.health_boot_history(limit=5)
-    assert history["access"] in ("ok", "needs_admin", "log_disabled")
     assert len(history["boots"]) <= 5
-    if not module.is_elevated():
-        assert history["access"] == "needs_admin"
+    # Windows Server has no Diagnostics-Performance log.
+    if history["access"] == "log_missing":
+        assert history["boots"] == []
+    else:
+        assert history["access"] in ("ok", "needs_admin", "log_disabled")
+        if not module.is_elevated():
+            assert history["access"] == "needs_admin"
     for limit in (0, -1, 501):
         with pytest.raises(ValueError, match="between 1 and 500"):
             module.health_boot_history(limit=limit)

@@ -15,10 +15,24 @@ use optimizer_core::tools::{
 };
 use optimizer_core::win::console_text::{OutputDecoder, OutputEvent, TextEncoding};
 use optimizer_core::win::paths::system_dir;
+use optimizer_core::win::registry::{read_value, Hive, RegValue};
 use optimizer_core::win::volume::fixed_volumes;
 
 fn system_program(name: &str) -> PathBuf {
     system_dir().unwrap().join(name)
+}
+
+/// Whether this is Windows Server, which lacks some client tools (System Restore among them):
+/// its `InstallationType` is "Server" or "Server Core", where Windows 11 says "Client".
+fn on_windows_server() -> bool {
+    matches!(
+        read_value(
+            Hive::LocalMachine,
+            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion",
+            "InstallationType",
+        ),
+        Ok(Some(RegValue::Sz(kind))) if kind.starts_with("Server")
+    )
 }
 
 fn spec(program: &str, args: &[&str], detach: DetachPolicy) -> CommandSpec {
@@ -176,7 +190,7 @@ fn catalog_programs_exist() {
     }
     for tool in tools::windows_tools() {
         assert!(
-            system.join(tool.program).is_file(),
+            system.join(tool.program).is_file() || on_windows_server(),
             "{} is missing",
             tool.program
         );

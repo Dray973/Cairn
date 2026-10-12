@@ -291,6 +291,20 @@ mod tests {
         );
     }
 
+    /// Whether this is Windows Server: its `InstallationType` is "Server" or "Server Core",
+    /// where Windows 11 says "Client".
+    fn on_windows_server() -> bool {
+        use crate::win::registry::{read_value, Hive, RegValue};
+        matches!(
+            read_value(
+                Hive::LocalMachine,
+                r"SOFTWARE\Microsoft\Windows NT\CurrentVersion",
+                "InstallationType",
+            ),
+            Ok(Some(RegValue::Sz(kind))) if kind.starts_with("Server")
+        )
+    }
+
     #[test]
     fn every_windows_tool_resolves_to_an_existing_system_file() {
         let system = system_dir().unwrap();
@@ -317,7 +331,12 @@ mod tests {
                 "{}",
                 tool.id
             );
-            assert!(program.is_file(), "{} is missing", program.display());
+            // Windows Server lacks some client tools, System Restore among them.
+            assert!(
+                program.is_file() || on_windows_server(),
+                "{} is missing",
+                program.display()
+            );
             let name = program
                 .file_name()
                 .unwrap()

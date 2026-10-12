@@ -87,7 +87,8 @@ jobs:
         env:
           PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
       - name: Tests
-        run: cargo test --workspace --locked
+        # Every test program runs, so one run lists every failure.
+        run: cargo test --workspace --locked --no-fail-fast
         env:
           PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
       - name: Tests of optctl
