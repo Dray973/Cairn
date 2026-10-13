@@ -4,6 +4,6 @@
 # proposes updates.
 
 debugpy                     # VS Code Python debugger backend
-ruff==0.16.8                # lint and format
+ruff==0.17.0                # lint and format
 pytest==9.1.1
 pytest-timeout==2.4.0
