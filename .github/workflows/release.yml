@@ -137,7 +137,7 @@ jobs:
       - name: Upload the programs to sign
         id: unsigned-binaries
         if: env.SIGNING_MODE != 'none'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: unsigned-binaries
           path: build/sign/binaries/
@@ -176,7 +176,7 @@ jobs:
       - name: Upload the setup to sign
         id: unsigned-setup
         if: env.SIGNING_MODE != 'none'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: unsigned-setup
           path: build/dist/Cairn-${{ env.CAIRN_VERSION }}-setup.exe
@@ -234,7 +234,7 @@ jobs:
             build/dist/SHA256SUMS.txt
 
       - name: Symbols and build information
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cairn-${{ env.CAIRN_VERSION }}-symbols
           path: |
@@ -245,7 +245,7 @@ jobs:
           if-no-files-found: error
       - name: Test-signed setup
         if: github.ref_type != 'tag'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cairn-test-signed-${{ github.sha }}
           path: |
