@@ -10,7 +10,7 @@
 customtkinter==6.0.0        # dark-themed Tk widgets
 darkdetect==0.8.0           # follows the system theme (CustomTkinter dependency)
 packaging==26.3             # CustomTkinter dependency
-pillow==12.3.0              # brand renderer, icons and CTkImage
+pillow==13.0.0              # brand renderer, icons and CTkImage
 
 # -- Native bridges ----------------------------------------------------------------------
 # ctypes (stdlib)           -> optimizer_telemetry.dll
